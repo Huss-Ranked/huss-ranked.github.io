@@ -93,7 +93,42 @@ body {
 		<link id="-gd-engine-icon" rel="icon" type="image/png" href="hussranked.icon.png" />
 <link rel="apple-touch-icon" href="hussranked.apple-touch-icon.png"/>
 <link rel="manifest" href="hussranked.manifest.json">
+<!-- Load Trystero via esm.sh module import -->
+<script type="module">
+    import { joinRoom } from 'https://esm.sh/trystero@0.18.0/nostr';
 
+    window.joinTrysteroRoom = function(roomCode) {
+        const config = { appId: 'huss_ranked_1v1_game' };
+        window.trysteroRoom = joinRoom(config, roomCode);
+
+        const [sendData, getData] = window.trysteroRoom.makeAction('gameData');
+        window.trysteroSendAction = sendData;
+
+        getData((data, peerId) => {
+            if (window._godot_on_data_received) {
+                window._godot_on_data_received(JSON.stringify(data));
+            }
+        });
+
+        window.trysteroRoom.onPeerJoin(peerId => {
+            if (window._godot_on_peer_joined) {
+                window._godot_on_peer_joined(peerId);
+            }
+        });
+
+        window.trysteroRoom.onPeerLeave(peerId => {
+            if (window._godot_on_peer_left) {
+                window._godot_on_peer_left(peerId);
+            }
+        });
+    };
+
+    window.sendTrysteroPacket = function(jsonStr) {
+        if (window.trysteroSendAction) {
+            window.trysteroSendAction(JSON.parse(jsonStr));
+        }
+    };
+</script>
 	</head>
 	<body>
 		<canvas id="canvas">
@@ -112,7 +147,7 @@ body {
 
 		<script src="hussranked.js"></script>
 		<script>
-const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":true,"executable":"hussranked","experimentalVK":false,"fileSizes":{"hussranked.pck":1329092,"hussranked.wasm":37902138},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4,"serviceWorker":"hussranked.service.worker.js"};
+const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":true,"executable":"hussranked","experimentalVK":false,"fileSizes":{"hussranked.pck":1335732,"hussranked.wasm":37902138},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4,"serviceWorker":"hussranked.service.worker.js"};
 const GODOT_THREADS_ENABLED = false;
 const engine = new Engine(GODOT_CONFIG);
 
