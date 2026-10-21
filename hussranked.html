@@ -93,34 +93,43 @@ body {
 		<link id="-gd-engine-icon" rel="icon" type="image/png" href="hussranked.icon.png" />
 <link rel="apple-touch-icon" href="hussranked.apple-touch-icon.png"/>
 <link rel="manifest" href="hussranked.manifest.json">
-<!-- Load Trystero via esm.sh module import -->
+<!-- Trystero Nostr P2P Signaling Script -->
 <script type="module">
     import { joinRoom } from 'https://esm.sh/trystero@0.18.0/nostr';
 
+    // Global handler attached immediately
     window.joinTrysteroRoom = function(roomCode) {
+        console.log("[Trystero] Attempting to join room:", roomCode);
         const config = { appId: 'huss_ranked_1v1_game' };
-        window.trysteroRoom = joinRoom(config, roomCode);
+        
+        try {
+            window.trysteroRoom = joinRoom(config, roomCode);
 
-        const [sendData, getData] = window.trysteroRoom.makeAction('gameData');
-        window.trysteroSendAction = sendData;
+            const [sendData, getData] = window.trysteroRoom.makeAction('gameData');
+            window.trysteroSendAction = sendData;
 
-        getData((data, peerId) => {
-            if (window._godot_on_data_received) {
-                window._godot_on_data_received(JSON.stringify(data));
-            }
-        });
+            getData((data, peerId) => {
+                if (window._godot_on_data_received) {
+                    window._godot_on_data_received(JSON.stringify(data));
+                }
+            });
 
-        window.trysteroRoom.onPeerJoin(peerId => {
-            if (window._godot_on_peer_joined) {
-                window._godot_on_peer_joined(peerId);
-            }
-        });
+            window.trysteroRoom.onPeerJoin(peerId => {
+                console.log("[Trystero] Peer joined:", peerId);
+                if (window._godot_on_peer_joined) {
+                    window._godot_on_peer_joined(peerId);
+                }
+            });
 
-        window.trysteroRoom.onPeerLeave(peerId => {
-            if (window._godot_on_peer_left) {
-                window._godot_on_peer_left(peerId);
-            }
-        });
+            window.trysteroRoom.onPeerLeave(peerId => {
+                console.log("[Trystero] Peer left:", peerId);
+                if (window._godot_on_peer_left) {
+                    window._godot_on_peer_left(peerId);
+                }
+            });
+        } catch (err) {
+            console.error("[Trystero] Initialization error:", err);
+        }
     };
 
     window.sendTrysteroPacket = function(jsonStr) {
@@ -128,6 +137,8 @@ body {
             window.trysteroSendAction(JSON.parse(jsonStr));
         }
     };
+
+    console.log("[Trystero] Module loaded and window methods attached.");
 </script>
 	</head>
 	<body>
