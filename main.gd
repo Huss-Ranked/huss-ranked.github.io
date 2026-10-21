@@ -1,18 +1,36 @@
 extends Node
 
-# --- NETWORKING CONFIGURATION ---
-const PORT: int = 8080
-const LOCALHOST: String = "127.0.0.1"
-
-var peer: WebSocketMultiplayerPeer = WebSocketMultiplayerPeer.new()
-
 # --- GAME MODE TRACKING ---
 var max_allowed_players: int = 2
 var is_match_active: bool = false
 var is_game_over: bool = false
+var is_host_peer: bool = false
+var is_single_player: bool = false
 
 # --- GLOBAL COMBAT LOCKS ---
 var is_qte_in_progress: bool = false
+
+# --- MAP POOL & BANNING SYSTEM ---
+var map_pool: Array = [
+	{"name": "Neo Red", "color": Color(0.85, 0.2, 0.2), "wall_color": Color(0.4, 0.1, 0.1)},
+	{"name": "Cyber Blue", "color": Color(0.15, 0.45, 0.9), "wall_color": Color(0.1, 0.2, 0.5)},
+	{"name": "Emerald Grid", "color": Color(0.1, 0.75, 0.35), "wall_color": Color(0.05, 0.35, 0.15)},
+	{"name": "Solar Amber", "color": Color(0.9, 0.65, 0.1), "wall_color": Color(0.45, 0.3, 0.05)},
+	{"name": "Void Purple", "color": Color(0.5, 0.15, 0.8), "wall_color": Color(0.25, 0.05, 0.4)},
+	{"name": "Rust Canyon", "color": Color(0.7, 0.35, 0.15), "wall_color": Color(0.35, 0.15, 0.05)},
+	{"name": "Toxic Mint", "color": Color(0.2, 0.85, 0.65), "wall_color": Color(0.05, 0.4, 0.3)},
+	{"name": "Frost White", "color": Color(0.8, 0.9, 0.95), "wall_color": Color(0.4, 0.5, 0.6)},
+	{"name": "Obsidian Core", "color": Color(0.12, 0.12, 0.15), "wall_color": Color(0.05, 0.05, 0.08)}
+]
+
+var current_3_maps: Array = []
+var banned_map_indices: Array = []
+var local_ban_turn: bool = true
+var selected_map_data: Dictionary = {}
+
+var map_ban_canvas: CanvasLayer = null
+var map_ban_header_label: Label = null
+var map_row_container: HBoxContainer = null
 
 # --- LOCAL SAVE & LEADERBOARD / ELO DATA ---
 const SAVE_PATH: String = "user://player_data.json"
@@ -40,12 +58,12 @@ var hud_canvas: CanvasLayer = null
 var results_canvas: CanvasLayer = null
 var console_list: VBoxContainer = null
 var players_container: Node3D = null
-var spawner: MultiplayerSpawner = null
 
 var nickname_input: LineEdit = null
 var pending_error_message: String = ""
 
-var cooldown_bar_container: PanelContainer = null
+var cooldown_bar_container: VBoxContainer = null
+var cooldown_progress_bar: ProgressBar = null
 var local_hp_label: Label = null
 var waiting_opponent_label: Label = null
 
@@ -67,17 +85,16 @@ const SPRITE_SHEET_PATH_PNG: String = "res://rank_icons.png"
 const SPRITE_SHEET_PATH_JPG: String = "res://rank_icons.jpg"
 var loaded_sheet_texture: Texture2D = null
 
+# --- JAVASCRIPT CALLBACK REFERENCES ---
+var js_on_peer_join_cb: JavaScriptObject
+var js_on_peer_leave_cb: JavaScriptObject
+var js_on_data_receive_cb: JavaScriptObject
+
 func _ready() -> void:
 	_load_player_data()
 	_load_leaderboard_cache()
 	_init_sprite_sheet()
-
-	multiplayer.connected_to_server.connect(_on_connected_to_server)
-	multiplayer.connection_failed.connect(_on_connection_failed)
-	multiplayer.server_disconnected.connect(_on_server_disconnected)
-	multiplayer.peer_connected.connect(_on_peer_connected)
-	multiplayer.peer_disconnected.connect(_on_peer_disconnected)
-
+	_init_trystero_bridge()
 	_build_main_menu()
 
 func _process(delta: float) -> void:
@@ -85,6 +102,9 @@ func _process(delta: float) -> void:
 		combat_cooldown_timer -= delta
 		if cooldown_bar_container:
 			cooldown_bar_container.visible = true
+		if cooldown_progress_bar:
+			cooldown_progress_bar.value = combat_cooldown_timer
+			
 		if combat_cooldown_timer <= 0.0:
 			combat_cooldown_active = false
 			combat_cooldown_timer = 0.0
@@ -100,60 +120,469 @@ func _process(delta: float) -> void:
 		if t >= 1.0:
 			is_animating_elo = false
 
+func start_combat_cooldown() -> void:
+	combat_cooldown_active = true
+	combat_cooldown_timer = COMBAT_COOLDOWN_DURATION
+	if cooldown_progress_bar:
+		cooldown_progress_bar.max_value = COMBAT_COOLDOWN_DURATION
+		cooldown_progress_bar.value = COMBAT_COOLDOWN_DURATION
+	if cooldown_bar_container:
+		cooldown_bar_container.visible = true
+
 func _unhandled_input(_event: InputEvent) -> void:
-	if world_root and Input.is_action_just_pressed("ui_cancel"):
+	if Input.is_action_just_pressed("ui_cancel"):
+		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 		if is_match_active and not is_game_over:
 			_forfeit_match()
 		else:
 			_return_to_main_menu()
 
 # ==============================================================================
+# 1. TRYSTERO WEBRTC BRIDGE IMPLEMENTATION
+# ==============================================================================
+
+func _init_trystero_bridge() -> void:
+	if not OS.has_feature("web"):
+		return
+
+	js_on_peer_join_cb = JavaScriptBridge.create_callback(_on_trystero_peer_joined)
+	js_on_peer_leave_cb = JavaScriptBridge.create_callback(_on_trystero_peer_left)
+	js_on_data_receive_cb = JavaScriptBridge.create_callback(_on_trystero_data_received)
+
+	var window = JavaScriptBridge.get_interface("window")
+	window._godot_on_peer_joined = js_on_peer_join_cb
+	window._godot_on_peer_left = js_on_peer_leave_cb
+	window._godot_on_data_received = js_on_data_receive_cb
+
+	JavaScriptBridge.eval("""
+		window.trysteroRoom = null;
+		window.trysteroSendAction = null;
+		window.trysteroGetAction = null;
+
+		window.joinTrysteroRoom = function(roomCode) {
+			if (typeof joinRoom === 'undefined') {
+				console.error("[Trystero] Library not loaded in HTML.");
+				return;
+			}
+
+			const config = { appId: 'huss_ranked_1v1_game' };
+			window.trysteroRoom = joinRoom(config, roomCode);
+
+			const [sendData, getData] = window.trysteroRoom.makeAction('gameData');
+			window.trysteroSendAction = sendData;
+
+			getData((data, peerId) => {
+				window._godot_on_data_received(JSON.stringify(data));
+			});
+
+			window.trysteroRoom.onPeerJoin(peerId => {
+				window._godot_on_peer_joined(peerId);
+			});
+
+			window.trysteroRoom.onPeerLeave(peerId => {
+				window._godot_on_peer_left(peerId);
+			});
+		};
+
+		window.sendTrysteroPacket = function(jsonStr) {
+			if (window.trysteroSendAction) {
+				const data = JSON.parse(jsonStr);
+				window.trysteroSendAction(data);
+			}
+		};
+	""", true)
+
+func _on_trystero_peer_joined(args: Array) -> void:
+	var peer_id_str: String = args[0]
+	log_console("[Trystero] Opponent found! Peer ID: " + peer_id_str)
+
+	if waiting_opponent_label:
+		waiting_opponent_label.visible = false
+
+	leaderboard_data[local_nickname] = {"elo": local_elo}
+	_save_leaderboard_cache()
+
+	send_p2p_packet({
+		"action": "register",
+		"peer_id": 1 if is_host_peer else 2,
+		"nickname": local_nickname,
+		"elo": local_elo,
+		"leaderboard": leaderboard_data
+	})
+
+	if is_host_peer and current_3_maps.is_empty():
+		var shuffled = map_pool.duplicate()
+		shuffled.shuffle()
+		current_3_maps = [shuffled[0], shuffled[1], shuffled[2]]
+
+		send_p2p_packet({
+			"action": "init_map_ban",
+			"maps": current_3_maps
+		})
+		_start_map_ban_phase()
+
+func _on_trystero_peer_left(args: Array) -> void:
+	var peer_id_str: String = args[0]
+	log_console("[Trystero] Opponent disconnected: " + peer_id_str)
+	if is_match_active and not is_game_over and not is_single_player:
+		_process_match_outcome(1 if is_host_peer else 2)
+
+func _on_trystero_data_received(args: Array) -> void:
+	var raw_json: String = args[0]
+	var json = JSON.new()
+	if json.parse(raw_json) == OK:
+		var data_dict: Dictionary = json.data
+		_handle_incoming_p2p_packet(data_dict)
+
+func _handle_incoming_p2p_packet(data: Dictionary) -> void:
+	var action = data.get("action", "")
+	match action:
+		"register":
+			var sender_id = int(data.get("peer_id", 2))
+			var nick = String(data.get("nickname", "Player"))
+			var elo = int(data.get("elo", 0))
+			player_nicknames[sender_id] = nick
+			player_elos[sender_id] = elo
+
+			var incoming_lb = data.get("leaderboard", {})
+			for p_nick in incoming_lb:
+				if not leaderboard_data.has(p_nick) or incoming_lb[p_nick].get("elo", 0) > leaderboard_data[p_nick].get("elo", 0):
+					leaderboard_data[p_nick] = incoming_lb[p_nick]
+
+			leaderboard_data[nick] = {"elo": elo}
+			_save_leaderboard_cache()
+
+			if is_host_peer:
+				send_p2p_packet({
+					"action": "sync_state",
+					"nicknames": player_nicknames,
+					"elos": player_elos,
+					"leaderboard": leaderboard_data
+				})
+		"sync_state":
+			player_nicknames = data.get("nicknames", {})
+			player_elos = data.get("elos", {})
+			var incoming_lb = data.get("leaderboard", {})
+			for p_nick in incoming_lb:
+				leaderboard_data[p_nick] = incoming_lb[p_nick]
+			_save_leaderboard_cache()
+		"init_map_ban":
+			current_3_maps = data.get("maps", [])
+			_start_map_ban_phase()
+		"ban_map":
+			var banned_idx = int(data.get("banned_index", -1))
+			if banned_idx != -1 and not banned_map_indices.has(banned_idx):
+				banned_map_indices.append(banned_idx)
+				local_ban_turn = true
+				_refresh_map_ban_ui()
+				_check_map_ban_completion()
+		"move":
+			var peer_id = String(data.get("peer_id", "2"))
+			if players_container and players_container.has_node(peer_id):
+				var p_node = players_container.get_node(peer_id)
+				p_node.global_position = Vector3(data["pos_x"], data["pos_y"], data["pos_z"])
+				p_node.rotation_degrees.y = data["rot_y"]
+		"set_movement_lock":
+			var target_id = String(data.get("peer_id", ""))
+			var locked_state = bool(data.get("locked", false))
+			if players_container and players_container.has_node(target_id):
+				var p_node = players_container.get_node(target_id) as NetworkPlayer
+				if p_node:
+					p_node.is_movement_locked = locked_state
+		"trigger_cooldown":
+			start_combat_cooldown()
+		"take_damage":
+			var target_id = String(data.get("peer_id", ""))
+			var amount = int(data.get("amount", 25))
+			if players_container and players_container.has_node(target_id):
+				var p_node = players_container.get_node(target_id) as NetworkPlayer
+				if p_node:
+					p_node.apply_damage(amount)
+		"match_outcome":
+			var winner_id = int(data.get("winner_peer_id", 1))
+			_process_match_outcome(winner_id)
+
+func send_p2p_packet(data: Dictionary) -> void:
+	if not OS.has_feature("web") or is_single_player:
+		return
+
+	var json_string = JSON.stringify(data)
+	var window = JavaScriptBridge.get_interface("window")
+	window.sendTrysteroPacket(json_string)
+
+# ==============================================================================
+# 2. TOP-DOWN MAP TEXTURE GENERATOR & MAP VETO GUI
+# ==============================================================================
+
+func generate_topdown_map_texture(map_info: Dictionary, is_banned: bool = false) -> Texture2D:
+	var width = 160
+	var height = 160
+	var img = Image.create(width, height, false, Image.FORMAT_RGBA8)
+
+	var f_color: Color = map_info["color"]
+	var w_color: Color = map_info["wall_color"]
+
+	if is_banned:
+		var avg_f = (f_color.r + f_color.g + f_color.b) / 3.0 * 0.25
+		f_color = Color(avg_f, avg_f, avg_f)
+		var avg_w = (w_color.r + w_color.g + w_color.b) / 3.0 * 0.2
+		w_color = Color(avg_w, avg_w, avg_w)
+
+	img.fill(f_color)
+
+	var wall_px = 8
+	for x in range(width):
+		for y in range(height):
+			if x < wall_px or x >= width - wall_px or y < wall_px or y >= height - wall_px:
+				img.set_pixel(x, y, w_color)
+
+	_draw_img_rect(img, 30, 40, 16, 40, w_color)
+	_draw_img_rect(img, 114, 80, 16, 40, w_color)
+	_draw_img_rect(img, 65, 65, 30, 30, w_color)
+
+	return ImageTexture.create_from_image(img)
+
+func _draw_img_rect(img: Image, start_x: int, start_y: int, rect_w: int, rect_h: int, color: Color) -> void:
+	for x in range(start_x, clamp(start_x + rect_w, 0, img.get_width())):
+		for y in range(start_y, clamp(start_y + rect_h, 0, img.get_height())):
+			img.set_pixel(x, y, color)
+
+func _start_map_ban_phase() -> void:
+	banned_map_indices.clear()
+	local_ban_turn = is_host_peer or is_single_player
+	_build_map_ban_ui()
+
+func _build_map_ban_ui() -> void:
+	if map_ban_canvas: map_ban_canvas.queue_free()
+
+	map_ban_canvas = CanvasLayer.new()
+	map_ban_canvas.layer = 100
+	add_child(map_ban_canvas)
+
+	var center = CenterContainer.new()
+	center.set_anchors_preset(Control.PRESET_FULL_RECT)
+	map_ban_canvas.add_child(center)
+
+	var panel = PanelContainer.new()
+	panel.custom_minimum_size = Vector2(620, 360)
+	center.add_child(panel)
+
+	var main_vbox = VBoxContainer.new()
+	main_vbox.alignment = BoxContainer.ALIGNMENT_CENTER
+	panel.add_child(main_vbox)
+
+	map_ban_header_label = Label.new()
+	map_ban_header_label.text = "MAP BAN PHASE - BAN A MAP" if local_ban_turn else "OPPONENT IS BANNING A MAP..."
+	map_ban_header_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	map_ban_header_label.add_theme_font_size_override("font_size", 22)
+	map_ban_header_label.add_theme_color_override("font_color", Color(1.0, 0.9, 0.2))
+	main_vbox.add_child(map_ban_header_label)
+
+	var sub_header = Label.new()
+	sub_header.text = "Single Player Mode: You get 2 Bans" if is_single_player else "Ranked 1v1: Each Player bans 1 map"
+	sub_header.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	sub_header.add_theme_font_size_override("font_size", 13)
+	sub_header.add_theme_color_override("font_color", Color(0.8, 0.8, 0.8))
+	main_vbox.add_child(sub_header)
+
+	var spacer = Control.new()
+	spacer.custom_minimum_size = Vector2(0, 15)
+	main_vbox.add_child(spacer)
+
+	map_row_container = HBoxContainer.new()
+	map_row_container.alignment = BoxContainer.ALIGNMENT_CENTER
+	map_row_container.custom_minimum_size = Vector2(580, 240)
+	main_vbox.add_child(map_row_container)
+
+	_refresh_map_ban_ui()
+
+func _refresh_map_ban_ui() -> void:
+	if not map_ban_canvas or not map_row_container: return
+
+	if map_ban_header_label:
+		map_ban_header_label.text = "MAP BAN PHASE - SELECT MAP TO BAN" if local_ban_turn else "OPPONENT IS BANNING A MAP..."
+
+	for child in map_row_container.get_children():
+		child.queue_free()
+
+	for i in range(current_3_maps.size()):
+		var map_info = current_3_maps[i]
+		var is_banned = banned_map_indices.has(i)
+
+		var card = PanelContainer.new()
+		card.custom_minimum_size = Vector2(180, 230)
+		map_row_container.add_child(card)
+
+		var vbox = VBoxContainer.new()
+		vbox.alignment = BoxContainer.ALIGNMENT_CENTER
+		card.add_child(vbox)
+
+		var preview_container = PanelContainer.new()
+		preview_container.custom_minimum_size = Vector2(160, 140)
+		vbox.add_child(preview_container)
+
+		var preview_rect = TextureRect.new()
+		preview_rect.texture = generate_topdown_map_texture(map_info, is_banned)
+		preview_rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		preview_rect.stretch_mode = TextureRect.STRETCH_SCALE
+		preview_rect.custom_minimum_size = Vector2(160, 140)
+		preview_container.add_child(preview_rect)
+
+		if is_banned:
+			var banned_overlay = Label.new()
+			banned_overlay.text = "BANNED"
+			banned_overlay.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+			banned_overlay.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+			banned_overlay.set_anchors_preset(Control.PRESET_FULL_RECT)
+			banned_overlay.add_theme_font_size_override("font_size", 24)
+			banned_overlay.add_theme_color_override("font_color", Color(1.0, 0.25, 0.25))
+			preview_container.add_child(banned_overlay)
+
+		var map_name = Label.new()
+		map_name.text = map_info["name"]
+		map_name.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		map_name.add_theme_font_size_override("font_size", 14)
+		vbox.add_child(map_name)
+
+		var ban_btn = Button.new()
+		if is_banned:
+			ban_btn.text = "BANNED"
+			ban_btn.disabled = true
+		else:
+			ban_btn.text = "Ban Map"
+			ban_btn.disabled = not local_ban_turn
+			ban_btn.pressed.connect(func(): _on_map_ban_clicked(i))
+		vbox.add_child(ban_btn)
+
+func _on_map_ban_clicked(map_idx: int) -> void:
+	if not local_ban_turn or banned_map_indices.has(map_idx):
+		return
+
+	banned_map_indices.append(map_idx)
+	local_ban_turn = false
+	_refresh_map_ban_ui()
+
+	if not is_single_player:
+		send_p2p_packet({
+			"action": "ban_map",
+			"banned_index": map_idx
+		})
+
+	_check_map_ban_completion()
+
+func _check_map_ban_completion() -> void:
+	var required_bans = 2
+
+	if is_single_player and banned_map_indices.size() < 2:
+		local_ban_turn = true
+		_refresh_map_ban_ui()
+		return
+
+	if banned_map_indices.size() >= required_bans:
+		for i in range(current_3_maps.size()):
+			if not banned_map_indices.has(i):
+				selected_map_data = current_3_maps[i]
+				break
+
+		if map_ban_canvas:
+			map_ban_canvas.queue_free()
+			map_ban_canvas = null
+
+		_start_p2p_game()
+
+# ==============================================================================
+# 3. MATCHMAKING UI & GAME FLOW
+# ==============================================================================
+
+func _on_find_match_pressed() -> void:
+	if nickname_input and nickname_input.text.strip_edges() != "":
+		local_nickname = nickname_input.text.strip_edges()
+		save_player_data()
+
+	is_single_player = false
+	is_host_peer = true
+	current_3_maps.clear()
+	banned_map_indices.clear()
+
+	log_console("[Matchmaking] Joining Trystero P2P room...")
+
+	_clear_ui()
+	_build_hud_console()
+
+	if OS.has_feature("web"):
+		var window = JavaScriptBridge.get_interface("window")
+		window.joinTrysteroRoom("public_1v1_room")
+
+	var my_id = 1
+	player_nicknames[my_id] = local_nickname
+	player_elos[my_id] = local_elo
+
+func _on_single_player_pressed() -> void:
+	if nickname_input and nickname_input.text.strip_edges() != "":
+		local_nickname = nickname_input.text.strip_edges()
+		save_player_data()
+
+	is_single_player = true
+	is_host_peer = true
+	is_match_active = true
+	is_game_over = false
+	is_qte_in_progress = false
+
+	_clear_ui()
+	_build_hud_console()
+
+	if waiting_opponent_label:
+		waiting_opponent_label.visible = false
+
+	var shuffled = map_pool.duplicate()
+	shuffled.shuffle()
+	current_3_maps = [shuffled[0], shuffled[1], shuffled[2]]
+
+	_start_map_ban_phase()
+
+func _start_p2p_game() -> void:
+	max_allowed_players = 2
+	pre_match_elo = local_elo
+	is_match_active = true
+	is_game_over = false
+	is_qte_in_progress = false
+
+	_build_3d_environment()
+
+	var my_id = 1 if is_host_peer else 2
+	_spawn_player(my_id)
+	player_nicknames[my_id] = local_nickname
+	player_elos[my_id] = local_elo
+
+	if is_single_player:
+		_spawn_test_dummy(2)
+
+# ==============================================================================
 # CUSTOM ELO RANK TIER & SPRITE SHEET ATLAS HELPER
 # ==============================================================================
 
 func get_rank_name(elo: int) -> String:
-	if elo < 100:
-		return "Humble Husser 1"
-	elif elo < 200:
-		return "Humble Husser 2"
-	elif elo < 300:
-		return "Humble Husser 3"
-	elif elo < 400:
-		return "Rookie Runner 1"
-	elif elo < 500:
-		return "Rookie Runner 2"
-	elif elo < 600:
-		return "Rookie Runner 3"
-	elif elo < 700:
-		return "Rising Hussler 1"
-	elif elo < 800:
-		return "Rising Hussler 2"
-	elif elo < 900:
-		return "Rising Hussler 3"
-	elif elo < 1000:
-		return "Valiant Voyager 1"
-	elif elo < 1100:
-		return "Valiant Voyager 2"
-	elif elo < 1200:
-		return "Valiant Voyager 3"
-	elif elo < 1300:
-		return "Royal Runner 1"
-	elif elo < 1400:
-		return "Royal Runner 2"
-	elif elo < 1500:
-		return "Royal Runner 3"
-	elif elo < 1600:
-		return "Holy Husser 1"
-	elif elo < 1700:
-		return "Holy Husser 2"
-	elif elo < 1800:
-		return "Holy Husser 3"
-	elif elo < 1900:
-		return "Heavenly Huss 1"
-	elif elo < 2000:
-		return "Heavenly Huss 2"
-	else:
-		return "Heavenly Huss 3"
+	if elo < 100: return "Humble Husser 1"
+	elif elo < 200: return "Humble Husser 2"
+	elif elo < 300: return "Humble Husser 3"
+	elif elo < 400: return "Rookie Runner 1"
+	elif elo < 500: return "Rookie Runner 2"
+	elif elo < 600: return "Rookie Runner 3"
+	elif elo < 700: return "Rising Hussler 1"
+	elif elo < 800: return "Rising Hussler 2"
+	elif elo < 900: return "Rising Hussler 3"
+	elif elo < 1000: return "Valiant Voyager 1"
+	elif elo < 1100: return "Valiant Voyager 2"
+	elif elo < 1200: return "Valiant Voyager 3"
+	elif elo < 1300: return "Royal Runner 1"
+	elif elo < 1400: return "Royal Runner 2"
+	elif elo < 1500: return "Royal Runner 3"
+	elif elo < 1600: return "Holy Husser 1"
+	elif elo < 1700: return "Holy Husser 2"
+	elif elo < 1800: return "Holy Husser 3"
+	elif elo < 1900: return "Heavenly Huss 1"
+	elif elo < 2000: return "Heavenly Huss 2"
+	else: return "Heavenly Huss 3"
 
 func _init_sprite_sheet() -> void:
 	if ResourceLoader.exists(SPRITE_SHEET_PATH_PNG):
@@ -163,32 +592,31 @@ func _init_sprite_sheet() -> void:
 
 func load_rank_texture(elo: int) -> Texture2D:
 	var rank_idx = clamp(floori(elo / 100.0), 0, 20)
-	
+
 	if loaded_sheet_texture:
 		var col_count: int = 7
 		var col = floori(rank_idx / 3.0)
 		var row = rank_idx % 3
-		
+
 		var sheet_w = float(loaded_sheet_texture.get_width())
 		var sheet_h = float(loaded_sheet_texture.get_height())
-		
+
 		var raw_cell_w = sheet_w / float(col_count)
-		
-		# Tighter height window to completely exclude the text label below each badge
+
 		var crop_h: float = sheet_h * 0.14
 		var crop_y: float = 0.0
-		
+
 		if row == 0:
 			crop_y = sheet_h * 0.145
 		elif row == 1:
 			crop_y = sheet_h * 0.44
 		else:
 			crop_y = sheet_h * 0.705
-			
+
 		var pad_side: float = raw_cell_w * 0.12
 		var crop_x = (col * raw_cell_w) + pad_side
 		var crop_w = raw_cell_w - (pad_side * 2.0)
-		
+
 		var atlas = AtlasTexture.new()
 		atlas.atlas = loaded_sheet_texture
 		atlas.region = Rect2(crop_x, crop_y, crop_w, crop_h)
@@ -249,8 +677,6 @@ func clear_leaderboard_data() -> void:
 	leaderboard_data.clear()
 	if FileAccess.file_exists(LEADERBOARD_CACHE_PATH):
 		DirAccess.remove_absolute(LEADERBOARD_CACHE_PATH)
-	if multiplayer.has_multiplayer_peer() and multiplayer.is_server():
-		sync_game_state.rpc(player_nicknames, player_elos, leaderboard_data)
 
 # ==============================================================================
 # UI & MAIN MENU
@@ -269,6 +695,7 @@ func log_console(message: String) -> void:
 
 func _build_hud_console() -> void:
 	hud_canvas = CanvasLayer.new()
+	hud_canvas.layer = 1
 	add_child(hud_canvas)
 
 	var hp_panel = PanelContainer.new()
@@ -297,31 +724,33 @@ func _build_hud_console() -> void:
 	console_list = VBoxContainer.new()
 	scroll.add_child(console_list)
 
-	cooldown_bar_container = PanelContainer.new()
-	cooldown_bar_container.custom_minimum_size = Vector2(300, 30)
+	# --- VISUAL DRAIN PROGRESS BAR FOR COMBAT COOLDOWN ---
+	cooldown_bar_container = VBoxContainer.new()
+	cooldown_bar_container.custom_minimum_size = Vector2(300, 45)
 	cooldown_bar_container.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
-	cooldown_bar_container.position = Vector2(-150, -40)
+	cooldown_bar_container.position = Vector2(-150, -60)
 	cooldown_bar_container.visible = false
 	hud_canvas.add_child(cooldown_bar_container)
 
-	var cd_box = VBoxContainer.new()
-	cooldown_bar_container.add_child(cd_box)
-
 	var cd_label = Label.new()
-	cd_label.text = "COMBAT COOLDOWN ACTIVE"
+	cd_label.text = "ATTACK COOLDOWN"
 	cd_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	cd_label.add_theme_font_size_override("font_size", 12)
 	cd_label.add_theme_color_override("font_color", Color(1.0, 0.4, 0.4))
-	cd_box.add_child(cd_label)
+	cooldown_bar_container.add_child(cd_label)
+
+	cooldown_progress_bar = ProgressBar.new()
+	cooldown_progress_bar.custom_minimum_size = Vector2(300, 20)
+	cooldown_progress_bar.show_percentage = false
+	cooldown_bar_container.add_child(cooldown_progress_bar)
 
 	waiting_opponent_label = Label.new()
-	waiting_opponent_label.text = "Waiting for Opponent..."
-	waiting_opponent_label.set_anchors_preset(Control.PRESET_CENTER)
-	waiting_opponent_label.position = Vector2(-150, -20)
-	waiting_opponent_label.custom_minimum_size = Vector2(300, 40)
+	waiting_opponent_label.text = "Searching for Opponent..."
+	waiting_opponent_label.set_anchors_preset(Control.PRESET_CENTER_TOP)
+	waiting_opponent_label.position = Vector2(-150, 10)
+	waiting_opponent_label.custom_minimum_size = Vector2(300, 30)
 	waiting_opponent_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	waiting_opponent_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	waiting_opponent_label.add_theme_font_size_override("font_size", 24)
+	waiting_opponent_label.add_theme_font_size_override("font_size", 16)
 	waiting_opponent_label.add_theme_color_override("font_color", Color(1.0, 0.9, 0.2))
 	waiting_opponent_label.visible = true
 	hud_canvas.add_child(waiting_opponent_label)
@@ -344,6 +773,7 @@ func _build_main_menu() -> void:
 	is_match_active = false
 	is_game_over = false
 	is_qte_in_progress = false
+	is_single_player = false
 
 	menu_canvas = CanvasLayer.new()
 	add_child(menu_canvas)
@@ -353,22 +783,8 @@ func _build_main_menu() -> void:
 	menu_canvas.add_child(center_panel)
 
 	var container = VBoxContainer.new()
-	container.custom_minimum_size = Vector2(300, 0)
+	container.custom_minimum_size = Vector2(340, 0)
 	center_panel.add_child(container)
-
-	if pending_error_message != "":
-		var err_panel = PanelContainer.new()
-		var err_lbl = Label.new()
-		err_lbl.text = pending_error_message
-		err_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		err_lbl.add_theme_color_override("font_color", Color(1, 0.35, 0.35))
-		err_panel.add_child(err_lbl)
-		container.add_child(err_panel)
-		
-		var err_spacer = Control.new()
-		err_spacer.custom_minimum_size = Vector2(0, 10)
-		container.add_child(err_spacer)
-		pending_error_message = ""
 
 	var nick_label = Label.new()
 	nick_label.text = "Enter Nickname:"
@@ -378,7 +794,7 @@ func _build_main_menu() -> void:
 	nickname_input = LineEdit.new()
 	nickname_input.text = local_nickname
 	nickname_input.placeholder_text = "Player Name"
-	nickname_input.custom_minimum_size = Vector2(280, 35)
+	nickname_input.custom_minimum_size = Vector2(320, 35)
 	nickname_input.alignment = HORIZONTAL_ALIGNMENT_CENTER
 	container.add_child(nickname_input)
 
@@ -405,29 +821,29 @@ func _build_main_menu() -> void:
 	spacer.custom_minimum_size = Vector2(0, 10)
 	container.add_child(spacer)
 
-	var pvp_btn = Button.new()
-	pvp_btn.text = "Start 1v1 Mode"
-	pvp_btn.custom_minimum_size = Vector2(280, 45)
-	pvp_btn.pressed.connect(_on_start_game_pressed)
-	container.add_child(pvp_btn)
+	var play_btn = Button.new()
+	play_btn.text = "Find Auto 1v1 Match (Ranked)"
+	play_btn.custom_minimum_size = Vector2(320, 45)
+	play_btn.pressed.connect(_on_find_match_pressed)
+	container.add_child(play_btn)
+
+	var sp_btn = Button.new()
+	sp_btn.text = "Single Player Practice (No ELO)"
+	sp_btn.custom_minimum_size = Vector2(320, 40)
+	sp_btn.pressed.connect(_on_single_player_pressed)
+	container.add_child(sp_btn)
 
 	var leaderboard_btn = Button.new()
 	leaderboard_btn.text = "Leaderboard"
-	leaderboard_btn.custom_minimum_size = Vector2(280, 45)
+	leaderboard_btn.custom_minimum_size = Vector2(320, 35)
 	leaderboard_btn.pressed.connect(_show_leaderboard_ui)
 	container.add_child(leaderboard_btn)
 
 	var clear_btn = Button.new()
 	clear_btn.text = "Clear Leaderboard"
-	clear_btn.custom_minimum_size = Vector2(280, 45)
+	clear_btn.custom_minimum_size = Vector2(320, 35)
 	clear_btn.pressed.connect(_on_clear_leaderboard_pressed)
 	container.add_child(clear_btn)
-
-	var quit_btn = Button.new()
-	quit_btn.text = "Quit"
-	quit_btn.custom_minimum_size = Vector2(280, 45)
-	quit_btn.pressed.connect(func(): get_tree().quit())
-	container.add_child(quit_btn)
 
 func _on_clear_leaderboard_pressed() -> void:
 	clear_leaderboard_data()
@@ -470,7 +886,7 @@ func _show_leaderboard_ui() -> void:
 	for player_key in display_data:
 		var entry = display_data[player_key]
 		var elo = entry.get("elo", 0) if entry is Dictionary else 0
-		
+
 		var row = HBoxContainer.new()
 		list.add_child(row)
 
@@ -496,13 +912,40 @@ func _show_leaderboard_ui() -> void:
 # MATCH RESULTS & ANIMATED ELO PROGRESSION SCREEN
 # ==============================================================================
 
+func _process_match_outcome(winner_peer_id: int) -> void:
+	is_game_over = true
+
+	if is_single_player:
+		_show_match_results_screen("Practice Dummy Defeated", true, 0, local_elo, local_elo, false)
+		return
+
+	var my_id = 1 if is_host_peer else 2
+	var is_winner = (my_id == winner_peer_id)
+
+	var start_elo = local_elo
+	var elo_change = 0
+	var hit_max_elo = false
+
+	if is_winner:
+		if local_elo >= MAX_ELO:
+			hit_max_elo = true
+			elo_change = 0
+		else:
+			elo_change = 25
+			local_elo = min(MAX_ELO, local_elo + elo_change)
+	else:
+		elo_change = -25
+		local_elo = max(0, local_elo + elo_change)
+
+	leaderboard_data[local_nickname] = {"elo": local_elo}
+	_save_leaderboard_cache()
+	save_player_data()
+
+	var banner_text = "You won the 1v1" if is_winner else "You lost the 1v1"
+	_show_match_results_screen(banner_text, is_winner, elo_change, start_elo, local_elo, hit_max_elo)
+
 func _show_match_results_screen(outcome_title: String, is_winner: bool, elo_change: int, start_elo: int, target_elo: int, hit_max_elo: bool = false) -> void:
 	_clear_ui()
-
-	if multiplayer.is_server():
-		get_tree().create_timer(0.5).timeout.connect(_cleanup_network)
-	else:
-		_cleanup_network()
 
 	if world_root:
 		world_root.queue_free()
@@ -511,6 +954,7 @@ func _show_match_results_screen(outcome_title: String, is_winner: bool, elo_chan
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 
 	results_canvas = CanvasLayer.new()
+	results_canvas.layer = 100
 	add_child(results_canvas)
 
 	var center = CenterContainer.new()
@@ -533,11 +977,16 @@ func _show_match_results_screen(outcome_title: String, is_winner: bool, elo_chan
 	container.add_child(title)
 
 	var delta_lbl = Label.new()
-	if hit_max_elo:
+	if is_single_player:
+		delta_lbl.text = "+0 ELO (Practice Mode)"
+		delta_lbl.add_theme_color_override("font_color", Color(0.8, 0.8, 0.8))
+	elif hit_max_elo:
 		delta_lbl.text = "You have reached the max ELO."
 		delta_lbl.add_theme_color_override("font_color", Color(1.0, 0.85, 0.2))
 	else:
 		delta_lbl.text = ("+ " if elo_change >= 0 else "- ") + str(abs(elo_change)) + " ELO"
+		delta_lbl.add_theme_color_override("font_color", Color(0.2, 1.0, 0.3) if elo_change >= 0 else Color(1.0, 0.3, 0.3))
+
 	delta_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	delta_lbl.add_theme_font_size_override("font_size", 18 if hit_max_elo else 20)
 	container.add_child(delta_lbl)
@@ -633,6 +1082,11 @@ func _update_elo_animation_ui() -> void:
 		anim_marker_rect.position = Vector2(clamp(380 * current_step_progress - 3, 0, 374), 0)
 
 func _clear_ui() -> void:
+	if map_ban_canvas:
+		map_ban_canvas.queue_free()
+		map_ban_canvas = null
+		map_row_container = null
+		map_ban_header_label = null
 	if menu_canvas:
 		menu_canvas.queue_free()
 		menu_canvas = null
@@ -645,263 +1099,63 @@ func _clear_ui() -> void:
 		console_list = null
 		local_hp_label = null
 		waiting_opponent_label = null
+		cooldown_progress_bar = null
+		cooldown_bar_container = null
 	if results_canvas:
 		results_canvas.queue_free()
 		results_canvas = null
 
-func _on_start_game_pressed() -> void:
-	max_allowed_players = 2
-	pre_match_elo = local_elo
-	is_match_active = true
-	is_game_over = false
-	is_qte_in_progress = false
-
-	if nickname_input and nickname_input.text.strip_edges() != "":
-		local_nickname = nickname_input.text.strip_edges()
-		save_player_data()
-
-	_clear_ui()
-	_build_3d_environment()
-	_build_hud_console()
-	_auto_connect_or_host()
-
 func _forfeit_match() -> void:
-	log_console("[Match] You forfeited the 1v1 match.")
+	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+	log_console("[Match] You forfeited the match.")
 	if is_game_over:
 		return
 	is_game_over = true
 
-	if multiplayer.has_multiplayer_peer() and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED:
-		if multiplayer.is_server():
-			for id in player_nicknames:
-				if id != 1:
-					notify_match_outcome.rpc(id)
-		else:
-			rpc_id(1, "request_host_forfeit_win")
-	else:
-		var start_elo = local_elo
-		local_elo = max(0, local_elo - 25)
-		save_player_data()
-		_show_match_results_screen("You lost the 1v1 (Forfeit)", false, -25, start_elo, local_elo)
-
-@rpc("any_peer", "call_local", "reliable")
-func request_host_forfeit_win() -> void:
-	if multiplayer.is_server() and not is_game_over:
-		var sender_id = multiplayer.get_remote_sender_id()
-		var winner_id = 1 if sender_id != 1 else sender_id
-		server_declare_winner(winner_id)
-
-func server_declare_winner(winner_peer_id: int) -> void:
-	if not multiplayer.is_server() or is_game_over:
+	if is_single_player:
+		_return_to_main_menu()
 		return
-	is_game_over = true
-	notify_match_outcome.rpc(winner_peer_id)
+
+	var winner_id = 2 if is_host_peer else 1
+	send_p2p_packet({"action": "match_outcome", "winner_peer_id": winner_id})
+	_process_match_outcome(winner_id)
 
 func _return_to_main_menu(error_msg: String = "") -> void:
+	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 	pending_error_message = error_msg
-	_cleanup_network()
 	if world_root:
 		world_root.queue_free()
 		world_root = null
 	_build_main_menu()
 
-func _cleanup_network() -> void:
-	player_nicknames.clear()
-	player_elos.clear()
-	multiplayer.multiplayer_peer = null
-	if peer:
-		peer.close()
-		peer = WebSocketMultiplayerPeer.new()
-
 # ==============================================================================
-# NETWORKING & CONNECTIVITY
-# ==============================================================================
-
-func _auto_connect_or_host() -> void:
-	_cleanup_network()
-	log_console("[Network] Probing host on " + LOCALHOST + ":" + str(PORT) + "...")
-
-	var err = peer.create_client("ws://" + LOCALHOST + ":" + str(PORT))
-	if err == OK:
-		multiplayer.multiplayer_peer = peer
-		get_tree().create_timer(0.3).timeout.connect(_check_connection_timeout)
-	else:
-		_start_hosting()
-
-func _check_connection_timeout() -> void:
-	if peer and peer.get_connection_status() != MultiplayerPeer.CONNECTION_CONNECTED:
-		log_console("[Network] Host not found. Initializing server...")
-		_start_hosting()
-
-func _start_hosting() -> void:
-	_cleanup_network()
-
-	var err = peer.create_server(PORT)
-	if err == OK:
-		multiplayer.multiplayer_peer = peer
-		log_console("[Host] Server online on port " + str(PORT) + " (1v1 Mode)")
-		_spawn_player(1)
-		register_player_info(1, local_nickname, local_elo)
-	else:
-		log_console("[Host] ERROR starting server: Code " + str(err))
-
-# --- NETWORK RPC SYNC & MATCH COMPLETION ---
-
-@rpc("any_peer", "call_local", "reliable")
-func set_qte_lock(locked: bool) -> void:
-	is_qte_in_progress = locked
-
-@rpc("any_peer", "call_local", "reliable")
-func trigger_global_combat_cooldown() -> void:
-	combat_cooldown_active = true
-	combat_cooldown_timer = COMBAT_COOLDOWN_DURATION
-
-@rpc("any_peer", "call_local", "reliable")
-func register_player_info(peer_id: int, nickname: String, elo: int) -> void:
-	if multiplayer.is_server():
-		if player_nicknames.size() >= max_allowed_players and not player_nicknames.has(peer_id):
-			reject_full_room.rpc_id(peer_id)
-			return
-
-		for existing_id in player_nicknames:
-			if existing_id != peer_id and player_nicknames[existing_id].to_lower() == nickname.to_lower():
-				reject_duplicate_nickname.rpc_id(peer_id)
-				return
-
-	player_nicknames[peer_id] = nickname
-	player_elos[peer_id] = elo
-	leaderboard_data[nickname] = {"elo": elo}
-	_save_leaderboard_cache()
-
-	if players_container and players_container.has_node(str(peer_id)):
-		var p_node = players_container.get_node(str(peer_id))
-		if p_node.has_method("update_nametag"):
-			p_node.update_nametag(nickname, elo)
-
-	if multiplayer.is_server():
-		sync_game_state.rpc(player_nicknames, player_elos, leaderboard_data)
-
-@rpc("authority", "call_local", "reliable")
-func reject_full_room() -> void:
-	_return_to_main_menu("Error: This 1v1 room is already full.")
-
-@rpc("authority", "call_local", "reliable")
-func reject_duplicate_nickname() -> void:
-	_return_to_main_menu("Error: Someone in the room has the same nickname as you, change your nickname and try again.")
-
-@rpc("authority", "call_local", "reliable")
-func sync_game_state(nicknames: Dictionary, elos: Dictionary, leaderboard: Dictionary) -> void:
-	player_nicknames = nicknames
-	player_elos = elos
-	leaderboard_data = leaderboard
-	_save_leaderboard_cache()
-
-	if players_container:
-		for id in player_nicknames:
-			if players_container.has_node(str(id)):
-				var p_node = players_container.get_node(str(id))
-				if p_node.has_method("update_nametag"):
-					p_node.update_nametag(player_nicknames[id], player_elos.get(id, 0))
-
-@rpc("authority", "call_local", "reliable")
-func notify_match_outcome(winner_peer_id: int) -> void:
-	is_game_over = true
-	var my_id = multiplayer.get_unique_id()
-	var is_winner = (my_id == winner_peer_id)
-
-	var start_elo = local_elo
-	var elo_change = 0
-	var hit_max_elo = false
-
-	if is_winner:
-		if local_elo >= MAX_ELO:
-			hit_max_elo = true
-			elo_change = 0
-		else:
-			elo_change = 25
-			local_elo = min(MAX_ELO, local_elo + elo_change)
-	else:
-		elo_change = -25
-		local_elo = max(0, local_elo + elo_change)
-
-	save_player_data()
-
-	var banner_text = "You won the 1v1" if is_winner else "You lost the 1v1"
-	_show_match_results_screen(banner_text, is_winner, elo_change, start_elo, local_elo, hit_max_elo)
-
-@rpc("authority", "call_local", "reliable")
-func teleport_player(target_pos: Vector3, target_rot_y: float) -> void:
-	var my_id = multiplayer.get_unique_id()
-	if players_container and players_container.has_node(str(my_id)):
-		var p_node = players_container.get_node(str(my_id)) as CharacterBody3D
-		if p_node:
-			p_node.global_position = target_pos
-			p_node.rotation_degrees.y = target_rot_y
-
-# --- NETWORK CALLBACKS ---
-
-func _on_connected_to_server() -> void:
-	var my_id = multiplayer.get_unique_id()
-	log_console("[Client] Connected to host! Assigned Peer ID: " + str(my_id))
-	register_player_info.rpc_id(1, my_id, local_nickname, local_elo)
-
-func _on_connection_failed() -> void:
-	log_console("[Client] Connection failed. Switching to Host...")
-	_start_hosting()
-
-func _on_server_disconnected() -> void:
-	log_console("[Client] Disconnected from server.")
-	if is_match_active and not is_game_over:
-		var start_elo = local_elo
-		local_elo = max(0, local_elo - 25)
-		save_player_data()
-		_show_match_results_screen("You lost the 1v1 (Host Left)", false, -25, start_elo, local_elo)
-	elif not is_game_over:
-		_return_to_main_menu()
-
-func _on_peer_connected(id: int) -> void:
-	log_console("[Network] Peer connected: ID " + str(id))
-	if waiting_opponent_label:
-		waiting_opponent_label.visible = false
-
-	if multiplayer.is_server():
-		_spawn_player(id)
-		teleport_player.rpc_id(1, Vector3(-15, 1, 0), -90.0)
-		teleport_player.rpc_id(id, Vector3(15, 1, 0), 90.0)
-
-func _on_peer_disconnected(id: int) -> void:
-	log_console("[Network] Peer disconnected: ID " + str(id))
-	var had_nickname = player_nicknames.has(id)
-	player_nicknames.erase(id)
-	player_elos.erase(id)
-	
-	if is_match_active and not is_game_over and multiplayer.is_server() and had_nickname:
-		server_declare_winner(1)
-	elif multiplayer.is_server():
-		sync_game_state.rpc(player_nicknames, player_elos, leaderboard_data)
-		
-	if players_container and players_container.has_node(str(id)):
-		players_container.get_node(str(id)).queue_free()
-
-# ==============================================================================
-# 3D WORLD & SPAWNING
+# 4. 3D WORLD & MAP GENERATOR
 # ==============================================================================
 
 func _build_3d_environment() -> void:
+	if world_root: world_root.queue_free()
+
 	world_root = Node3D.new()
 	world_root.name = "3DWorld"
 	add_child(world_root)
 
 	var light = DirectionalLight3D.new()
-	light.position = Vector3(0, 10, 0)
+	light.position = Vector3(0, 15, 0)
 	light.rotation_degrees = Vector3(-45, 45, 0)
 	world_root.add_child(light)
+
+	var floor_color = selected_map_data.get("color", Color(0.2, 0.2, 0.2))
+	var wall_color = selected_map_data.get("wall_color", Color(0.1, 0.1, 0.1))
 
 	var floor_body = StaticBody3D.new()
 	var floor_mesh = MeshInstance3D.new()
 	var plane = PlaneMesh.new()
 	plane.size = Vector2(50, 50)
 	floor_mesh.mesh = plane
+
+	var floor_mat = StandardMaterial3D.new()
+	floor_mat.albedo_color = floor_color
+	floor_mesh.material_override = floor_mat
 
 	var floor_shape = CollisionShape3D.new()
 	var box = BoxShape3D.new()
@@ -912,36 +1166,66 @@ func _build_3d_environment() -> void:
 	floor_body.add_child(floor_shape)
 	world_root.add_child(floor_body)
 
+	_create_wall_block(Vector3(0, 2, -25), Vector3(50, 4, 1), wall_color)
+	_create_wall_block(Vector3(0, 2, 25), Vector3(50, 4, 1), wall_color)
+	_create_wall_block(Vector3(-25, 2, 0), Vector3(1, 4, 50), wall_color)
+	_create_wall_block(Vector3(25, 2, 0), Vector3(1, 4, 50), wall_color)
+
+	_create_wall_block(Vector3(-8, 1.5, -6), Vector3(2, 3, 6), wall_color)
+	_create_wall_block(Vector3(8, 1.5, 6), Vector3(2, 3, 6), wall_color)
+	_create_wall_block(Vector3(0, 1.5, 0), Vector3(4, 3, 4), wall_color)
+
 	players_container = Node3D.new()
 	players_container.name = "Players"
 	world_root.add_child(players_container)
 
-	spawner = MultiplayerSpawner.new()
-	spawner.name = "MultiplayerSpawner"
-	spawner.spawn_function = _custom_spawn_player
-	world_root.add_child(spawner)
-	spawner.spawn_path = players_container.get_path()
+func _create_wall_block(pos: Vector3, size: Vector3, color: Color) -> void:
+	var body = StaticBody3D.new()
+	body.position = pos
+
+	var mesh_inst = MeshInstance3D.new()
+	var box_mesh = BoxMesh.new()
+	box_mesh.size = size
+	mesh_inst.mesh = box_mesh
+
+	var mat = StandardMaterial3D.new()
+	mat.albedo_color = color
+	mesh_inst.material_override = mat
+
+	var col = CollisionShape3D.new()
+	var shape = BoxShape3D.new()
+	shape.size = size
+	col.shape = shape
+
+	body.add_child(mesh_inst)
+	body.add_child(col)
+	world_root.add_child(body)
 
 func _spawn_player(peer_id: int) -> void:
-	if spawner:
-		spawner.spawn(peer_id)
+	var player = NetworkPlayer.new(peer_id, self)
+	player.name = str(peer_id)
 
-func _custom_spawn_player(peer_id: Variant) -> Node:
-	var id = int(peer_id)
-	var player = NetworkPlayer.new(id, self)
-	player.name = str(id)
-
-	if id == 1:
+	if peer_id == 1:
 		player.position = Vector3(-15, 1, 0)
 		player.rotation_degrees.y = -90
 	else:
 		player.position = Vector3(15, 1, 0)
 		player.rotation_degrees.y = 90
 
-	return player
+	players_container.add_child(player)
+
+func _spawn_test_dummy(peer_id: int) -> void:
+	var dummy = NetworkPlayer.new(peer_id, self)
+	dummy.name = str(peer_id)
+	dummy.position = Vector3(15, 1, 0)
+	dummy.rotation_degrees.y = 90
+	dummy.is_dummy = true
+	players_container.add_child(dummy)
+	player_nicknames[peer_id] = "Test Dummy"
+	player_elos[peer_id] = 0
 
 # ==============================================================================
-# PLAYER CHARACTER CLASS
+# PLAYER & TEST DUMMY CHARACTER CLASS
 # ==============================================================================
 
 class NetworkPlayer extends CharacterBody3D:
@@ -953,7 +1237,9 @@ class NetworkPlayer extends CharacterBody3D:
 	var mesh_inst: MeshInstance3D
 	var base_material: StandardMaterial3D
 	var outline_material: StandardMaterial3D
-	
+
+	var is_dummy: bool = false
+	var is_movement_locked: bool = false
 	var mouse_sensitivity: float = 0.003
 	var walk_speed: float = 8.0
 	var sprint_speed: float = 14.0
@@ -980,19 +1266,13 @@ class NetworkPlayer extends CharacterBody3D:
 		peer_id = id
 		main_manager = manager
 
+	func is_local_player() -> bool:
+		if is_dummy:
+			return false
+		var local_id = 1 if main_manager.is_host_peer else 2
+		return peer_id == local_id
+
 	func _ready() -> void:
-		set_multiplayer_authority(peer_id)
-
-		var sync = MultiplayerSynchronizer.new()
-		sync.name = "Sync"
-		sync.set_multiplayer_authority(peer_id)
-		
-		var config = SceneReplicationConfig.new()
-		config.add_property(NodePath(":position"))
-		config.add_property(NodePath(":rotation"))
-		sync.replication_config = config
-		add_child(sync)
-
 		mesh_inst = MeshInstance3D.new()
 		var cap = CapsuleMesh.new()
 		cap.height = 1.8
@@ -1001,7 +1281,11 @@ class NetworkPlayer extends CharacterBody3D:
 		mesh_inst.position.y = 0.9
 
 		base_material = StandardMaterial3D.new()
-		base_material.albedo_color = Color(randf(), randf(), randf())
+		if is_dummy:
+			base_material.albedo_color = Color(0.6, 0.6, 0.6)
+		else:
+			base_material.albedo_color = Color(randf(), randf(), randf())
+
 		mesh_inst.material_override = base_material
 		add_child(mesh_inst)
 
@@ -1027,9 +1311,12 @@ class NetworkPlayer extends CharacterBody3D:
 		name_label.outline_size = 6
 		add_child(name_label)
 
-		var nick = main_manager.player_nicknames.get(peer_id, "Player " + str(peer_id)) if main_manager else "Player"
-		var elo = main_manager.player_elos.get(peer_id, 0) if main_manager else 0
-		update_nametag(nick, elo)
+		if is_dummy:
+			name_label.text = "[Practice Dummy] Target"
+		else:
+			var nick = main_manager.player_nicknames.get(peer_id, "Player " + str(peer_id)) if main_manager else "Player"
+			var elo = main_manager.player_elos.get(peer_id, 0) if main_manager else 0
+			update_nametag(nick, elo)
 
 		hussing_label = Label3D.new()
 		hussing_label.position = Vector3(0, 2.6, 0)
@@ -1043,14 +1330,14 @@ class NetworkPlayer extends CharacterBody3D:
 
 		_build_health_label()
 
-		if is_multiplayer_authority():
+		if is_local_player():
 			camera = Camera3D.new()
 			camera.position = Vector3(0, 1.5, 0)
 			add_child(camera)
 			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 
 	func update_nametag(nickname: String, elo: int) -> void:
-		if name_label and main_manager:
+		if name_label and main_manager and not is_dummy:
 			var rank_title = main_manager.get_rank_name(elo)
 			name_label.text = "[" + rank_title + "] " + nickname
 
@@ -1076,11 +1363,23 @@ class NetworkPlayer extends CharacterBody3D:
 			else:
 				hp_label.modulate = Color(0.2, 1.0, 0.2)
 
-		if is_multiplayer_authority() and main_manager:
+		if is_local_player() and main_manager:
 			main_manager.update_local_hud_hp(health)
 
+	func apply_damage(amount: int) -> void:
+		health = max(0, health - amount)
+		_update_health_display()
+
+		if health <= 0:
+			if main_manager.is_single_player:
+				main_manager._process_match_outcome(1)
+			elif main_manager.is_host_peer:
+				var winner_id = 1 if peer_id != 1 else 2
+				main_manager.send_p2p_packet({"action": "match_outcome", "winner_peer_id": winner_id})
+				main_manager._process_match_outcome(winner_id)
+
 	func _unhandled_input(event: InputEvent) -> void:
-		if not is_multiplayer_authority():
+		if not is_local_player() or is_dummy or is_movement_locked:
 			return
 
 		if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
@@ -1092,7 +1391,22 @@ class NetworkPlayer extends CharacterBody3D:
 	func _physics_process(delta: float) -> void:
 		_update_health_display()
 
-		if not is_multiplayer_authority():
+		if is_dummy:
+			if not is_on_floor():
+				velocity.y -= 20.0 * delta
+				move_and_slide()
+			return
+
+		if not is_local_player():
+			return
+
+		if is_movement_locked:
+			velocity.x = 0
+			velocity.z = 0
+			if not is_on_floor():
+				velocity.y -= 20.0 * delta
+			move_and_slide()
+			_send_p2p_position()
 			return
 
 		if is_launching:
@@ -1100,6 +1414,7 @@ class NetworkPlayer extends CharacterBody3D:
 			var launch_dir = (launch_target_pos - global_position).normalized()
 			velocity = launch_dir * 32.0 + Vector3(0, 3, 0)
 			move_and_slide()
+			_send_p2p_position()
 			if launch_timer <= 0.0:
 				is_launching = false
 			return
@@ -1140,15 +1455,23 @@ class NetworkPlayer extends CharacterBody3D:
 			velocity.z = move_toward(velocity.z, 0, current_speed)
 
 		move_and_slide()
+		_send_p2p_position()
 
-	# --- CAMERA FIELD OF VIEW & VISION CHECK ---
+	func _send_p2p_position() -> void:
+		main_manager.send_p2p_packet({
+			"action": "move",
+			"peer_id": str(peer_id),
+			"pos_x": global_position.x,
+			"pos_y": global_position.y,
+			"pos_z": global_position.z,
+			"rot_y": rotation_degrees.y
+		})
 
 	func is_in_camera_vision(target: NetworkPlayer) -> bool:
 		if not camera:
 			return false
 
 		var target_pos = target.global_position + Vector3(0, 0.9, 0)
-
 		if not camera.is_position_in_frustum(target_pos):
 			return false
 
@@ -1197,15 +1520,20 @@ class NetworkPlayer extends CharacterBody3D:
 		if hussing_label:
 			hussing_label.visible = active
 
-	# --- QTE & LAUNCH ---
-
 	func _start_qte() -> void:
 		qte_active = true
 		qte_delay_timer = 0.35
 		qte_progress = 0.0
 		qte_direction = 1.0
 
-		main_manager.set_qte_lock.rpc(true)
+		if targeted_opponent:
+			targeted_opponent.is_movement_locked = true
+			if not main_manager.is_single_player:
+				main_manager.send_p2p_packet({
+					"action": "set_movement_lock",
+					"peer_id": str(targeted_opponent.peer_id),
+					"locked": true
+				})
 
 		qte_canvas = CanvasLayer.new()
 		add_child(qte_canvas)
@@ -1249,11 +1577,22 @@ class NetworkPlayer extends CharacterBody3D:
 
 	func _evaluate_qte() -> void:
 		qte_active = false
-		main_manager.set_qte_lock.rpc(false)
 
 		if qte_canvas:
 			qte_canvas.queue_free()
 			qte_canvas = null
+
+		if targeted_opponent:
+			targeted_opponent.is_movement_locked = false
+			if not main_manager.is_single_player:
+				main_manager.send_p2p_packet({
+					"action": "set_movement_lock",
+					"peer_id": str(targeted_opponent.peer_id),
+					"locked": false
+				})
+
+		# --- TRIGGER COOLDOWN FOR ATTACKER ---
+		main_manager.start_combat_cooldown()
 
 		if qte_progress >= qte_target_start and qte_progress <= (qte_target_start + qte_target_width):
 			if targeted_opponent:
@@ -1261,23 +1600,18 @@ class NetworkPlayer extends CharacterBody3D:
 				launch_timer = 0.45
 				launch_target_pos = targeted_opponent.global_position
 
-				targeted_opponent.rpc("sync_take_damage", 25)
-				main_manager.trigger_global_combat_cooldown.rpc()
+				# --- TRIGGER COOLDOWN & DAMAGE FOR VICTIM ---
+				if not main_manager.is_single_player:
+					main_manager.send_p2p_packet({
+						"action": "take_damage",
+						"peer_id": str(targeted_opponent.peer_id),
+						"amount": 25
+					})
+					main_manager.send_p2p_packet({
+						"action": "trigger_cooldown",
+						"peer_id": str(targeted_opponent.peer_id)
+					})
+				targeted_opponent.apply_damage(25)
 				main_manager.log_console("[Combat] Precision strike landed on " + targeted_opponent.name_label.text + "!")
 		else:
-			main_manager.trigger_global_combat_cooldown.rpc()
 			main_manager.log_console("[Combat] Timing missed! Cooldown triggered.")
-
-	@rpc("any_peer", "call_local", "reliable")
-	func sync_take_damage(amount: int) -> void:
-		health = max(0, health - amount)
-		_update_health_display()
-
-		if health <= 0 and main_manager and multiplayer.is_server():
-			var loser_id = peer_id
-			var winner_id = 1
-			for id in main_manager.player_nicknames:
-				if id != loser_id:
-					winner_id = id
-					break
-			main_manager.server_declare_winner(winner_id)
