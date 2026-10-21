@@ -93,17 +93,16 @@ body {
 		<link id="-gd-engine-icon" rel="icon" type="image/png" href="hussranked.icon.png" />
 <link rel="apple-touch-icon" href="hussranked.apple-touch-icon.png"/>
 <link rel="manifest" href="hussranked.manifest.json">
-<!-- Load Trystero Nostr global bundle -->
-<script src="https://cdn.jsdelivr.net/npm/trystero@0.18.0/dist/trystero-nostr.min.js"></script>
+<!-- Load Trystero Nostr via ES Module -->
+<script type="module">
+    import { joinRoom } from 'https://unpkg.com/trystero@0.18.0/dist/trystero-nostr.min.js';
 
-<script>
     window.joinTrysteroRoom = function(roomCode) {
         console.log("[Trystero] Global library loaded, joining room:", roomCode);
         const config = { appId: 'huss_ranked_1v1_game' };
         
         try {
-            // Global trystero object provided by bundle
-            window.trysteroRoom = trystero.joinRoom(config, roomCode);
+            window.trysteroRoom = joinRoom(config, roomCode);
 
             const [sendData, getData] = window.trysteroRoom.makeAction('gameData');
             window.trysteroSendAction = sendData;
