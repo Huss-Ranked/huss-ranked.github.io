@@ -100,19 +100,23 @@ body {
     window.joinTrysteroRoom = function(roomCode) {
         console.log("[Trystero] Global library loaded, joining room:", roomCode);
         
-        // Pass explicit active relays & free Google STUN servers to resolve ICE/NAT blocks
+        // Strictly free, unlimited public STUN infrastructure & top Nostr relays
         const config = { 
             appId: 'huss_ranked_1v1_game',
-            relays: [
-                'wss://relay.damus.io',
-                'wss://nos.lol',
-                'wss://relay.snort.social'
-            ],
+            relayConfig: {
+                urls: [
+                    'wss://relay.damus.io',
+                    'wss://nos.lol',
+                    'wss://nostr.mom',
+                    'wss://relay.snort.social'
+                ]
+            },
             rtcConfig: {
                 iceServers: [
                     { urls: 'stun:stun.l.google.com:19302' },
                     { urls: 'stun:stun1.l.google.com:19302' },
-                    { urls: 'stun:stun2.l.google.com:19302' }
+                    { urls: 'stun:stun2.l.google.com:19302' },
+                    { urls: 'stun:stun.cloudflare.com:3478' }
                 ]
             }
         };
