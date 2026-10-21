@@ -95,7 +95,7 @@ body {
 <link rel="manifest" href="hussranked.manifest.json">
 <!-- Load Trystero Nostr via ES Module -->
 <script type="module">
-    import { joinRoom } from 'https://unpkg.com/trystero@0.18.0/dist/trystero-nostr.min.js';
+    import { joinRoom } from 'https://esm.sh/trystero@0.18.0/nostr';
 
     window.joinTrysteroRoom = function(roomCode) {
         console.log("[Trystero] Global library loaded, joining room:", roomCode);
