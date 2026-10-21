@@ -93,17 +93,17 @@ body {
 		<link id="-gd-engine-icon" rel="icon" type="image/png" href="hussranked.icon.png" />
 <link rel="apple-touch-icon" href="hussranked.apple-touch-icon.png"/>
 <link rel="manifest" href="hussranked.manifest.json">
-<!-- Trystero Nostr P2P Signaling Script -->
-<script type="module">
-    import { joinRoom } from 'https://esm.sh/trystero@0.18.0/nostr';
+<!-- Load Trystero Nostr global bundle -->
+<script src="https://cdn.jsdelivr.net/npm/trystero@0.18.0/dist/trystero-nostr.min.js"></script>
 
-    // Global handler attached immediately
+<script>
     window.joinTrysteroRoom = function(roomCode) {
-        console.log("[Trystero] Attempting to join room:", roomCode);
+        console.log("[Trystero] Global library loaded, joining room:", roomCode);
         const config = { appId: 'huss_ranked_1v1_game' };
         
         try {
-            window.trysteroRoom = joinRoom(config, roomCode);
+            // Global trystero object provided by bundle
+            window.trysteroRoom = trystero.joinRoom(config, roomCode);
 
             const [sendData, getData] = window.trysteroRoom.makeAction('gameData');
             window.trysteroSendAction = sendData;
@@ -128,7 +128,7 @@ body {
                 }
             });
         } catch (err) {
-            console.error("[Trystero] Initialization error:", err);
+            console.error("[Trystero] Room join error:", err);
         }
     };
 
@@ -137,8 +137,6 @@ body {
             window.trysteroSendAction(JSON.parse(jsonStr));
         }
     };
-
-    console.log("[Trystero] Module loaded and window methods attached.");
 </script>
 	</head>
 	<body>
