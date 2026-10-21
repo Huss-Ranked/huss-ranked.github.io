@@ -99,7 +99,22 @@ body {
 
     window.joinTrysteroRoom = function(roomCode) {
         console.log("[Trystero] Global library loaded, joining room:", roomCode);
-        const config = { appId: 'huss_ranked_1v1_game' };
+        
+        // Pass explicit active relays & free STUN servers to bypass NAT/firewall blocks
+        const config = { 
+            appId: 'huss_ranked_1v1_game',
+            relays: [
+                'wss://relay.damus.io',
+                'wss://nos.lol',
+                'wss://relay.snort.social'
+            ],
+            rtcConfig: {
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:stun1.l.google.com:19302' }
+                ]
+            }
+        };
         
         try {
             window.trysteroRoom = joinRoom(config, roomCode);
