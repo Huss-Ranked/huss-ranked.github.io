@@ -93,13 +93,14 @@ body {
 		<link id="-gd-engine-icon" rel="icon" type="image/png" href="hussranked.icon.png" />
 <link rel="apple-touch-icon" href="hussranked.apple-touch-icon.png"/>
 <link rel="manifest" href="hussranked.manifest.json">
+<!-- Load Trystero Nostr via ES Module -->
 <script type="module">
     import { joinRoom, selfId } from 'https://esm.sh/trystero@0.18.0/nostr';
 
     window.trysteroSelfId = selfId;
 
     window.joinTrysteroRoom = function(roomCode) {
-        console.log("[Trystero] Self ID:", selfId, "Joining room:", roomCode);
+        console.log("[Trystero] Local Peer ID:", selfId, "Joining room:", roomCode);
         
         const config = { 
             appId: 'huss_ranked_1v1_game',
@@ -132,27 +133,27 @@ body {
             });
 
             window.trysteroRoom.onPeerJoin(peerId => {
-                const peers = window.trysteroRoom.getPeers();
-                // Reject 3rd or 4th peers joining the same 1v1 lobby
-                if (Object.keys(peers).length > 1) {
-                    console.warn("[Trystero] Room full! Rejecting extra peer:", peerId);
+                const connectedPeers = window.trysteroRoom.getPeers();
+                // Enforce strict 1v1 limit: reject 3rd+ connections
+                if (Object.keys(connectedPeers).length > 1) {
+                    console.warn("[Trystero] Lobby full! Rejecting extra peer:", peerId);
                     return;
                 }
                 
-                console.log("[Trystero] Opponent joined:", peerId);
+                console.log("[Trystero] Opponent peer joined:", peerId);
                 if (window._godot_on_peer_joined) {
                     window._godot_on_peer_joined(peerId);
                 }
             });
 
             window.trysteroRoom.onPeerLeave(peerId => {
-                console.log("[Trystero] Peer left:", peerId);
+                console.log("[Trystero] Peer disconnected:", peerId);
                 if (window._godot_on_peer_left) {
                     window._godot_on_peer_left(peerId);
                 }
             });
         } catch (err) {
-            console.error("[Trystero] Error:", err);
+            console.error("[Trystero] Room initialization error:", err);
         }
     };
 
