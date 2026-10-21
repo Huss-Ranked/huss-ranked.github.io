@@ -93,21 +93,20 @@ body {
 		<link id="-gd-engine-icon" rel="icon" type="image/png" href="hussranked.icon.png" />
 <link rel="apple-touch-icon" href="hussranked.apple-touch-icon.png"/>
 <link rel="manifest" href="hussranked.manifest.json">
-<!-- Load Trystero Nostr via ES Module -->
 <script type="module">
-    import { joinRoom } from 'https://esm.sh/trystero@0.18.0/nostr';
+    import { joinRoom, selfId } from 'https://esm.sh/trystero@0.18.0/nostr';
+
+    window.trysteroSelfId = selfId;
 
     window.joinTrysteroRoom = function(roomCode) {
-        console.log("[Trystero] Global library loaded, joining room:", roomCode);
+        console.log("[Trystero] Self ID:", selfId, "Joining room:", roomCode);
         
-        // Strictly free, unlimited public STUN infrastructure & top Nostr relays
         const config = { 
             appId: 'huss_ranked_1v1_game',
             relayConfig: {
                 urls: [
                     'wss://relay.damus.io',
                     'wss://nos.lol',
-                    'wss://nostr.mom',
                     'wss://relay.snort.social'
                 ]
             },
@@ -115,12 +114,11 @@ body {
                 iceServers: [
                     { urls: 'stun:stun.l.google.com:19302' },
                     { urls: 'stun:stun1.l.google.com:19302' },
-                    { urls: 'stun:stun2.l.google.com:19302' },
                     { urls: 'stun:stun.cloudflare.com:3478' }
                 ]
             }
         };
-        
+
         try {
             window.trysteroRoom = joinRoom(config, roomCode);
 
@@ -129,12 +127,19 @@ body {
 
             getData((data, peerId) => {
                 if (window._godot_on_data_received) {
-                    window._godot_on_data_received(JSON.stringify(data));
+                    window._godot_on_data_received(JSON.stringify(data), peerId);
                 }
             });
 
             window.trysteroRoom.onPeerJoin(peerId => {
-                console.log("[Trystero] Peer joined:", peerId);
+                const peers = window.trysteroRoom.getPeers();
+                // Reject 3rd or 4th peers joining the same 1v1 lobby
+                if (Object.keys(peers).length > 1) {
+                    console.warn("[Trystero] Room full! Rejecting extra peer:", peerId);
+                    return;
+                }
+                
+                console.log("[Trystero] Opponent joined:", peerId);
                 if (window._godot_on_peer_joined) {
                     window._godot_on_peer_joined(peerId);
                 }
@@ -147,7 +152,7 @@ body {
                 }
             });
         } catch (err) {
-            console.error("[Trystero] Room join error:", err);
+            console.error("[Trystero] Error:", err);
         }
     };
 
