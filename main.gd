@@ -7,8 +7,7 @@ const LOCALHOST: String = "127.0.0.1"
 var peer: WebSocketMultiplayerPeer = WebSocketMultiplayerPeer.new()
 
 # --- GAME MODE TRACKING ---
-var max_allowed_players: int = 32
-var is_1v1_mode: bool = false
+var max_allowed_players: int = 2
 var is_match_active: bool = false
 var is_game_over: bool = false
 
@@ -25,6 +24,7 @@ var pre_match_elo: int = 0
 const MAX_ELO: int = 2100
 
 var player_nicknames: Dictionary = {}
+var player_elos: Dictionary = {}
 var leaderboard_data: Dictionary = {}
 
 # --- COMBAT & COOLDOWN SYNC ---
@@ -60,10 +60,17 @@ const ANIM_DURATION: float = 2.0
 var anim_elo_label: Label = null
 var anim_fill_rect: ColorRect = null
 var anim_marker_rect: ColorRect = null
+var anim_rank_icon: TextureRect = null
+
+# --- SPRITE SHEET CONFIGURATION ---
+const SPRITE_SHEET_PATH_PNG: String = "res://rank_icons.png"
+const SPRITE_SHEET_PATH_JPG: String = "res://rank_icons.jpg"
+var loaded_sheet_texture: Texture2D = null
 
 func _ready() -> void:
 	_load_player_data()
 	_load_leaderboard_cache()
+	_init_sprite_sheet()
 
 	multiplayer.connected_to_server.connect(_on_connected_to_server)
 	multiplayer.connection_failed.connect(_on_connection_failed)
@@ -95,13 +102,13 @@ func _process(delta: float) -> void:
 
 func _unhandled_input(_event: InputEvent) -> void:
 	if world_root and Input.is_action_just_pressed("ui_cancel"):
-		if is_1v1_mode and is_match_active and not is_game_over:
+		if is_match_active and not is_game_over:
 			_forfeit_match()
 		else:
 			_return_to_main_menu()
 
 # ==============================================================================
-# CUSTOM ELO RANK TIER HELPER (100 ELO PER TIER)
+# CUSTOM ELO RANK TIER & SPRITE SHEET ATLAS HELPER
 # ==============================================================================
 
 func get_rank_name(elo: int) -> String:
@@ -147,6 +154,54 @@ func get_rank_name(elo: int) -> String:
 		return "Heavenly Huss 2"
 	else:
 		return "Heavenly Huss 3"
+
+func _init_sprite_sheet() -> void:
+	if ResourceLoader.exists(SPRITE_SHEET_PATH_PNG):
+		loaded_sheet_texture = load(SPRITE_SHEET_PATH_PNG) as Texture2D
+	elif ResourceLoader.exists(SPRITE_SHEET_PATH_JPG):
+		loaded_sheet_texture = load(SPRITE_SHEET_PATH_JPG) as Texture2D
+
+func load_rank_texture(elo: int) -> Texture2D:
+	var rank_idx = clamp(floori(elo / 100.0), 0, 20)
+	
+	if loaded_sheet_texture:
+		var col_count: int = 7
+		var col = floori(rank_idx / 3.0)
+		var row = rank_idx % 3
+		
+		var sheet_w = float(loaded_sheet_texture.get_width())
+		var sheet_h = float(loaded_sheet_texture.get_height())
+		
+		var raw_cell_w = sheet_w / float(col_count)
+		
+		# Tighter height window to completely exclude the text label below each badge
+		var crop_h: float = sheet_h * 0.14
+		var crop_y: float = 0.0
+		
+		if row == 0:
+			crop_y = sheet_h * 0.145
+		elif row == 1:
+			crop_y = sheet_h * 0.44
+		else:
+			crop_y = sheet_h * 0.705
+			
+		var pad_side: float = raw_cell_w * 0.12
+		var crop_x = (col * raw_cell_w) + pad_side
+		var crop_w = raw_cell_w - (pad_side * 2.0)
+		
+		var atlas = AtlasTexture.new()
+		atlas.atlas = loaded_sheet_texture
+		atlas.region = Rect2(crop_x, crop_y, crop_w, crop_h)
+		return atlas
+
+	var fallback_path = "res://rank_icons/rank_" + str(rank_idx) + ".png"
+	if ResourceLoader.exists(fallback_path):
+		return load(fallback_path) as Texture2D
+
+	var img = Image.create(32, 32, false, Image.FORMAT_RGBA8)
+	var hue = (rank_idx * 17 % 100) / 100.0
+	img.fill(Color.from_hsv(hue, 0.85, 0.95))
+	return ImageTexture.create_from_image(img)
 
 # ==============================================================================
 # SAVE / LOAD SYSTEM
@@ -195,7 +250,7 @@ func clear_leaderboard_data() -> void:
 	if FileAccess.file_exists(LEADERBOARD_CACHE_PATH):
 		DirAccess.remove_absolute(LEADERBOARD_CACHE_PATH)
 	if multiplayer.has_multiplayer_peer() and multiplayer.is_server():
-		sync_game_state.rpc(player_nicknames, leaderboard_data)
+		sync_game_state.rpc(player_nicknames, player_elos, leaderboard_data)
 
 # ==============================================================================
 # UI & MAIN MENU
@@ -268,7 +323,7 @@ func _build_hud_console() -> void:
 	waiting_opponent_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	waiting_opponent_label.add_theme_font_size_override("font_size", 24)
 	waiting_opponent_label.add_theme_color_override("font_color", Color(1.0, 0.9, 0.2))
-	waiting_opponent_label.visible = is_1v1_mode
+	waiting_opponent_label.visible = true
 	hud_canvas.add_child(waiting_opponent_label)
 
 	log_console("[System] Network Console initialized.")
@@ -327,26 +382,33 @@ func _build_main_menu() -> void:
 	nickname_input.alignment = HORIZONTAL_ALIGNMENT_CENTER
 	container.add_child(nickname_input)
 
+	var elo_row = HBoxContainer.new()
+	elo_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	container.add_child(elo_row)
+
+	var tex = load_rank_texture(local_elo)
+	if tex:
+		var icon = TextureRect.new()
+		icon.texture = tex
+		icon.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		icon.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+		icon.custom_minimum_size = Vector2(42, 42)
+		elo_row.add_child(icon)
+
 	var elo_lbl = Label.new()
-	elo_lbl.text = "Current ELO: " + str(local_elo) + " (" + get_rank_name(local_elo) + ")"
+	elo_lbl.text = " Current ELO: " + str(local_elo) + " (" + get_rank_name(local_elo) + ")"
 	elo_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	elo_lbl.add_theme_color_override("font_color", Color(0.4, 0.8, 1.0))
-	container.add_child(elo_lbl)
+	elo_row.add_child(elo_lbl)
 
 	var spacer = Control.new()
 	spacer.custom_minimum_size = Vector2(0, 10)
 	container.add_child(spacer)
 
-	var sandbox_btn = Button.new()
-	sandbox_btn.text = "Start / Join Sandbox"
-	sandbox_btn.custom_minimum_size = Vector2(280, 45)
-	sandbox_btn.pressed.connect(func(): _on_start_game_pressed(false))
-	container.add_child(sandbox_btn)
-
 	var pvp_btn = Button.new()
 	pvp_btn.text = "Start 1v1 Mode"
 	pvp_btn.custom_minimum_size = Vector2(280, 45)
-	pvp_btn.pressed.connect(func(): _on_start_game_pressed(true))
+	pvp_btn.pressed.connect(_on_start_game_pressed)
 	container.add_child(pvp_btn)
 
 	var leaderboard_btn = Button.new()
@@ -383,7 +445,7 @@ func _show_leaderboard_ui() -> void:
 	leaderboard_canvas.add_child(center_panel)
 
 	var panel = PanelContainer.new()
-	panel.custom_minimum_size = Vector2(340, 300)
+	panel.custom_minimum_size = Vector2(380, 320)
 	center_panel.add_child(panel)
 
 	var container = VBoxContainer.new()
@@ -395,7 +457,7 @@ func _show_leaderboard_ui() -> void:
 	container.add_child(title)
 
 	var scroll = ScrollContainer.new()
-	scroll.custom_minimum_size = Vector2(320, 200)
+	scroll.custom_minimum_size = Vector2(360, 220)
 	container.add_child(scroll)
 
 	var list = VBoxContainer.new()
@@ -409,9 +471,21 @@ func _show_leaderboard_ui() -> void:
 		var entry = display_data[player_key]
 		var elo = entry.get("elo", 0) if entry is Dictionary else 0
 		
+		var row = HBoxContainer.new()
+		list.add_child(row)
+
+		var tex = load_rank_texture(elo)
+		if tex:
+			var icon = TextureRect.new()
+			icon.texture = tex
+			icon.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+			icon.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+			icon.custom_minimum_size = Vector2(32, 32)
+			row.add_child(icon)
+
 		var label = Label.new()
-		label.text = str(player_key) + ": " + str(elo) + " ELO (" + get_rank_name(elo) + ")"
-		list.add_child(label)
+		label.text = " " + str(player_key) + ": " + str(elo) + " ELO (" + get_rank_name(elo) + ")"
+		row.add_child(label)
 
 	var back_btn = Button.new()
 	back_btn.text = "Back to Menu"
@@ -423,9 +497,6 @@ func _show_leaderboard_ui() -> void:
 # ==============================================================================
 
 func _show_match_results_screen(outcome_title: String, is_winner: bool, elo_change: int, start_elo: int, target_elo: int, hit_max_elo: bool = false) -> void:
-	is_game_over = true
-	is_match_active = false
-
 	_clear_ui()
 
 	if multiplayer.is_server():
@@ -447,7 +518,7 @@ func _show_match_results_screen(outcome_title: String, is_winner: bool, elo_chan
 	results_canvas.add_child(center)
 
 	var panel = PanelContainer.new()
-	panel.custom_minimum_size = Vector2(440, 320)
+	panel.custom_minimum_size = Vector2(440, 340)
 	center.add_child(panel)
 
 	var container = VBoxContainer.new()
@@ -471,9 +542,19 @@ func _show_match_results_screen(outcome_title: String, is_winner: bool, elo_chan
 	delta_lbl.add_theme_font_size_override("font_size", 18 if hit_max_elo else 20)
 	container.add_child(delta_lbl)
 
+	var rank_row = HBoxContainer.new()
+	rank_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	container.add_child(rank_row)
+
+	anim_rank_icon = TextureRect.new()
+	anim_rank_icon.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	anim_rank_icon.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	anim_rank_icon.custom_minimum_size = Vector2(42, 42)
+	rank_row.add_child(anim_rank_icon)
+
 	anim_elo_label = Label.new()
 	anim_elo_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	container.add_child(anim_elo_label)
+	rank_row.add_child(anim_elo_label)
 
 	var spacer = Control.new()
 	spacer.custom_minimum_size = Vector2(0, 15)
@@ -503,7 +584,7 @@ func _show_match_results_screen(outcome_title: String, is_winner: bool, elo_chan
 	bar_vbox.add_child(text_row)
 
 	var left_lbl = Label.new()
-	var current_tier_base = (target_elo / 100) * 100
+	var current_tier_base = floori(target_elo / 100.0) * 100
 	left_lbl.text = str(current_tier_base) + " ELO"
 	left_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	left_lbl.add_theme_font_size_override("font_size", 11)
@@ -539,7 +620,10 @@ func _show_match_results_screen(outcome_title: String, is_winner: bool, elo_chan
 func _update_elo_animation_ui() -> void:
 	var val_int = int(round(anim_current_elo))
 	if anim_elo_label:
-		anim_elo_label.text = "Rating: " + str(val_int) + " ELO (" + get_rank_name(val_int) + ")"
+		anim_elo_label.text = " Rating: " + str(val_int) + " ELO (" + get_rank_name(val_int) + ")"
+
+	if anim_rank_icon:
+		anim_rank_icon.texture = load_rank_texture(val_int)
 
 	var current_step_progress = 1.0 if val_int >= MAX_ELO else (val_int % 100) / 100.0
 
@@ -565,9 +649,8 @@ func _clear_ui() -> void:
 		results_canvas.queue_free()
 		results_canvas = null
 
-func _on_start_game_pressed(mode_1v1: bool) -> void:
-	is_1v1_mode = mode_1v1
-	max_allowed_players = 2 if mode_1v1 else 32
+func _on_start_game_pressed() -> void:
+	max_allowed_players = 2
 	pre_match_elo = local_elo
 	is_match_active = true
 	is_game_over = false
@@ -584,24 +667,35 @@ func _on_start_game_pressed(mode_1v1: bool) -> void:
 
 func _forfeit_match() -> void:
 	log_console("[Match] You forfeited the 1v1 match.")
+	if is_game_over:
+		return
 	is_game_over = true
-	if multiplayer.has_multiplayer_peer():
+
+	if multiplayer.has_multiplayer_peer() and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED:
 		if multiplayer.is_server():
 			for id in player_nicknames:
 				if id != 1:
-					notify_match_outcome.rpc_id(id, id)
+					notify_match_outcome.rpc(id)
 		else:
 			rpc_id(1, "request_host_forfeit_win")
-	
-	var start_elo = local_elo
-	local_elo = max(0, local_elo - 25)
-	save_player_data()
-	_show_match_results_screen("You lost the 1v1 (Forfeit)", false, -25, start_elo, local_elo)
+	else:
+		var start_elo = local_elo
+		local_elo = max(0, local_elo - 25)
+		save_player_data()
+		_show_match_results_screen("You lost the 1v1 (Forfeit)", false, -25, start_elo, local_elo)
 
 @rpc("any_peer", "call_local", "reliable")
 func request_host_forfeit_win() -> void:
 	if multiplayer.is_server() and not is_game_over:
-		notify_match_outcome.rpc(1)
+		var sender_id = multiplayer.get_remote_sender_id()
+		var winner_id = 1 if sender_id != 1 else sender_id
+		server_declare_winner(winner_id)
+
+func server_declare_winner(winner_peer_id: int) -> void:
+	if not multiplayer.is_server() or is_game_over:
+		return
+	is_game_over = true
+	notify_match_outcome.rpc(winner_peer_id)
 
 func _return_to_main_menu(error_msg: String = "") -> void:
 	pending_error_message = error_msg
@@ -613,6 +707,7 @@ func _return_to_main_menu(error_msg: String = "") -> void:
 
 func _cleanup_network() -> void:
 	player_nicknames.clear()
+	player_elos.clear()
 	multiplayer.multiplayer_peer = null
 	if peer:
 		peer.close()
@@ -644,7 +739,7 @@ func _start_hosting() -> void:
 	var err = peer.create_server(PORT)
 	if err == OK:
 		multiplayer.multiplayer_peer = peer
-		log_console("[Host] Server online on port " + str(PORT) + (" (1v1 Mode)" if is_1v1_mode else " (Sandbox)"))
+		log_console("[Host] Server online on port " + str(PORT) + " (1v1 Mode)")
 		_spawn_player(1)
 		register_player_info(1, local_nickname, local_elo)
 	else:
@@ -664,7 +759,7 @@ func trigger_global_combat_cooldown() -> void:
 @rpc("any_peer", "call_local", "reliable")
 func register_player_info(peer_id: int, nickname: String, elo: int) -> void:
 	if multiplayer.is_server():
-		if is_1v1_mode and player_nicknames.size() >= max_allowed_players and not player_nicknames.has(peer_id):
+		if player_nicknames.size() >= max_allowed_players and not player_nicknames.has(peer_id):
 			reject_full_room.rpc_id(peer_id)
 			return
 
@@ -674,16 +769,17 @@ func register_player_info(peer_id: int, nickname: String, elo: int) -> void:
 				return
 
 	player_nicknames[peer_id] = nickname
+	player_elos[peer_id] = elo
 	leaderboard_data[nickname] = {"elo": elo}
 	_save_leaderboard_cache()
 
 	if players_container and players_container.has_node(str(peer_id)):
 		var p_node = players_container.get_node(str(peer_id))
-		if p_node.has_method("set_nickname_label"):
-			p_node.set_nickname_label(nickname)
+		if p_node.has_method("update_nametag"):
+			p_node.update_nametag(nickname, elo)
 
 	if multiplayer.is_server():
-		sync_game_state.rpc(player_nicknames, leaderboard_data)
+		sync_game_state.rpc(player_nicknames, player_elos, leaderboard_data)
 
 @rpc("authority", "call_local", "reliable")
 func reject_full_room() -> void:
@@ -694,8 +790,9 @@ func reject_duplicate_nickname() -> void:
 	_return_to_main_menu("Error: Someone in the room has the same nickname as you, change your nickname and try again.")
 
 @rpc("authority", "call_local", "reliable")
-func sync_game_state(nicknames: Dictionary, leaderboard: Dictionary) -> void:
+func sync_game_state(nicknames: Dictionary, elos: Dictionary, leaderboard: Dictionary) -> void:
 	player_nicknames = nicknames
+	player_elos = elos
 	leaderboard_data = leaderboard
 	_save_leaderboard_cache()
 
@@ -703,14 +800,11 @@ func sync_game_state(nicknames: Dictionary, leaderboard: Dictionary) -> void:
 		for id in player_nicknames:
 			if players_container.has_node(str(id)):
 				var p_node = players_container.get_node(str(id))
-				if p_node.has_method("set_nickname_label"):
-					p_node.set_nickname_label(player_nicknames[id])
+				if p_node.has_method("update_nametag"):
+					p_node.update_nametag(player_nicknames[id], player_elos.get(id, 0))
 
-@rpc("any_peer", "call_local", "reliable")
+@rpc("authority", "call_local", "reliable")
 func notify_match_outcome(winner_peer_id: int) -> void:
-	if is_game_over:
-		return
-
 	is_game_over = true
 	var my_id = multiplayer.get_unique_id()
 	var is_winner = (my_id == winner_peer_id)
@@ -757,7 +851,7 @@ func _on_connection_failed() -> void:
 
 func _on_server_disconnected() -> void:
 	log_console("[Client] Disconnected from server.")
-	if is_1v1_mode and is_match_active and not is_game_over:
+	if is_match_active and not is_game_over:
 		var start_elo = local_elo
 		local_elo = max(0, local_elo - 25)
 		save_player_data()
@@ -772,20 +866,19 @@ func _on_peer_connected(id: int) -> void:
 
 	if multiplayer.is_server():
 		_spawn_player(id)
-
-		if is_1v1_mode:
-			teleport_player.rpc_id(1, Vector3(-15, 1, 0), -90.0)
-			teleport_player.rpc_id(id, Vector3(15, 1, 0), 90.0)
+		teleport_player.rpc_id(1, Vector3(-15, 1, 0), -90.0)
+		teleport_player.rpc_id(id, Vector3(15, 1, 0), 90.0)
 
 func _on_peer_disconnected(id: int) -> void:
 	log_console("[Network] Peer disconnected: ID " + str(id))
 	var had_nickname = player_nicknames.has(id)
 	player_nicknames.erase(id)
+	player_elos.erase(id)
 	
-	if is_1v1_mode and is_match_active and not is_game_over and multiplayer.is_server() and had_nickname:
-		notify_match_outcome.rpc(1)
+	if is_match_active and not is_game_over and multiplayer.is_server() and had_nickname:
+		server_declare_winner(1)
 	elif multiplayer.is_server():
-		sync_game_state.rpc(player_nicknames, leaderboard_data)
+		sync_game_state.rpc(player_nicknames, player_elos, leaderboard_data)
 		
 	if players_container and players_container.has_node(str(id)):
 		players_container.get_node(str(id)).queue_free()
@@ -838,15 +931,12 @@ func _custom_spawn_player(peer_id: Variant) -> Node:
 	var player = NetworkPlayer.new(id, self)
 	player.name = str(id)
 
-	if is_1v1_mode:
-		if id == 1:
-			player.position = Vector3(-15, 1, 0)
-			player.rotation_degrees.y = -90
-		else:
-			player.position = Vector3(15, 1, 0)
-			player.rotation_degrees.y = 90
+	if id == 1:
+		player.position = Vector3(-15, 1, 0)
+		player.rotation_degrees.y = -90
 	else:
-		player.position = Vector3(randf_range(-5, 5), 1, randf_range(-5, 5))
+		player.position = Vector3(15, 1, 0)
+		player.rotation_degrees.y = 90
 
 	return player
 
@@ -935,8 +1025,11 @@ class NetworkPlayer extends CharacterBody3D:
 		name_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 		name_label.font_size = 22
 		name_label.outline_size = 6
-		name_label.text = main_manager.player_nicknames.get(peer_id, "Player " + str(peer_id)) if main_manager else "Player"
 		add_child(name_label)
+
+		var nick = main_manager.player_nicknames.get(peer_id, "Player " + str(peer_id)) if main_manager else "Player"
+		var elo = main_manager.player_elos.get(peer_id, 0) if main_manager else 0
+		update_nametag(nick, elo)
 
 		hussing_label = Label3D.new()
 		hussing_label.position = Vector3(0, 2.6, 0)
@@ -956,9 +1049,10 @@ class NetworkPlayer extends CharacterBody3D:
 			add_child(camera)
 			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 
-	func set_nickname_label(nickname: String) -> void:
-		if name_label:
-			name_label.text = nickname
+	func update_nametag(nickname: String, elo: int) -> void:
+		if name_label and main_manager:
+			var rank_title = main_manager.get_rank_name(elo)
+			name_label.text = "[" + rank_title + "] " + nickname
 
 	func _build_health_label() -> void:
 		var hp_label = Label3D.new()
@@ -1180,5 +1274,10 @@ class NetworkPlayer extends CharacterBody3D:
 		_update_health_display()
 
 		if health <= 0 and main_manager and multiplayer.is_server():
-			var winner_id = 1 if peer_id != 1 else 2
-			main_manager.notify_match_outcome.rpc(winner_id)
+			var loser_id = peer_id
+			var winner_id = 1
+			for id in main_manager.player_nicknames:
+				if id != loser_id:
+					winner_id = id
+					break
+			main_manager.server_declare_winner(winner_id)
