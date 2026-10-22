@@ -1,4 +1,1 @@
-TODO:
-  Implement Trystero for P2P
-  Add Map voting
-  Improve GUI
+A backup of the game in a playable state.
