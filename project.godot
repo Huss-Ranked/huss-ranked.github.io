@@ -10,10 +10,10 @@ config_version=5
 
 [application]
 
-config/name="Huss ranked V2"
+config/name="Huss Ranked"
 run/main_scene="uid://gxlsomg0ci22"
 config/features=PackedStringArray("4.7", "GL Compatibility")
-config/icon="res://icon.svg"
+config/icon="uid://d1d8fjfexak8g"
 
 [display]
 

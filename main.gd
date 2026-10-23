@@ -6,21 +6,99 @@ var is_match_active: bool = false
 var is_game_over: bool = false
 var is_host_peer: bool = false
 var is_single_player: bool = false
+var opponent_trystero_id: String = ""
 
 # --- GLOBAL COMBAT LOCKS ---
 var is_qte_in_progress: bool = false
 
+const FALL_BOUNDARY_Y: float = -30.0
+
 # --- MAP POOL & BANNING SYSTEM ---
 var map_pool: Array = [
-	{"name": "Neo Red", "color": Color(0.85, 0.2, 0.2), "wall_color": Color(0.4, 0.1, 0.1)},
-	{"name": "Cyber Blue", "color": Color(0.15, 0.45, 0.9), "wall_color": Color(0.1, 0.2, 0.5)},
-	{"name": "Emerald Grid", "color": Color(0.1, 0.75, 0.35), "wall_color": Color(0.05, 0.35, 0.15)},
-	{"name": "Solar Amber", "color": Color(0.9, 0.65, 0.1), "wall_color": Color(0.45, 0.3, 0.05)},
-	{"name": "Void Purple", "color": Color(0.5, 0.15, 0.8), "wall_color": Color(0.25, 0.05, 0.4)},
-	{"name": "Rust Canyon", "color": Color(0.7, 0.35, 0.15), "wall_color": Color(0.35, 0.15, 0.05)},
-	{"name": "Toxic Mint", "color": Color(0.2, 0.85, 0.65), "wall_color": Color(0.05, 0.4, 0.3)},
-	{"name": "Frost White", "color": Color(0.8, 0.9, 0.95), "wall_color": Color(0.4, 0.5, 0.6)},
-	{"name": "Obsidian Core", "color": Color(0.12, 0.12, 0.15), "wall_color": Color(0.05, 0.05, 0.08)}
+	{
+		"name": "Obsidian Void",
+		"color": Color(0.12, 0.08, 0.18),
+		"wall_color": Color(0.4, 0.1, 0.6),
+		"theme": "Neon Void & Wall Portals",
+		"mechanic": "portals"
+	},
+	{
+		"name": "Solar Canyon",
+		"color": Color(0.85, 0.5, 0.15),
+		"wall_color": Color(0.3, 0.15, 0.05),
+		"theme": "Desert Ramps & High Ground",
+		"mechanic": "slopes"
+	},
+	{
+		"name": "Cyber Frost",
+		"color": Color(0.2, 0.7, 0.95),
+		"wall_color": Color(0.05, 0.25, 0.5),
+		"theme": "Glacial Tech & Jump Pads",
+		"mechanic": "jump_pads"
+	},
+	{
+		"name": "Toxic Core",
+		"color": Color(0.25, 0.85, 0.35),
+		"wall_color": Color(0.1, 0.25, 0.1),
+		"theme": "Biohazard Acid Pools",
+		"mechanic": "toxic_hazards"
+	},
+	{
+		"name": "Glacial Rift",
+		"color": Color(0.85, 0.95, 1.0),
+		"wall_color": Color(0.35, 0.55, 0.75),
+		"theme": "Low Friction Ice Arena",
+		"mechanic": "ice_physics"
+	},
+	{
+		"name": "Nebula Zenith",
+		"color": Color(0.45, 0.1, 0.75),
+		"wall_color": Color(0.85, 0.2, 0.8),
+		"theme": "Cosmic Low Gravity",
+		"mechanic": "low_gravity"
+	},
+	{
+		"name": "Overclock Cyber",
+		"color": Color(0.95, 0.75, 0.1),
+		"wall_color": Color(0.15, 0.15, 0.2),
+		"theme": "Gold Cyber & Recharge Pads",
+		"mechanic": "recharge_pads"
+	},
+	{
+		"name": "Prismatic Labyrinth",
+		"color": Color(0.9, 0.95, 0.95),
+		"wall_color": Color(0.5, 0.75, 0.9, 0.4),
+		"theme": "Glass Maze & Corridors",
+		"mechanic": "glass_barriers"
+	},
+	{
+		"name": "Rust Inferno",
+		"color": Color(0.75, 0.25, 0.1),
+		"wall_color": Color(0.35, 0.1, 0.05),
+		"theme": "Molten Canyon Ramps",
+		"mechanic": "slopes"
+	},
+	{
+		"name": "Emerald Trench",
+		"color": Color(0.1, 0.8, 0.45),
+		"wall_color": Color(0.05, 0.3, 0.2),
+		"theme": "Toxic Green Jump Bouncers",
+		"mechanic": "jump_pads"
+	},
+	{
+		"name": "Eclipse Gate",
+		"color": Color(0.08, 0.08, 0.12),
+		"wall_color": Color(0.8, 0.1, 0.3),
+		"theme": "Shadow Teleport Flanks",
+		"mechanic": "portals"
+	},
+	{
+		"name": "Hyper Red",
+		"color": Color(0.9, 0.15, 0.25),
+		"wall_color": Color(0.35, 0.05, 0.1),
+		"theme": "Close Quarters Crimson Arena",
+		"mechanic": "labyrinth"
+	}
 ]
 
 var current_3_maps: Array = []
@@ -80,7 +158,8 @@ var anim_fill_rect: ColorRect = null
 var anim_marker_rect: ColorRect = null
 var anim_rank_icon: TextureRect = null
 
-# --- SPRITE SHEET CONFIGURATION ---
+# --- ASSET PATHS ---
+const TITLE_CARD_PATH: String = "res://CARD.png"
 const SPRITE_SHEET_PATH_PNG: String = "res://rank_icons.png"
 const SPRITE_SHEET_PATH_JPG: String = "res://rank_icons.jpg"
 var loaded_sheet_texture: Texture2D = null
@@ -90,21 +169,21 @@ var js_on_peer_join_cb: JavaScriptObject
 var js_on_peer_leave_cb: JavaScriptObject
 var js_on_data_receive_cb: JavaScriptObject
 
-func _ready() -> void:
+func _ready() -> void :
 	_load_player_data()
 	_load_leaderboard_cache()
 	_init_sprite_sheet()
 	_init_trystero_bridge()
 	_build_main_menu()
 
-func _process(delta: float) -> void:
+func _process(delta: float) -> void :
 	if combat_cooldown_active:
 		combat_cooldown_timer -= delta
 		if cooldown_bar_container:
 			cooldown_bar_container.visible = true
 		if cooldown_progress_bar:
 			cooldown_progress_bar.value = combat_cooldown_timer
-			
+
 		if combat_cooldown_timer <= 0.0:
 			combat_cooldown_active = false
 			combat_cooldown_timer = 0.0
@@ -120,7 +199,7 @@ func _process(delta: float) -> void:
 		if t >= 1.0:
 			is_animating_elo = false
 
-func start_combat_cooldown() -> void:
+func start_combat_cooldown() -> void :
 	combat_cooldown_active = true
 	combat_cooldown_timer = COMBAT_COOLDOWN_DURATION
 	if cooldown_progress_bar:
@@ -129,7 +208,13 @@ func start_combat_cooldown() -> void:
 	if cooldown_bar_container:
 		cooldown_bar_container.visible = true
 
-func _unhandled_input(_event: InputEvent) -> void:
+func reset_combat_cooldown() -> void :
+	combat_cooldown_active = false
+	combat_cooldown_timer = 0.0
+	if cooldown_bar_container:
+		cooldown_bar_container.visible = false
+
+func _unhandled_input(_event: InputEvent) -> void :
 	if Input.is_action_just_pressed("ui_cancel"):
 		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 		if is_match_active and not is_game_over:
@@ -137,11 +222,8 @@ func _unhandled_input(_event: InputEvent) -> void:
 		else:
 			_return_to_main_menu()
 
-# ==============================================================================
-# 1. TRYSTERO WEBRTC BRIDGE IMPLEMENTATION
-# ==============================================================================
 
-func _init_trystero_bridge() -> void:
+func _init_trystero_bridge() -> void :
 	if not OS.has_feature("web"):
 		return
 
@@ -159,82 +241,96 @@ func _init_trystero_bridge() -> void:
 		window.trysteroSendAction = null;
 		window.trysteroGetAction = null;
 
-		window.joinTrysteroRoom = function(roomCode) {
-			if (typeof joinRoom === 'undefined') {
-				console.error("[Trystero] Library not loaded in HTML.");
+		window.leaveTrysteroRoom = function() {
+			if (window.trysteroRoom) {
+				window.trysteroRoom.leave();
+			}
+			window.trysteroRoom = null;
+			window.trysteroSendAction = null;
+		};
+
+		window.joinTrysteroRoomWhenReady = function(roomCode, attempts = 0) {
+			if (typeof window.joinTrysteroRoom !== 'function') {
+				if (attempts < 40) {
+					setTimeout(() => window.joinTrysteroRoomWhenReady(roomCode, attempts + 1), 250);
+				} else {
+					console.error(\"[Trystero] HTML bridge never loaded - check the esm.sh import.\");
+				}
 				return;
 			}
 
-			const config = { appId: 'huss_ranked_1v1_game' };
-			window.trysteroRoom = joinRoom(config, roomCode);
-
-			const [sendData, getData] = window.trysteroRoom.makeAction('gameData');
-			window.trysteroSendAction = sendData;
-
-			getData((data, peerId) => {
-				window._godot_on_data_received(JSON.stringify(data));
-			});
-
-			window.trysteroRoom.onPeerJoin(peerId => {
-				window._godot_on_peer_joined(peerId);
-			});
-
-			window.trysteroRoom.onPeerLeave(peerId => {
-				window._godot_on_peer_left(peerId);
-			});
-		};
-
-		window.sendTrysteroPacket = function(jsonStr) {
-			if (window.trysteroSendAction) {
-				const data = JSON.parse(jsonStr);
-				window.trysteroSendAction(data);
+			if (window.trysteroRoom) {
+				window.leaveTrysteroRoom();
 			}
+
+			window.joinTrysteroRoom(roomCode);
 		};
 	""", true)
 
-func _on_trystero_peer_joined(args: Array) -> void:
+func _leave_trystero_room() -> void :
+	if not OS.has_feature("web"):
+		return
+	var window = JavaScriptBridge.get_interface("window")
+	window.leaveTrysteroRoom()
+
+func _on_trystero_peer_joined(args: Array) -> void :
 	var peer_id_str: String = args[0]
+	if opponent_trystero_id != "":
+		return
+
+	var window = JavaScriptBridge.get_interface("window")
+	var my_trystero_id = window.trysteroSelfId
+	if typeof(my_trystero_id) != TYPE_STRING or my_trystero_id == "":
+		log_console("[Trystero] selfId missing - check the HTML import.")
+		return
+
+	opponent_trystero_id = peer_id_str
+	is_host_peer = my_trystero_id < peer_id_str
 	log_console("[Trystero] Opponent found! Peer ID: " + peer_id_str)
 
 	if waiting_opponent_label:
 		waiting_opponent_label.visible = false
 
-	leaderboard_data[local_nickname] = {"elo": local_elo}
-	_save_leaderboard_cache()
-
 	send_p2p_packet({
-		"action": "register",
-		"peer_id": 1 if is_host_peer else 2,
-		"nickname": local_nickname,
-		"elo": local_elo,
+		"action": "register", 
+		"peer_id": 1 if is_host_peer else 2, 
+		"nickname": local_nickname, 
+		"elo": local_elo, 
 		"leaderboard": leaderboard_data
 	})
 
 	if is_host_peer and current_3_maps.is_empty():
-		var shuffled = map_pool.duplicate()
-		shuffled.shuffle()
-		current_3_maps = [shuffled[0], shuffled[1], shuffled[2]]
+		var indices: Array = range(map_pool.size())
+		indices.shuffle()
+		var picked: Array = [indices[0], indices[1], indices[2]]
+		for i in picked:
+			current_3_maps.append(map_pool[i])
 
 		send_p2p_packet({
-			"action": "init_map_ban",
-			"maps": current_3_maps
+			"action": "init_map_ban", 
+			"map_indices": picked
 		})
 		_start_map_ban_phase()
 
-func _on_trystero_peer_left(args: Array) -> void:
+func _on_trystero_peer_left(args: Array) -> void :
 	var peer_id_str: String = args[0]
-	log_console("[Trystero] Opponent disconnected: " + peer_id_str)
-	if is_match_active and not is_game_over and not is_single_player:
-		_process_match_outcome(1 if is_host_peer else 2)
+	if peer_id_str != opponent_trystero_id or is_game_over or is_single_player:
+		return
 
-func _on_trystero_data_received(args: Array) -> void:
+	log_console("[Trystero] Opponent disconnected: " + peer_id_str)
+	if is_match_active:
+		_process_match_outcome(1 if is_host_peer else 2)
+	else:
+		_return_to_main_menu("Opponent disconnected.")
+
+func _on_trystero_data_received(args: Array) -> void :
 	var raw_json: String = args[0]
 	var json = JSON.new()
 	if json.parse(raw_json) == OK:
 		var data_dict: Dictionary = json.data
 		_handle_incoming_p2p_packet(data_dict)
 
-func _handle_incoming_p2p_packet(data: Dictionary) -> void:
+func _handle_incoming_p2p_packet(data: Dictionary) -> void :
 	var action = data.get("action", "")
 	match action:
 		"register":
@@ -246,28 +342,37 @@ func _handle_incoming_p2p_packet(data: Dictionary) -> void:
 
 			var incoming_lb = data.get("leaderboard", {})
 			for p_nick in incoming_lb:
-				if not leaderboard_data.has(p_nick) or incoming_lb[p_nick].get("elo", 0) > leaderboard_data[p_nick].get("elo", 0):
-					leaderboard_data[p_nick] = incoming_lb[p_nick]
+				if p_nick == local_nickname or leaderboard_data.has(p_nick):
+					continue
+				leaderboard_data[p_nick] = incoming_lb[p_nick]
 
 			leaderboard_data[nick] = {"elo": elo}
 			_save_leaderboard_cache()
 
 			if is_host_peer:
 				send_p2p_packet({
-					"action": "sync_state",
-					"nicknames": player_nicknames,
-					"elos": player_elos,
+					"action": "sync_state", 
+					"nicknames": player_nicknames, 
+					"elos": player_elos, 
 					"leaderboard": leaderboard_data
 				})
 		"sync_state":
-			player_nicknames = data.get("nicknames", {})
-			player_elos = data.get("elos", {})
+			var incoming_nicks = data.get("nicknames", {})
+			for k in incoming_nicks:
+				player_nicknames[int(k)] = String(incoming_nicks[k])
+			var incoming_elos = data.get("elos", {})
+			for k in incoming_elos:
+				player_elos[int(k)] = int(incoming_elos[k])
 			var incoming_lb = data.get("leaderboard", {})
 			for p_nick in incoming_lb:
+				if p_nick == local_nickname:
+					continue
 				leaderboard_data[p_nick] = incoming_lb[p_nick]
 			_save_leaderboard_cache()
 		"init_map_ban":
-			current_3_maps = data.get("maps", [])
+			current_3_maps.clear()
+			for i in data.get("map_indices", []):
+				current_3_maps.append(map_pool[int(i)])
 			_start_map_ban_phase()
 		"ban_map":
 			var banned_idx = int(data.get("banned_index", -1))
@@ -289,6 +394,14 @@ func _handle_incoming_p2p_packet(data: Dictionary) -> void:
 				var p_node = players_container.get_node(target_id) as NetworkPlayer
 				if p_node:
 					p_node.is_movement_locked = locked_state
+		"trigger_clash":
+			var my_id = 1 if is_host_peer else 2
+			if players_container and players_container.has_node(str(my_id)):
+				var local_p = players_container.get_node(str(my_id)) as NetworkPlayer
+				if local_p:
+					var opp_id = 2 if my_id == 1 else 1
+					var opp_p = players_container.get_node_or_null(str(opp_id)) as NetworkPlayer
+					local_p.trigger_repulse_clash(opp_p)
 		"trigger_cooldown":
 			start_combat_cooldown()
 		"take_damage":
@@ -302,7 +415,7 @@ func _handle_incoming_p2p_packet(data: Dictionary) -> void:
 			var winner_id = int(data.get("winner_peer_id", 1))
 			_process_match_outcome(winner_id)
 
-func send_p2p_packet(data: Dictionary) -> void:
+func send_p2p_packet(data: Dictionary) -> void :
 	if not OS.has_feature("web") or is_single_player:
 		return
 
@@ -310,9 +423,6 @@ func send_p2p_packet(data: Dictionary) -> void:
 	var window = JavaScriptBridge.get_interface("window")
 	window.sendTrysteroPacket(json_string)
 
-# ==============================================================================
-# 2. TOP-DOWN MAP TEXTURE GENERATOR & MAP VETO GUI
-# ==============================================================================
 
 func generate_topdown_map_texture(map_info: Dictionary, is_banned: bool = false) -> Texture2D:
 	var width = 160
@@ -342,17 +452,17 @@ func generate_topdown_map_texture(map_info: Dictionary, is_banned: bool = false)
 
 	return ImageTexture.create_from_image(img)
 
-func _draw_img_rect(img: Image, start_x: int, start_y: int, rect_w: int, rect_h: int, color: Color) -> void:
+func _draw_img_rect(img: Image, start_x: int, start_y: int, rect_w: int, rect_h: int, color: Color) -> void :
 	for x in range(start_x, clamp(start_x + rect_w, 0, img.get_width())):
 		for y in range(start_y, clamp(start_y + rect_h, 0, img.get_height())):
 			img.set_pixel(x, y, color)
 
-func _start_map_ban_phase() -> void:
+func _start_map_ban_phase() -> void :
 	banned_map_indices.clear()
 	local_ban_turn = is_host_peer or is_single_player
 	_build_map_ban_ui()
 
-func _build_map_ban_ui() -> void:
+func _build_map_ban_ui() -> void :
 	if map_ban_canvas: map_ban_canvas.queue_free()
 
 	map_ban_canvas = CanvasLayer.new()
@@ -396,7 +506,7 @@ func _build_map_ban_ui() -> void:
 
 	_refresh_map_ban_ui()
 
-func _refresh_map_ban_ui() -> void:
+func _refresh_map_ban_ui() -> void :
 	if not map_ban_canvas or not map_row_container: return
 
 	if map_ban_header_label:
@@ -418,14 +528,14 @@ func _refresh_map_ban_ui() -> void:
 		card.add_child(vbox)
 
 		var preview_container = PanelContainer.new()
-		preview_container.custom_minimum_size = Vector2(160, 140)
+		preview_container.custom_minimum_size = Vector2(160, 130)
 		vbox.add_child(preview_container)
 
 		var preview_rect = TextureRect.new()
 		preview_rect.texture = generate_topdown_map_texture(map_info, is_banned)
 		preview_rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 		preview_rect.stretch_mode = TextureRect.STRETCH_SCALE
-		preview_rect.custom_minimum_size = Vector2(160, 140)
+		preview_rect.custom_minimum_size = Vector2(160, 130)
 		preview_container.add_child(preview_rect)
 
 		if is_banned:
@@ -444,6 +554,13 @@ func _refresh_map_ban_ui() -> void:
 		map_name.add_theme_font_size_override("font_size", 14)
 		vbox.add_child(map_name)
 
+		var map_theme_lbl = Label.new()
+		map_theme_lbl.text = map_info.get("theme", "")
+		map_theme_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		map_theme_lbl.add_theme_font_size_override("font_size", 10)
+		map_theme_lbl.add_theme_color_override("font_color", Color(0.7, 0.9, 1.0))
+		vbox.add_child(map_theme_lbl)
+
 		var ban_btn = Button.new()
 		if is_banned:
 			ban_btn.text = "BANNED"
@@ -451,10 +568,10 @@ func _refresh_map_ban_ui() -> void:
 		else:
 			ban_btn.text = "Ban Map"
 			ban_btn.disabled = not local_ban_turn
-			ban_btn.pressed.connect(func(): _on_map_ban_clicked(i))
+			ban_btn.pressed.connect( func(): _on_map_ban_clicked(i))
 		vbox.add_child(ban_btn)
 
-func _on_map_ban_clicked(map_idx: int) -> void:
+func _on_map_ban_clicked(map_idx: int) -> void :
 	if not local_ban_turn or banned_map_indices.has(map_idx):
 		return
 
@@ -464,13 +581,13 @@ func _on_map_ban_clicked(map_idx: int) -> void:
 
 	if not is_single_player:
 		send_p2p_packet({
-			"action": "ban_map",
+			"action": "ban_map", 
 			"banned_index": map_idx
 		})
 
 	_check_map_ban_completion()
 
-func _check_map_ban_completion() -> void:
+func _check_map_ban_completion() -> void :
 	var required_bans = 2
 
 	if is_single_player and banned_map_indices.size() < 2:
@@ -490,19 +607,17 @@ func _check_map_ban_completion() -> void:
 
 		_start_p2p_game()
 
-# ==============================================================================
-# 3. MATCHMAKING UI & GAME FLOW
-# ==============================================================================
 
-func _on_find_match_pressed() -> void:
-	if nickname_input and nickname_input.text.strip_edges() != "":
-		local_nickname = nickname_input.text.strip_edges()
-		save_player_data()
+func _on_find_match_pressed() -> void :
+	_save_nickname_from_input()
 
 	is_single_player = false
-	is_host_peer = true
+	is_host_peer = false
+	opponent_trystero_id = ""
 	current_3_maps.clear()
 	banned_map_indices.clear()
+	player_nicknames.clear()
+	player_elos.clear()
 
 	log_console("[Matchmaking] Joining Trystero P2P room...")
 
@@ -511,16 +626,10 @@ func _on_find_match_pressed() -> void:
 
 	if OS.has_feature("web"):
 		var window = JavaScriptBridge.get_interface("window")
-		window.joinTrysteroRoom("public_1v1_room")
+		window.joinTrysteroRoomWhenReady("public_1v1_room")
 
-	var my_id = 1
-	player_nicknames[my_id] = local_nickname
-	player_elos[my_id] = local_elo
-
-func _on_single_player_pressed() -> void:
-	if nickname_input and nickname_input.text.strip_edges() != "":
-		local_nickname = nickname_input.text.strip_edges()
-		save_player_data()
+func _on_single_player_pressed() -> void :
+	_save_nickname_from_input()
 
 	is_single_player = true
 	is_host_peer = true
@@ -540,7 +649,7 @@ func _on_single_player_pressed() -> void:
 
 	_start_map_ban_phase()
 
-func _start_p2p_game() -> void:
+func _start_p2p_game() -> void :
 	max_allowed_players = 2
 	pre_match_elo = local_elo
 	is_match_active = true
@@ -550,16 +659,15 @@ func _start_p2p_game() -> void:
 	_build_3d_environment()
 
 	var my_id = 1 if is_host_peer else 2
-	_spawn_player(my_id)
 	player_nicknames[my_id] = local_nickname
 	player_elos[my_id] = local_elo
 
+	_spawn_player(1)
 	if is_single_player:
 		_spawn_test_dummy(2)
+	else:
+		_spawn_player(2)
 
-# ==============================================================================
-# CUSTOM ELO RANK TIER & SPRITE SHEET ATLAS HELPER
-# ==============================================================================
 
 func get_rank_name(elo: int) -> String:
 	if elo < 100: return "Humble Husser 1"
@@ -584,7 +692,7 @@ func get_rank_name(elo: int) -> String:
 	elif elo < 2000: return "Heavenly Huss 2"
 	else: return "Heavenly Huss 3"
 
-func _init_sprite_sheet() -> void:
+func _init_sprite_sheet() -> void :
 	if ResourceLoader.exists(SPRITE_SHEET_PATH_PNG):
 		loaded_sheet_texture = load(SPRITE_SHEET_PATH_PNG) as Texture2D
 	elif ResourceLoader.exists(SPRITE_SHEET_PATH_JPG):
@@ -631,31 +739,108 @@ func load_rank_texture(elo: int) -> Texture2D:
 	img.fill(Color.from_hsv(hue, 0.85, 0.95))
 	return ImageTexture.create_from_image(img)
 
-# ==============================================================================
-# SAVE / LOAD SYSTEM
-# ==============================================================================
 
-func _load_player_data() -> void:
+func _save_nickname_from_input() -> void:
+	if nickname_input and nickname_input.text.strip_edges() != "":
+		local_nickname = nickname_input.text.strip_edges()
+		save_player_data()
+
+func _load_player_data() -> void :
 	if FileAccess.file_exists(SAVE_PATH):
 		var file = FileAccess.open(SAVE_PATH, FileAccess.READ)
 		if file:
 			var json = JSON.new()
 			if json.parse(file.get_as_text()) == OK:
 				local_nickname = json.data.get("nickname", "Player")
-				local_elo = json.data.get("elo", 0)
+				local_elo = int(json.data.get("elo", 0))
 			file.close()
 
-func save_player_data() -> void:
+func save_player_data() -> void :
 	var file = FileAccess.open(SAVE_PATH, FileAccess.WRITE)
 	if file:
 		var data = {
-			"nickname": local_nickname,
+			"nickname": local_nickname, 
 			"elo": local_elo
 		}
 		file.store_string(JSON.stringify(data))
 		file.close()
 
-func _load_leaderboard_cache() -> void:
+func export_data_to_obfuscated_string() -> String:
+	var raw_dict = {
+		"nickname": local_nickname,
+		"elo": local_elo
+	}
+	var json_str = JSON.stringify(raw_dict)
+	return Marshalls.utf8_to_base64(json_str)
+
+func import_data_from_obfuscated_string(encoded_string: String) -> bool:
+	var clean_str = encoded_string.strip_edges()
+	if clean_str.is_empty():
+		return false
+
+	var decoded_json_str = Marshalls.base64_to_utf8(clean_str)
+	if decoded_json_str.is_empty():
+		return false
+
+	var json = JSON.new()
+	if json.parse(decoded_json_str) == OK and json.data is Dictionary:
+		var dict: Dictionary = json.data
+		if dict.has("nickname") and dict.has("elo"):
+			local_nickname = String(dict["nickname"])
+			local_elo = int(dict["elo"])
+			save_player_data()
+			leaderboard_data[local_nickname] = {"elo": local_elo}
+			_save_leaderboard_cache()
+			return true
+	return false
+
+func _on_export_save_pressed() -> void:
+	_save_nickname_from_input()
+	var obfuscated = export_data_to_obfuscated_string()
+	DisplayServer.clipboard_set(obfuscated)
+	pending_error_message = "Save code copied to clipboard!"
+	_build_main_menu()
+
+func _on_import_save_pressed() -> void:
+	_save_nickname_from_input()
+	
+	var dialog = AcceptDialog.new()
+	dialog.title = "Import Save Data"
+	dialog.ok_button_text = "Import"
+	
+	var vbox = VBoxContainer.new()
+	
+	var lbl = Label.new()
+	lbl.text = "Paste your copied save data string below:"
+	vbox.add_child(lbl)
+	
+	var input_field = LineEdit.new()
+	input_field.placeholder_text = "Paste save code here..."
+	input_field.custom_minimum_size = Vector2(320, 35)
+	vbox.add_child(input_field)
+	
+	dialog.add_child(vbox)
+	menu_canvas.add_child(dialog)
+	dialog.popup_centered()
+	
+	dialog.confirmed.connect(func():
+		var input_text = input_field.text
+		if input_text.strip_edges() == "":
+			input_text = DisplayServer.clipboard_get()
+			
+		if import_data_from_obfuscated_string(input_text):
+			pending_error_message = "Save data imported successfully!"
+		else:
+			pending_error_message = "Failed to import save data."
+		dialog.queue_free()
+		_build_main_menu()
+	)
+	
+	dialog.canceled.connect(func():
+		dialog.queue_free()
+	)
+
+func _load_leaderboard_cache() -> void :
 	if FileAccess.file_exists(LEADERBOARD_CACHE_PATH):
 		var file = FileAccess.open(LEADERBOARD_CACHE_PATH, FileAccess.READ)
 		if file:
@@ -667,22 +852,19 @@ func _load_leaderboard_cache() -> void:
 						leaderboard_data[k] = raw_data[k]
 			file.close()
 
-func _save_leaderboard_cache() -> void:
+func _save_leaderboard_cache() -> void :
 	var file = FileAccess.open(LEADERBOARD_CACHE_PATH, FileAccess.WRITE)
 	if file:
 		file.store_string(JSON.stringify(leaderboard_data))
 		file.close()
 
-func clear_leaderboard_data() -> void:
+func clear_leaderboard_data() -> void :
 	leaderboard_data.clear()
 	if FileAccess.file_exists(LEADERBOARD_CACHE_PATH):
 		DirAccess.remove_absolute(LEADERBOARD_CACHE_PATH)
 
-# ==============================================================================
-# UI & MAIN MENU
-# ==============================================================================
 
-func log_console(message: String) -> void:
+func log_console(message: String) -> void :
 	print(message)
 	if console_list:
 		var lbl = Label.new()
@@ -693,7 +875,7 @@ func log_console(message: String) -> void:
 		if console_list.get_child_count() > 30:
 			console_list.get_child(0).queue_free()
 
-func _build_hud_console() -> void:
+func _build_hud_console() -> void :
 	hud_canvas = CanvasLayer.new()
 	hud_canvas.layer = 1
 	add_child(hud_canvas)
@@ -724,7 +906,6 @@ func _build_hud_console() -> void:
 	console_list = VBoxContainer.new()
 	scroll.add_child(console_list)
 
-	# --- VISUAL DRAIN PROGRESS BAR FOR COMBAT COOLDOWN ---
 	cooldown_bar_container = VBoxContainer.new()
 	cooldown_bar_container.custom_minimum_size = Vector2(300, 45)
 	cooldown_bar_container.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
@@ -757,7 +938,7 @@ func _build_hud_console() -> void:
 
 	log_console("[System] Network Console initialized.")
 
-func update_local_hud_hp(hp: int) -> void:
+func update_local_hud_hp(hp: int) -> void :
 	if local_hp_label:
 		local_hp_label.text = "YOUR HP: " + str(hp) + " / 100"
 		if hp <= 30:
@@ -767,8 +948,10 @@ func update_local_hud_hp(hp: int) -> void:
 		else:
 			local_hp_label.add_theme_color_override("font_color", Color(0.2, 1.0, 0.3))
 
-func _build_main_menu() -> void:
+func _build_main_menu() -> void :
 	_clear_ui()
+	opponent_trystero_id = ""
+	_leave_trystero_room()
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 	is_match_active = false
 	is_game_over = false
@@ -782,9 +965,30 @@ func _build_main_menu() -> void:
 	center_panel.set_anchors_preset(Control.PRESET_FULL_RECT)
 	menu_canvas.add_child(center_panel)
 
+	var panel = PanelContainer.new()
+	panel.custom_minimum_size = Vector2(380, 520)
+	center_panel.add_child(panel)
+
+	var scroll = ScrollContainer.new()
+	scroll.custom_minimum_size = Vector2(360, 500)
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	panel.add_child(scroll)
+
 	var container = VBoxContainer.new()
 	container.custom_minimum_size = Vector2(340, 0)
-	center_panel.add_child(container)
+	container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.add_child(container)
+
+	# --- Title Card Banner Image (res://CARD.png) ---
+	if ResourceLoader.exists(TITLE_CARD_PATH):
+		var title_tex = load(TITLE_CARD_PATH) as Texture2D
+		if title_tex:
+			var title_card_rect = TextureRect.new()
+			title_card_rect.texture = title_tex
+			title_card_rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+			title_card_rect.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+			title_card_rect.custom_minimum_size = Vector2(340, 170)
+			container.add_child(title_card_rect)
 
 	var nick_label = Label.new()
 	nick_label.text = "Enter Nickname:"
@@ -796,6 +1000,7 @@ func _build_main_menu() -> void:
 	nickname_input.placeholder_text = "Player Name"
 	nickname_input.custom_minimum_size = Vector2(320, 35)
 	nickname_input.alignment = HORIZONTAL_ALIGNMENT_CENTER
+	nickname_input.focus_exited.connect(_save_nickname_from_input)
 	container.add_child(nickname_input)
 
 	var elo_row = HBoxContainer.new()
@@ -845,12 +1050,50 @@ func _build_main_menu() -> void:
 	clear_btn.pressed.connect(_on_clear_leaderboard_pressed)
 	container.add_child(clear_btn)
 
-func _on_clear_leaderboard_pressed() -> void:
+	var spacer2 = Control.new()
+	spacer2.custom_minimum_size = Vector2(0, 10)
+	container.add_child(spacer2)
+
+	var backup_info_label = Label.new()
+	backup_info_label.text = "Make sure you back up your save data often, you can paste your copied save data into Google Docs."
+	backup_info_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	backup_info_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	backup_info_label.custom_minimum_size = Vector2(320, 0)
+	backup_info_label.add_theme_font_size_override("font_size", 11)
+	backup_info_label.add_theme_color_override("font_color", Color(0.85, 0.85, 0.85))
+	container.add_child(backup_info_label)
+
+	var spacer3 = Control.new()
+	spacer3.custom_minimum_size = Vector2(0, 5)
+	container.add_child(spacer3)
+
+	var exp_btn = Button.new()
+	exp_btn.text = "Export Save Data"
+	exp_btn.custom_minimum_size = Vector2(320, 35)
+	exp_btn.pressed.connect(_on_export_save_pressed)
+	container.add_child(exp_btn)
+
+	var imp_btn = Button.new()
+	imp_btn.text = "Import Save Data"
+	imp_btn.custom_minimum_size = Vector2(320, 35)
+	imp_btn.pressed.connect(_on_import_save_pressed)
+	container.add_child(imp_btn)
+
+	if pending_error_message != "":
+		var msg_lbl = Label.new()
+		msg_lbl.text = pending_error_message
+		msg_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		msg_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		msg_lbl.add_theme_color_override("font_color", Color(1.0, 0.6, 0.3))
+		container.add_child(msg_lbl)
+		pending_error_message = ""
+
+func _on_clear_leaderboard_pressed() -> void :
 	clear_leaderboard_data()
 	pending_error_message = "Leaderboard data successfully cleared!"
 	_build_main_menu()
 
-func _show_leaderboard_ui() -> void:
+func _show_leaderboard_ui() -> void :
 	_clear_ui()
 
 	leaderboard_canvas = CanvasLayer.new()
@@ -885,7 +1128,7 @@ func _show_leaderboard_ui() -> void:
 
 	for player_key in display_data:
 		var entry = display_data[player_key]
-		var elo = entry.get("elo", 0) if entry is Dictionary else 0
+		var elo = int(entry.get("elo", 0)) if entry is Dictionary else 0
 
 		var row = HBoxContainer.new()
 		list.add_child(row)
@@ -908,11 +1151,14 @@ func _show_leaderboard_ui() -> void:
 	back_btn.pressed.connect(_build_main_menu)
 	container.add_child(back_btn)
 
-# ==============================================================================
-# MATCH RESULTS & ANIMATED ELO PROGRESSION SCREEN
-# ==============================================================================
 
-func _process_match_outcome(winner_peer_id: int) -> void:
+func calculate_elo_change(player_elo: int, opponent_elo: int, score: float, k_factor: float = 32.0) -> int:
+	var expected: float = 1.0 / (1.0 + pow(10.0, float(opponent_elo - player_elo) / 400.0))
+	return int(round(k_factor * (score - expected)))
+
+func _process_match_outcome(winner_peer_id: int) -> void :
+	if is_game_over:
+		return
 	is_game_over = true
 
 	if is_single_player:
@@ -920,31 +1166,38 @@ func _process_match_outcome(winner_peer_id: int) -> void:
 		return
 
 	var my_id = 1 if is_host_peer else 2
+	var opponent_id = 2 if my_id == 1 else 1
 	var is_winner = (my_id == winner_peer_id)
 
+	var opponent_elo = player_elos.get(opponent_id, 1000)
+	var opponent_nick = player_nicknames.get(opponent_id, "Opponent")
 	var start_elo = local_elo
-	var elo_change = 0
-	var hit_max_elo = false
 
-	if is_winner:
-		if local_elo >= MAX_ELO:
-			hit_max_elo = true
-			elo_change = 0
-		else:
-			elo_change = 25
-			local_elo = min(MAX_ELO, local_elo + elo_change)
-	else:
-		elo_change = -25
-		local_elo = max(0, local_elo + elo_change)
+	var my_score = 1.0 if is_winner else 0.0
+	var my_elo_change = calculate_elo_change(local_elo, opponent_elo, my_score)
+	local_elo = clamp(local_elo + my_elo_change, 0, MAX_ELO)
+
+	var opp_score = 0.0 if is_winner else 1.0
+	var opp_elo_change = calculate_elo_change(opponent_elo, start_elo, opp_score)
+	var updated_opp_elo = clamp(opponent_elo + opp_elo_change, 0, MAX_ELO)
 
 	leaderboard_data[local_nickname] = {"elo": local_elo}
+	leaderboard_data[opponent_nick] = {"elo": updated_opp_elo}
+	
 	_save_leaderboard_cache()
 	save_player_data()
 
-	var banner_text = "You won the 1v1" if is_winner else "You lost the 1v1"
-	_show_match_results_screen(banner_text, is_winner, elo_change, start_elo, local_elo, hit_max_elo)
+	send_p2p_packet({
+		"action": "sync_state",
+		"nicknames": player_nicknames,
+		"elos": {my_id: local_elo, opponent_id: updated_opp_elo},
+		"leaderboard": leaderboard_data
+	})
 
-func _show_match_results_screen(outcome_title: String, is_winner: bool, elo_change: int, start_elo: int, target_elo: int, hit_max_elo: bool = false) -> void:
+	var banner_text = "You won the 1v1" if is_winner else "You lost the 1v1"
+	_show_match_results_screen(banner_text, is_winner, my_elo_change, start_elo, local_elo, local_elo >= MAX_ELO)
+
+func _show_match_results_screen(outcome_title: String, is_winner: bool, elo_change: int, start_elo: int, target_elo: int, hit_max_elo: bool = false) -> void :
 	_clear_ui()
 
 	if world_root:
@@ -1066,7 +1319,7 @@ func _show_match_results_screen(outcome_title: String, is_winner: bool, elo_chan
 	is_animating_elo = true
 	_update_elo_animation_ui()
 
-func _update_elo_animation_ui() -> void:
+func _update_elo_animation_ui() -> void :
 	var val_int = int(round(anim_current_elo))
 	if anim_elo_label:
 		anim_elo_label.text = " Rating: " + str(val_int) + " ELO (" + get_rank_name(val_int) + ")"
@@ -1077,11 +1330,11 @@ func _update_elo_animation_ui() -> void:
 	var current_step_progress = 1.0 if val_int >= MAX_ELO else (val_int % 100) / 100.0
 
 	if anim_fill_rect:
-		anim_fill_rect.custom_minimum_size = Vector2(380 * current_step_progress, 28)
+		anim_fill_rect.size = Vector2(380 * current_step_progress, 28)
 	if anim_marker_rect:
 		anim_marker_rect.position = Vector2(clamp(380 * current_step_progress - 3, 0, 374), 0)
 
-func _clear_ui() -> void:
+func _clear_ui() -> void :
 	if map_ban_canvas:
 		map_ban_canvas.queue_free()
 		map_ban_canvas = null
@@ -1105,14 +1358,14 @@ func _clear_ui() -> void:
 		results_canvas.queue_free()
 		results_canvas = null
 
-func _forfeit_match() -> void:
+func _forfeit_match() -> void :
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
-	log_console("[Match] You forfeited the match.")
 	if is_game_over:
 		return
-	is_game_over = true
+	log_console("[Match] You forfeited the match.")
 
 	if is_single_player:
+		is_game_over = true
 		_return_to_main_menu()
 		return
 
@@ -1120,7 +1373,7 @@ func _forfeit_match() -> void:
 	send_p2p_packet({"action": "match_outcome", "winner_peer_id": winner_id})
 	_process_match_outcome(winner_id)
 
-func _return_to_main_menu(error_msg: String = "") -> void:
+func _return_to_main_menu(error_msg: String = "") -> void :
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 	pending_error_message = error_msg
 	if world_root:
@@ -1128,11 +1381,8 @@ func _return_to_main_menu(error_msg: String = "") -> void:
 		world_root = null
 	_build_main_menu()
 
-# ==============================================================================
-# 4. 3D WORLD & MAP GENERATOR
-# ==============================================================================
 
-func _build_3d_environment() -> void:
+func _build_3d_environment() -> void :
 	if world_root: world_root.queue_free()
 
 	world_root = Node3D.new()
@@ -1146,6 +1396,7 @@ func _build_3d_environment() -> void:
 
 	var floor_color = selected_map_data.get("color", Color(0.2, 0.2, 0.2))
 	var wall_color = selected_map_data.get("wall_color", Color(0.1, 0.1, 0.1))
+	var mechanic = selected_map_data.get("mechanic", "default")
 
 	var floor_body = StaticBody3D.new()
 	var floor_mesh = MeshInstance3D.new()
@@ -1171,17 +1422,82 @@ func _build_3d_environment() -> void:
 	_create_wall_block(Vector3(-25, 2, 0), Vector3(1, 4, 50), wall_color)
 	_create_wall_block(Vector3(25, 2, 0), Vector3(1, 4, 50), wall_color)
 
-	_create_wall_block(Vector3(-8, 1.5, -6), Vector3(2, 3, 6), wall_color)
-	_create_wall_block(Vector3(8, 1.5, 6), Vector3(2, 3, 6), wall_color)
-	_create_wall_block(Vector3(0, 1.5, 0), Vector3(4, 3, 4), wall_color)
+	_build_map_mechanics(mechanic, wall_color)
 
 	players_container = Node3D.new()
 	players_container.name = "Players"
 	world_root.add_child(players_container)
 
-func _create_wall_block(pos: Vector3, size: Vector3, color: Color) -> void:
+func _build_map_mechanics(mechanic: String, wall_color: Color) -> void :
+	match mechanic:
+		"portals":
+			_create_wall_block(Vector3(-8, 1.5, -6), Vector3(2, 3, 6), wall_color)
+			_create_wall_block(Vector3(8, 1.5, 6), Vector3(2, 3, 6), wall_color)
+			_create_portal_pair(Vector3(-20, 1, -10), Vector3(20, 1, 10))
+		"slopes":
+			_create_ramp(Vector3(-10, 1.5, -10), Vector3(6, 0.5, 12), -25.0, wall_color)
+			_create_ramp(Vector3(10, 1.5, 10), Vector3(6, 0.5, 12), 25.0, wall_color)
+			_create_wall_block(Vector3(0, 3, 0), Vector3(12, 0.5, 12), wall_color)
+		"jump_pads":
+			_create_wall_block(Vector3(-8, 1.5, -6), Vector3(2, 3, 6), wall_color)
+			_create_wall_block(Vector3(8, 1.5, 6), Vector3(2, 3, 6), wall_color)
+			_create_jump_pad(Vector3(-12, 0.2, -12), 22.0)
+			_create_jump_pad(Vector3(12, 0.2, 12), 22.0)
+			_create_jump_pad(Vector3(0, 0.2, 0), 26.0)
+		"toxic_hazards":
+			_create_toxic_pool(Vector3(0, 0.05, 0), Vector3(16, 0.1, 16))
+			_create_wall_block(Vector3(-12, 1.5, 0), Vector3(4, 3, 4), wall_color)
+			_create_wall_block(Vector3(12, 1.5, 0), Vector3(4, 3, 4), wall_color)
+		"ice_physics":
+			_create_wall_block(Vector3(0, 1.5, 0), Vector3(6, 3, 6), wall_color)
+			_create_jump_pad(Vector3(-15, 0.2, 15), 18.0)
+			_create_jump_pad(Vector3(15, 0.2, -15), 18.0)
+		"recharge_pads":
+			_create_wall_block(Vector3(-8, 1.5, -6), Vector3(2, 3, 6), wall_color)
+			_create_wall_block(Vector3(8, 1.5, 6), Vector3(2, 3, 6), wall_color)
+			_create_recharge_pad(Vector3(0, 0.2, 0))
+		"labyrinth":
+			_create_wall_block(Vector3(-10, 2, -10), Vector3(20, 4, 1), wall_color)
+			_create_wall_block(Vector3(10, 2, 10), Vector3(20, 4, 1), wall_color)
+			_create_wall_block(Vector3(0, 2, -5), Vector3(1, 4, 15), wall_color)
+			_create_wall_block(Vector3(0, 2, 5), Vector3(1, 4, 15), wall_color)
+		"glass_barriers":
+			var glass_col = Color(0.7, 0.9, 1.0, 0.35)
+			_create_wall_block(Vector3(-8, 1.5, 0), Vector3(1, 3, 16), glass_col)
+			_create_wall_block(Vector3(8, 1.5, 0), Vector3(1, 3, 16), glass_col)
+		_:
+			_create_wall_block(Vector3(-8, 1.5, -6), Vector3(2, 3, 6), wall_color)
+			_create_wall_block(Vector3(8, 1.5, 6), Vector3(2, 3, 6), wall_color)
+			_create_wall_block(Vector3(0, 1.5, 0), Vector3(4, 3, 4), wall_color)
+
+func _create_wall_block(pos: Vector3, size: Vector3, color: Color) -> void :
 	var body = StaticBody3D.new()
 	body.position = pos
+
+	var mesh_inst = MeshInstance3D.new()
+	var box_mesh = BoxMesh.new()
+	box_mesh.size = size
+	mesh_inst.mesh = box_mesh
+
+	var mat = StandardMaterial3D.new()
+	mat.albedo_color = color
+	if color.a < 1.0:
+		mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mesh_inst.material_override = mat
+
+	var col = CollisionShape3D.new()
+	var shape = BoxShape3D.new()
+	shape.size = size
+	col.shape = shape
+
+	body.add_child(mesh_inst)
+	body.add_child(col)
+	world_root.add_child(body)
+
+func _create_ramp(pos: Vector3, size: Vector3, rot_x_deg: float, color: Color) -> void :
+	var body = StaticBody3D.new()
+	body.position = pos
+	body.rotation_degrees.x = rot_x_deg
 
 	var mesh_inst = MeshInstance3D.new()
 	var box_mesh = BoxMesh.new()
@@ -1201,7 +1517,34 @@ func _create_wall_block(pos: Vector3, size: Vector3, color: Color) -> void:
 	body.add_child(col)
 	world_root.add_child(body)
 
-func _spawn_player(peer_id: int) -> void:
+func _create_portal_pair(pos_a: Vector3, pos_b: Vector3) -> void :
+	var exit_offset_a = Vector3(0, 0, 3)
+	var exit_offset_b = Vector3(0, 0, -3)
+
+	var portal_a = MapPortal.new(pos_b + exit_offset_b)
+	portal_a.position = pos_a
+	world_root.add_child(portal_a)
+
+	var portal_b = MapPortal.new(pos_a + exit_offset_a)
+	portal_b.position = pos_b
+	world_root.add_child(portal_b)
+
+func _create_jump_pad(pos: Vector3, launch_force: float) -> void :
+	var pad = MapJumpPad.new(launch_force)
+	pad.position = pos
+	world_root.add_child(pad)
+
+func _create_toxic_pool(pos: Vector3, size: Vector3) -> void :
+	var pool = MapToxicPool.new(size)
+	pool.position = pos
+	world_root.add_child(pool)
+
+func _create_recharge_pad(pos: Vector3) -> void :
+	var pad = MapRechargePad.new(self)
+	pad.position = pos
+	world_root.add_child(pad)
+
+func _spawn_player(peer_id: int) -> void :
 	var player = NetworkPlayer.new(peer_id, self)
 	player.name = str(peer_id)
 
@@ -1214,7 +1557,7 @@ func _spawn_player(peer_id: int) -> void:
 
 	players_container.add_child(player)
 
-func _spawn_test_dummy(peer_id: int) -> void:
+func _spawn_test_dummy(peer_id: int) -> void :
 	var dummy = NetworkPlayer.new(peer_id, self)
 	dummy.name = str(peer_id)
 	dummy.position = Vector3(15, 1, 0)
@@ -1224,9 +1567,153 @@ func _spawn_test_dummy(peer_id: int) -> void:
 	player_nicknames[peer_id] = "Test Dummy"
 	player_elos[peer_id] = 0
 
-# ==============================================================================
-# PLAYER & TEST DUMMY CHARACTER CLASS
-# ==============================================================================
+
+class MapPortal extends Area3D:
+	var dest_pos: Vector3
+	var cooldown_players: Dictionary = {}
+
+	func _init(target: Vector3) -> void:
+		dest_pos = target
+
+	func _ready() -> void:
+		var col = CollisionShape3D.new()
+		var box = BoxShape3D.new()
+		box.size = Vector3(2.5, 3.5, 0.5)
+		col.shape = box
+		add_child(col)
+
+		var mesh = MeshInstance3D.new()
+		var torus = TorusMesh.new()
+		torus.inner_radius = 0.8
+		torus.outer_radius = 1.3
+		mesh.mesh = torus
+		mesh.rotation_degrees.x = 90
+
+		var mat = StandardMaterial3D.new()
+		mat.albedo_color = Color(0.2, 0.6, 1.0)
+		mat.emission_enabled = true
+		mat.emission = Color(0.1, 0.5, 1.0)
+		mat.emission_energy_multiplier = 3.0
+		mesh.material_override = mat
+		add_child(mesh)
+
+		body_entered.connect(_on_body_entered)
+
+	func _process(delta: float) -> void:
+		for player in cooldown_players.keys():
+			cooldown_players[player] -= delta
+			if cooldown_players[player] <= 0.0:
+				cooldown_players.erase(player)
+
+	func _on_body_entered(body: Node3D) -> void:
+		if body is CharacterBody3D and not cooldown_players.has(body):
+			cooldown_players[body] = 1.5
+			body.global_position = dest_pos
+
+
+class MapJumpPad extends Area3D:
+	var force: float = 20.0
+
+	func _init(boost_force: float = 20.0) -> void:
+		force = boost_force
+
+	func _ready() -> void:
+		var col = CollisionShape3D.new()
+		var box = BoxShape3D.new()
+		box.size = Vector3(3.0, 0.5, 3.0)
+		col.shape = box
+		add_child(col)
+
+		var mesh = MeshInstance3D.new()
+		var cyl = CylinderMesh.new()
+		cyl.top_radius = 1.4
+		cyl.bottom_radius = 1.6
+		cyl.height = 0.2
+		mesh.mesh = cyl
+
+		var mat = StandardMaterial3D.new()
+		mat.albedo_color = Color(1.0, 0.8, 0.1)
+		mat.emission_enabled = true
+		mat.emission = Color(1.0, 0.7, 0.0)
+		mat.emission_energy_multiplier = 2.5
+		mesh.material_override = mat
+		add_child(mesh)
+
+		body_entered.connect(_on_body_entered)
+
+	func _on_body_entered(body: Node3D) -> void:
+		if body is CharacterBody3D:
+			body.velocity.y = force
+
+
+class MapToxicPool extends Area3D:
+	var damage_timer: float = 0.0
+
+	func _init(size: Vector3) -> void:
+		var col = CollisionShape3D.new()
+		var box = BoxShape3D.new()
+		box.size = size
+		col.shape = box
+		add_child(col)
+
+		var mesh = MeshInstance3D.new()
+		var plane = PlaneMesh.new()
+		plane.size = Vector2(size.x, size.z)
+		mesh.mesh = plane
+
+		var mat = StandardMaterial3D.new()
+		mat.albedo_color = Color(0.1, 0.9, 0.3, 0.7)
+		mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		mat.emission_enabled = true
+		mat.emission = Color(0.0, 0.8, 0.2)
+		mat.emission_energy_multiplier = 1.5
+		mesh.material_override = mat
+		add_child(mesh)
+
+	func _physics_process(delta: float) -> void:
+		damage_timer += delta
+		if damage_timer >= 1.0:
+			damage_timer = 0.0
+			for body in get_overlapping_bodies():
+				if body.has_method("apply_damage"):
+					body.apply_damage(5)
+
+
+class MapRechargePad extends Area3D:
+	var main_manager: Node
+
+	func _init(manager: Node) -> void:
+		main_manager = manager
+
+	func _ready() -> void:
+		var col = CollisionShape3D.new()
+		var box = BoxShape3D.new()
+		box.size = Vector3(2.5, 0.5, 2.5)
+		col.shape = box
+		add_child(col)
+
+		var mesh = MeshInstance3D.new()
+		var cyl = CylinderMesh.new()
+		cyl.top_radius = 1.2
+		cyl.bottom_radius = 1.2
+		cyl.height = 0.15
+		mesh.mesh = cyl
+
+		var mat = StandardMaterial3D.new()
+		mat.albedo_color = Color(1.0, 0.9, 0.2)
+		mat.emission_enabled = true
+		mat.emission = Color(1.0, 0.85, 0.1)
+		mat.emission_energy_multiplier = 3.0
+		mesh.material_override = mat
+		add_child(mesh)
+
+		body_entered.connect(_on_body_entered)
+
+	func _on_body_entered(body: Node3D) -> void:
+		if main_manager and body is CharacterBody3D and body.has_method("is_local_player") and body.is_local_player():
+			main_manager.reset_combat_cooldown()
+			main_manager.log_console("[Map] Recharge pad triggered - Cooldown reset!")
+
 
 class NetworkPlayer extends CharacterBody3D:
 	var peer_id: int
@@ -1250,6 +1737,7 @@ class NetworkPlayer extends CharacterBody3D:
 
 	var qte_active: bool = false
 	var qte_delay_timer: float = 0.0
+	var qte_e_released: bool = false
 	var qte_canvas: CanvasLayer = null
 	var qte_indicator: ColorRect = null
 	var qte_target_box: ColorRect = null
@@ -1262,7 +1750,10 @@ class NetworkPlayer extends CharacterBody3D:
 	var launch_target_pos: Vector3 = Vector3.ZERO
 	var launch_timer: float = 0.0
 
-	func _init(id: int = 1, manager: Node = null) -> void:
+	var gravity_mult: float = 1.0
+	var friction: float = 1.0
+
+	func _init(id: int = 1, manager: Node = null) -> void :
 		peer_id = id
 		main_manager = manager
 
@@ -1272,7 +1763,15 @@ class NetworkPlayer extends CharacterBody3D:
 		var local_id = 1 if main_manager.is_host_peer else 2
 		return peer_id == local_id
 
-	func _ready() -> void:
+	func _ready() -> void :
+		if main_manager and main_manager.selected_map_data:
+			var mech = main_manager.selected_map_data.get("mechanic", "")
+			if mech == "low_gravity":
+				gravity_mult = 0.45
+				jump_velocity = 9.0
+			elif mech == "ice_physics":
+				friction = 0.1
+
 		mesh_inst = MeshInstance3D.new()
 		var cap = CapsuleMesh.new()
 		cap.height = 1.8
@@ -1336,12 +1835,12 @@ class NetworkPlayer extends CharacterBody3D:
 			add_child(camera)
 			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 
-	func update_nametag(nickname: String, elo: int) -> void:
+	func update_nametag(nickname: String, elo: int) -> void :
 		if name_label and main_manager and not is_dummy:
 			var rank_title = main_manager.get_rank_name(elo)
 			name_label.text = "[" + rank_title + "] " + nickname
 
-	func _build_health_label() -> void:
+	func _build_health_label() -> void :
 		var hp_label = Label3D.new()
 		hp_label.name = "HPLabel"
 		hp_label.position = Vector3(0, 2.0, 0)
@@ -1352,7 +1851,7 @@ class NetworkPlayer extends CharacterBody3D:
 		hp_label.text = "HP: " + str(health) + "/100"
 		add_child(hp_label)
 
-	func _update_health_display() -> void:
+	func _update_health_display() -> void :
 		var hp_label = get_node_or_null("HPLabel") as Label3D
 		if hp_label:
 			hp_label.text = "HP: " + str(health) + "/100"
@@ -1366,7 +1865,7 @@ class NetworkPlayer extends CharacterBody3D:
 		if is_local_player() and main_manager:
 			main_manager.update_local_hud_hp(health)
 
-	func apply_damage(amount: int) -> void:
+	func apply_damage(amount: int) -> void :
 		health = max(0, health - amount)
 		_update_health_display()
 
@@ -1378,22 +1877,30 @@ class NetworkPlayer extends CharacterBody3D:
 				main_manager.send_p2p_packet({"action": "match_outcome", "winner_peer_id": winner_id})
 				main_manager._process_match_outcome(winner_id)
 
-	func _unhandled_input(event: InputEvent) -> void:
+	func _unhandled_input(event: InputEvent) -> void :
 		if not is_local_player() or is_dummy or is_movement_locked:
 			return
 
 		if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
-			rotate_y(-event.relative.x * mouse_sensitivity)
+			rotate_y( - event.relative.x * mouse_sensitivity)
 			if camera:
-				camera.rotate_x(-event.relative.y * mouse_sensitivity)
+				camera.rotate_x( - event.relative.y * mouse_sensitivity)
 				camera.rotation.x = clamp(camera.rotation.x, deg_to_rad(-89), deg_to_rad(89))
 
-	func _physics_process(delta: float) -> void:
+	func _physics_process(delta: float) -> void :
 		_update_health_display()
+
+		if global_position.y < FALL_BOUNDARY_Y:
+			if is_local_player():
+				main_manager.log_console("[Match] You fell off the map!")
+				main_manager._forfeit_match()
+			elif is_dummy:
+				apply_damage(100)
+			return
 
 		if is_dummy:
 			if not is_on_floor():
-				velocity.y -= 20.0 * delta
+				velocity.y -= 20.0 * gravity_mult * delta
 				move_and_slide()
 			return
 
@@ -1404,7 +1911,7 @@ class NetworkPlayer extends CharacterBody3D:
 			velocity.x = 0
 			velocity.z = 0
 			if not is_on_floor():
-				velocity.y -= 20.0 * delta
+				velocity.y -= 20.0 * gravity_mult * delta
 			move_and_slide()
 			_send_p2p_position()
 			return
@@ -1434,36 +1941,39 @@ class NetworkPlayer extends CharacterBody3D:
 			_start_qte()
 
 		if not is_on_floor():
-			velocity.y -= 20.0 * delta
+			velocity.y -= 20.0 * gravity_mult * delta
 
-		if Input.is_key_pressed(KEY_SPACE) and is_on_floor():
-			velocity.y = jump_velocity
+		var is_sprinting: bool = Input.is_key_pressed(KEY_SHIFT) or Input.is_physical_key_pressed(KEY_SHIFT)
+		var current_speed: float = sprint_speed if is_sprinting else walk_speed
 
-		var current_speed = sprint_speed if Input.is_key_pressed(KEY_SHIFT) else walk_speed
-		var input_dir := Vector3.ZERO
-		if Input.is_key_pressed(KEY_W): input_dir.z -= 1
-		if Input.is_key_pressed(KEY_S): input_dir.z += 1
-		if Input.is_key_pressed(KEY_A): input_dir.x -= 1
-		if Input.is_key_pressed(KEY_D): input_dir.x += 1
+		var jump_pressed: bool = Input.is_key_pressed(KEY_SPACE) or Input.is_physical_key_pressed(KEY_SPACE) or Input.is_action_just_pressed("ui_accept")
+		if jump_pressed and is_on_floor():
+			velocity.y = jump_velocity * (1.2 if is_sprinting else 1.0)
+
+		var input_dir: Vector3 = Vector3.ZERO
+		if Input.is_key_pressed(KEY_W) or Input.is_key_pressed(KEY_UP): input_dir.z -= 1
+		if Input.is_key_pressed(KEY_S) or Input.is_key_pressed(KEY_DOWN): input_dir.z += 1
+		if Input.is_key_pressed(KEY_A) or Input.is_key_pressed(KEY_LEFT): input_dir.x -= 1
+		if Input.is_key_pressed(KEY_D) or Input.is_key_pressed(KEY_RIGHT): input_dir.x += 1
 
 		var direction = (transform.basis * input_dir).normalized()
 		if direction != Vector3.ZERO:
-			velocity.x = direction.x * current_speed
-			velocity.z = direction.z * current_speed
+			velocity.x = lerp(velocity.x, direction.x * current_speed, friction)
+			velocity.z = lerp(velocity.z, direction.z * current_speed, friction)
 		else:
-			velocity.x = move_toward(velocity.x, 0, current_speed)
-			velocity.z = move_toward(velocity.z, 0, current_speed)
+			velocity.x = move_toward(velocity.x, 0, current_speed * friction)
+			velocity.z = move_toward(velocity.z, 0, current_speed * friction)
 
 		move_and_slide()
 		_send_p2p_position()
 
-	func _send_p2p_position() -> void:
+	func _send_p2p_position() -> void :
 		main_manager.send_p2p_packet({
-			"action": "move",
-			"peer_id": str(peer_id),
-			"pos_x": global_position.x,
-			"pos_y": global_position.y,
-			"pos_z": global_position.z,
+			"action": "move", 
+			"peer_id": str(peer_id), 
+			"pos_x": global_position.x, 
+			"pos_y": global_position.y, 
+			"pos_z": global_position.z, 
 			"rot_y": rotation_degrees.y
 		})
 
@@ -1475,7 +1985,7 @@ class NetworkPlayer extends CharacterBody3D:
 		if not camera.is_position_in_frustum(target_pos):
 			return false
 
-		var cam_forward = -camera.global_transform.basis.z.normalized()
+		var cam_forward = - camera.global_transform.basis.z.normalized()
 		var dir_to_target = (target_pos - camera.global_position).normalized()
 		var dot = cam_forward.dot(dir_to_target)
 
@@ -1492,7 +2002,7 @@ class NetworkPlayer extends CharacterBody3D:
 
 		return false
 
-	func _detect_and_highlight_opponents() -> void:
+	func _detect_and_highlight_opponents() -> void :
 		var players_container = get_parent()
 		if not players_container:
 			return
@@ -1514,24 +2024,55 @@ class NetworkPlayer extends CharacterBody3D:
 		if targeted_opponent:
 			targeted_opponent.set_highlight(true)
 
-	func set_highlight(active: bool) -> void:
+	func set_highlight(active: bool) -> void :
 		if base_material:
 			base_material.next_pass = outline_material if active else null
 		if hussing_label:
 			hussing_label.visible = active
 
-	func _start_qte() -> void:
+	func trigger_repulse_clash(opp: NetworkPlayer) -> void:
+		qte_active = false
+		main_manager.is_qte_in_progress = false
+		is_movement_locked = false
+
+		if qte_canvas:
+			qte_canvas.queue_free()
+			qte_canvas = null
+
+		main_manager.start_combat_cooldown()
+
+		if opp:
+			opp.is_movement_locked = false
+			var repulse_dir = (global_position - opp.global_position).normalized()
+			if repulse_dir == Vector3.ZERO:
+				repulse_dir = Vector3(1, 0, 0)
+			is_launching = true
+			launch_timer = 0.45
+			launch_target_pos = global_position + repulse_dir * 12.0
+
+		main_manager.log_console("[Combat] Simultaneous attack clash! Both players repelled!")
+
+	func _start_qte() -> void :
+		if targeted_opponent and targeted_opponent.qte_active:
+			trigger_repulse_clash(targeted_opponent)
+			targeted_opponent.trigger_repulse_clash(self)
+			if not main_manager.is_single_player:
+				main_manager.send_p2p_packet({"action": "trigger_clash"})
+			return
+
 		qte_active = true
 		qte_delay_timer = 0.35
+		qte_e_released = false
 		qte_progress = 0.0
 		qte_direction = 1.0
+		main_manager.is_qte_in_progress = true
 
 		if targeted_opponent:
 			targeted_opponent.is_movement_locked = true
 			if not main_manager.is_single_player:
 				main_manager.send_p2p_packet({
-					"action": "set_movement_lock",
-					"peer_id": str(targeted_opponent.peer_id),
+					"action": "set_movement_lock", 
+					"peer_id": str(targeted_opponent.peer_id), 
 					"locked": true
 				})
 
@@ -1556,7 +2097,10 @@ class NetworkPlayer extends CharacterBody3D:
 		qte_indicator.position = Vector2(0, 2)
 		bg.add_child(qte_indicator)
 
-	func _process_qte(delta: float) -> void:
+	func _process_qte(delta: float) -> void :
+		if not Input.is_key_pressed(KEY_E):
+			qte_e_released = true
+
 		if qte_delay_timer > 0.0:
 			qte_delay_timer -= delta
 			return
@@ -1572,11 +2116,12 @@ class NetworkPlayer extends CharacterBody3D:
 		if qte_indicator:
 			qte_indicator.position.x = qte_progress * (400 - 8)
 
-		if Input.is_key_pressed(KEY_E):
+		if qte_e_released and Input.is_key_pressed(KEY_E):
 			_evaluate_qte()
 
-	func _evaluate_qte() -> void:
+	func _evaluate_qte() -> void :
 		qte_active = false
+		main_manager.is_qte_in_progress = false
 
 		if qte_canvas:
 			qte_canvas.queue_free()
@@ -1586,12 +2131,11 @@ class NetworkPlayer extends CharacterBody3D:
 			targeted_opponent.is_movement_locked = false
 			if not main_manager.is_single_player:
 				main_manager.send_p2p_packet({
-					"action": "set_movement_lock",
-					"peer_id": str(targeted_opponent.peer_id),
+					"action": "set_movement_lock", 
+					"peer_id": str(targeted_opponent.peer_id), 
 					"locked": false
 				})
 
-		# --- TRIGGER COOLDOWN FOR ATTACKER ---
 		main_manager.start_combat_cooldown()
 
 		if qte_progress >= qte_target_start and qte_progress <= (qte_target_start + qte_target_width):
@@ -1600,15 +2144,14 @@ class NetworkPlayer extends CharacterBody3D:
 				launch_timer = 0.45
 				launch_target_pos = targeted_opponent.global_position
 
-				# --- TRIGGER COOLDOWN & DAMAGE FOR VICTIM ---
 				if not main_manager.is_single_player:
 					main_manager.send_p2p_packet({
-						"action": "take_damage",
-						"peer_id": str(targeted_opponent.peer_id),
+						"action": "take_damage", 
+						"peer_id": str(targeted_opponent.peer_id), 
 						"amount": 25
 					})
 					main_manager.send_p2p_packet({
-						"action": "trigger_cooldown",
+						"action": "trigger_cooldown", 
 						"peer_id": str(targeted_opponent.peer_id)
 					})
 				targeted_opponent.apply_damage(25)
