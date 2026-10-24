@@ -8,6 +8,34 @@ var is_host_peer: bool = false
 var is_single_player: bool = false
 var opponent_trystero_id: String = ""
 
+# --- MATCHMAKING (public lobby -> private 1v1 room) ---
+# Everyone searching meets in the lobby room. Players pair up there with a
+# propose -> accept -> confirm handshake, then each pair moves into its own
+# private room so a third (or fourth...) player can never merge into a match.
+const LOBBY_ROOM_CODE: String = "public_1v1_lobby"
+const MM_HELLO_INTERVAL: float = 1.0
+const MM_HANDSHAKE_TIMEOUT: float = 3.0
+const MM_SKIP_DURATION_MS: int = 4000
+const MM_PRIVATE_JOIN_TIMEOUT: float = 25.0
+# After sending the final "confirm", stay in the lobby briefly so the message is
+# actually delivered before leaving the room tears down the connection.
+const MM_CONFIRM_LINGER: float = 1.5
+
+var mm_phase: String = "idle" # "idle", "lobby", "match"
+var mm_self_id: String = ""
+var mm_lobby_peers: Dictionary = {} # trystero id -> "searching" / "busy" / "unknown"
+var mm_skip_until: Dictionary = {} # trystero id -> ticks_msec until we can propose again
+var mm_pending_out: String = "" # peer we proposed to
+var mm_pending_in: String = "" # peer whose proposal we accepted
+var mm_pending_room: String = ""
+var mm_pending_timer: float = 0.0
+var mm_hello_timer: float = 0.0
+var mm_expected_opponent: String = ""
+var mm_private_join_timer: float = 0.0
+var mm_linger_opponent: String = ""
+var mm_linger_room: String = ""
+var mm_linger_timer: float = 0.0
+
 # --- GLOBAL COMBAT LOCKS ---
 var is_qte_in_progress: bool = false
 
@@ -27,7 +55,9 @@ var map_pool: Array = [
 		"color": Color(0.85, 0.5, 0.15),
 		"wall_color": Color(0.3, 0.15, 0.05),
 		"theme": "Desert Ramps & High Ground",
-		"mechanic": "slopes"
+		"mechanic": "slopes",
+		"crystals": true,
+		"crystal_high_ground": true
 	},
 	{
 		"name": "Cyber Frost",
@@ -48,14 +78,18 @@ var map_pool: Array = [
 		"color": Color(0.85, 0.95, 1.0),
 		"wall_color": Color(0.35, 0.55, 0.75),
 		"theme": "Low Friction Ice Arena",
-		"mechanic": "ice_physics"
+		"mechanic": "ice_physics",
+		"crystals": true,
+		"crystal_high_ground": false
 	},
 	{
 		"name": "Nebula Zenith",
 		"color": Color(0.45, 0.1, 0.75),
 		"wall_color": Color(0.85, 0.2, 0.8),
 		"theme": "Cosmic Low Gravity",
-		"mechanic": "low_gravity"
+		"mechanic": "low_gravity",
+		"crystals": true,
+		"crystal_high_ground": true
 	},
 	{
 		"name": "Overclock Cyber",
@@ -98,6 +132,15 @@ var map_pool: Array = [
 		"wall_color": Color(0.35, 0.05, 0.1),
 		"theme": "Close Quarters Crimson Arena",
 		"mechanic": "labyrinth"
+	},
+	{
+		"name": "Skyline Bastion",
+		"color": Color(0.36, 0.4, 0.45),
+		"wall_color": Color(0.58, 0.47, 0.32),
+		"theme": "Tall Ramparts & Ladders",
+		"mechanic": "ladders",
+		"crystals": true,
+		"crystal_high_ground": true
 	}
 ]
 
@@ -109,6 +152,42 @@ var selected_map_data: Dictionary = {}
 var map_ban_canvas: CanvasLayer = null
 var map_ban_header_label: Label = null
 var map_row_container: HBoxContainer = null
+
+# Each ban turn has a time limit; if it runs out, a random map is banned for you.
+const MAP_BAN_TURN_TIME: float = 20.0
+var map_ban_timer: float = 0.0
+var map_ban_timer_label: Label = null
+
+# --- PRACTICE DUMMY PATHFINDING ---
+# The arena interior is covered by a 1m grid (49x49 cells, x/z from -24 to 24).
+const NAV_HALF_EXTENT: int = 24
+var nav_grid: AStarGrid2D = null
+var nav_floor_rid: RID
+
+# --- POWER CRYSTALS ---
+# Only on maps flagged "crystals". The host decides where/what spawns and who
+# picked it up; the other client mirrors that through packets.
+const CRYSTAL_FIRST_SPAWN: float = 10.0
+const CRYSTAL_RESPAWN_TIME: float = 40.0
+const ABILITY_DURATION: float = 20.0
+const SPEED_BOOST_MULT: float = 1.6
+const LUNGE_COOLDOWN: float = 1.0
+const CRYSTAL_ABILITIES: Dictionary = {
+	"double_jump": {"name": "Double Jump", "color": Color(0.3, 0.8, 1.0)},
+	"double_damage": {"name": "Double Damage", "color": Color(1.0, 0.25, 0.3)},
+	"speed_boost": {"name": "Speed Boost", "color": Color(0.35, 1.0, 0.45)},
+	"lunge": {"name": "Lunge (press Q)", "color": Color(1.0, 0.75, 0.15)},
+}
+var crystal_node: Node3D = null
+var crystal_spawn_timer: float = 0.0
+var crystal_id_counter: int = 0
+var ability_label: Label = null
+
+# --- OPPONENT-ABOVE POINTER ---
+const OPPONENT_HIGH_THRESHOLD: float = 4.0
+const POINTER_RADIUS: float = 90.0
+var opponent_pointer: Control = null
+var opponent_height_label: Label = null
 
 # --- LOCAL SAVE & LEADERBOARD / ELO DATA ---
 const SAVE_PATH: String = "user://player_data.json"
@@ -177,6 +256,21 @@ func _ready() -> void :
 	_build_main_menu()
 
 func _process(delta: float) -> void :
+	if mm_phase == "lobby":
+		_mm_tick(delta)
+	elif mm_phase == "match" and opponent_trystero_id == "":
+		# Paired in the lobby but the opponent never showed up in the private room.
+		mm_private_join_timer -= delta
+		if mm_private_join_timer <= 0.0:
+			log_console("[Matchmaking] Opponent never arrived, returning to queue...")
+			mm_skip_until[mm_expected_opponent] = Time.get_ticks_msec() + MM_SKIP_DURATION_MS
+			_mm_enter_lobby()
+
+	if map_ban_canvas and map_row_container:
+		_tick_map_ban_timer(delta)
+
+	_update_opponent_pointer()
+
 	if combat_cooldown_active:
 		combat_cooldown_timer -= delta
 		if cooldown_bar_container:
@@ -273,17 +367,43 @@ func _leave_trystero_room() -> void :
 	var window = JavaScriptBridge.get_interface("window")
 	window.leaveTrysteroRoom()
 
-func _on_trystero_peer_joined(args: Array) -> void :
-	var peer_id_str: String = args[0]
-	if opponent_trystero_id != "":
-		return
-
+func _get_self_trystero_id() -> String:
+	if mm_self_id != "":
+		return mm_self_id
+	if not OS.has_feature("web"):
+		return ""
 	var window = JavaScriptBridge.get_interface("window")
-	var my_trystero_id = window.trysteroSelfId
-	if typeof(my_trystero_id) != TYPE_STRING or my_trystero_id == "":
+	var sid = window.trysteroSelfId
+	if typeof(sid) == TYPE_STRING:
+		mm_self_id = sid
+	return mm_self_id
+
+func _on_trystero_peer_joined(args: Array) -> void :
+	var peer_id_str: String = String(args[0])
+
+	if _get_self_trystero_id() == "":
 		log_console("[Trystero] selfId missing - check the HTML import.")
 		return
 
+	if mm_phase == "lobby":
+		mm_lobby_peers[peer_id_str] = "unknown"
+		_mm_send_hello(peer_id_str)
+		return
+
+	if mm_phase != "match":
+		return
+
+	# Private room: only the player we paired with in the lobby is allowed in.
+	if peer_id_str != mm_expected_opponent:
+		log_console("[Matchmaking] Ignoring unexpected peer in private room: " + peer_id_str)
+		return
+	if opponent_trystero_id != "":
+		return
+
+	_begin_match_with(peer_id_str)
+
+func _begin_match_with(peer_id_str: String) -> void :
+	var my_trystero_id = _get_self_trystero_id()
 	opponent_trystero_id = peer_id_str
 	is_host_peer = my_trystero_id < peer_id_str
 	log_console("[Trystero] Opponent found! Peer ID: " + peer_id_str)
@@ -313,8 +433,15 @@ func _on_trystero_peer_joined(args: Array) -> void :
 		_start_map_ban_phase()
 
 func _on_trystero_peer_left(args: Array) -> void :
-	var peer_id_str: String = args[0]
-	if peer_id_str != opponent_trystero_id or is_game_over or is_single_player:
+	var peer_id_str: String = String(args[0])
+
+	if mm_phase == "lobby":
+		mm_lobby_peers.erase(peer_id_str)
+		if peer_id_str == mm_pending_out or peer_id_str == mm_pending_in:
+			_mm_clear_pending()
+		return
+
+	if opponent_trystero_id == "" or peer_id_str != opponent_trystero_id or is_game_over or is_single_player:
 		return
 
 	log_console("[Trystero] Opponent disconnected: " + peer_id_str)
@@ -331,7 +458,23 @@ func _on_trystero_data_received(args: Array) -> void :
 		_handle_incoming_p2p_packet(data_dict)
 
 func _handle_incoming_p2p_packet(data: Dictionary) -> void :
-	var action = data.get("action", "")
+	var action = String(data.get("action", ""))
+	var sender = String(data.get("from", ""))
+
+	if mm_phase == "lobby":
+		var to = String(data.get("to", ""))
+		if to != "" and to != _get_self_trystero_id():
+			return
+		_mm_handle_lobby_packet(action, sender, data)
+		return
+
+	if mm_phase != "match":
+		return
+
+	# Only ever accept game packets from the one opponent we paired with.
+	if sender == "" or sender != mm_expected_opponent:
+		return
+
 	match action:
 		"register":
 			var sender_id = int(data.get("peer_id", 2))
@@ -393,7 +536,33 @@ func _handle_incoming_p2p_packet(data: Dictionary) -> void :
 			if players_container and players_container.has_node(target_id):
 				var p_node = players_container.get_node(target_id) as NetworkPlayer
 				if p_node:
-					p_node.is_movement_locked = locked_state
+					p_node.set_movement_lock(locked_state)
+		"qte_start":
+			if not players_container:
+				return
+			var attacker = players_container.get_node_or_null(String(data.get("attacker", ""))) as NetworkPlayer
+			var target = players_container.get_node_or_null(String(data.get("target", ""))) as NetworkPlayer
+			if attacker:
+				attacker.qte_active = true
+			if target and target.is_local_player():
+				if target.qte_active:
+					# Both players pressed E at the same time: each side sees the
+					# other's qte_start while its own QTE is running, so both
+					# clients resolve this as a clash and fling apart.
+					if attacker:
+						attacker.qte_active = false
+					target.trigger_repulse_clash(attacker)
+				else:
+					target.set_movement_lock(true)
+		"qte_end":
+			if not players_container:
+				return
+			var attacker_end = players_container.get_node_or_null(String(data.get("attacker", ""))) as NetworkPlayer
+			var target_end = players_container.get_node_or_null(String(data.get("target", ""))) as NetworkPlayer
+			if attacker_end:
+				attacker_end.qte_active = false
+			if target_end and target_end.is_local_player():
+				target_end.set_movement_lock(false)
 		"trigger_clash":
 			var my_id = 1 if is_host_peer else 2
 			if players_container and players_container.has_node(str(my_id)):
@@ -419,9 +588,163 @@ func send_p2p_packet(data: Dictionary) -> void :
 	if not OS.has_feature("web") or is_single_player:
 		return
 
+	data["from"] = _get_self_trystero_id()
 	var json_string = JSON.stringify(data)
 	var window = JavaScriptBridge.get_interface("window")
 	window.sendTrysteroPacket(json_string)
+
+
+# --- LOBBY MATCHMAKING ---
+# Pairing rule: a free player proposes only to the lowest-ID free player whose
+# ID is higher than its own. Proposals therefore never form cycles, and every
+# player is in at most one handshake at a time, so with N players in the queue
+# you always get N/2 separate private matches.
+
+func _mm_enter_lobby() -> void :
+	mm_phase = "lobby"
+	mm_lobby_peers.clear()
+	mm_expected_opponent = ""
+	opponent_trystero_id = ""
+	mm_hello_timer = 0.0
+	_mm_clear_pending()
+	if waiting_opponent_label:
+		waiting_opponent_label.text = "Searching for Opponent..."
+		waiting_opponent_label.visible = true
+	if OS.has_feature("web"):
+		var window = JavaScriptBridge.get_interface("window")
+		window.joinTrysteroRoomWhenReady(LOBBY_ROOM_CODE)
+
+func _mm_is_free() -> bool:
+	return mm_pending_out == "" and mm_pending_in == "" and mm_linger_opponent == ""
+
+func _mm_status() -> String:
+	return "searching" if _mm_is_free() else "busy"
+
+func _mm_send_hello(to: String = "") -> void :
+	var pkt = {"action": "mm_hello", "status": _mm_status()}
+	if to != "":
+		pkt["to"] = to
+	send_p2p_packet(pkt)
+
+func _mm_clear_pending() -> void :
+	mm_pending_out = ""
+	mm_pending_in = ""
+	mm_pending_room = ""
+	mm_pending_timer = 0.0
+	mm_linger_opponent = ""
+	mm_linger_room = ""
+	mm_linger_timer = 0.0
+
+func _mm_skip(peer: String) -> void :
+	if peer != "":
+		mm_skip_until[peer] = Time.get_ticks_msec() + MM_SKIP_DURATION_MS
+
+func _mm_tick(delta: float) -> void :
+	if _get_self_trystero_id() == "":
+		return
+
+	mm_hello_timer -= delta
+	if mm_hello_timer <= 0.0:
+		mm_hello_timer = MM_HELLO_INTERVAL
+		_mm_send_hello()
+
+	# Proposer: confirm was sent, give it time to arrive, then switch rooms.
+	if mm_linger_opponent != "":
+		mm_linger_timer -= delta
+		if mm_linger_timer <= 0.0:
+			_mm_enter_private_room(mm_linger_opponent, mm_linger_room)
+		return
+
+	if mm_pending_out != "":
+		mm_pending_timer -= delta
+		if mm_pending_timer <= 0.0:
+			# Our proposal got no answer: try someone else for a while.
+			_mm_skip(mm_pending_out)
+			_mm_clear_pending()
+		return
+
+	if mm_pending_in != "":
+		mm_pending_timer -= delta
+		if mm_pending_timer <= 0.0:
+			# We accepted and the proposer never said "busy", so it's going to
+			# the private room even if its confirm got lost. Go meet it there.
+			# (If it really isn't coming, the private-room timeout brings us back.)
+			_mm_enter_private_room(mm_pending_in, mm_pending_room)
+		return
+
+	_mm_try_propose()
+
+func _mm_try_propose() -> void :
+	var now = Time.get_ticks_msec()
+	var best: String = ""
+	for peer in mm_lobby_peers:
+		if mm_lobby_peers[peer] != "searching":
+			continue
+		if peer <= mm_self_id:
+			continue
+		if mm_skip_until.has(peer) and now < int(mm_skip_until[peer]):
+			continue
+		if best == "" or peer < best:
+			best = peer
+
+	if best == "":
+		return
+
+	mm_pending_out = best
+	mm_pending_room = "hussle_1v1_" + mm_self_id + "_" + best + "_" + str(randi() % 1000000)
+	mm_pending_timer = MM_HANDSHAKE_TIMEOUT
+	send_p2p_packet({"action": "mm_propose", "to": best, "room": mm_pending_room})
+
+func _mm_handle_lobby_packet(action: String, sender: String, data: Dictionary) -> void :
+	if sender == "" or sender == mm_self_id:
+		return
+	var room = String(data.get("room", ""))
+
+	match action:
+		"mm_hello":
+			mm_lobby_peers[sender] = String(data.get("status", "unknown"))
+		"mm_propose":
+			if _mm_is_free() and room != "":
+				mm_pending_in = sender
+				mm_pending_room = room
+				mm_pending_timer = MM_HANDSHAKE_TIMEOUT
+				send_p2p_packet({"action": "mm_accept", "to": sender, "room": room})
+			else:
+				send_p2p_packet({"action": "mm_busy", "to": sender, "room": room})
+		"mm_accept":
+			if sender == mm_pending_out and room == mm_pending_room:
+				send_p2p_packet({"action": "mm_confirm", "to": sender, "room": room})
+				# Don't leave yet - leaving immediately drops the confirm in flight.
+				_mm_clear_pending()
+				mm_linger_opponent = sender
+				mm_linger_room = room
+				mm_linger_timer = MM_CONFIRM_LINGER
+				log_console("[Matchmaking] Opponent found! Setting up match...")
+				if waiting_opponent_label:
+					waiting_opponent_label.text = "Opponent found! Connecting..."
+			else:
+				send_p2p_packet({"action": "mm_busy", "to": sender, "room": room})
+		"mm_confirm":
+			if sender == mm_pending_in and room == mm_pending_room:
+				_mm_enter_private_room(sender, room)
+		"mm_busy":
+			if (sender == mm_pending_out or sender == mm_pending_in) and room == mm_pending_room:
+				_mm_skip(sender)
+				_mm_clear_pending()
+
+func _mm_enter_private_room(opponent: String, room: String) -> void :
+	mm_phase = "match"
+	mm_expected_opponent = opponent
+	opponent_trystero_id = ""
+	mm_private_join_timer = MM_PRIVATE_JOIN_TIMEOUT
+	_mm_clear_pending()
+	mm_lobby_peers.clear()
+	log_console("[Matchmaking] Paired! Moving to private room...")
+	if waiting_opponent_label:
+		waiting_opponent_label.text = "Opponent found! Connecting..."
+	if OS.has_feature("web"):
+		var window = JavaScriptBridge.get_interface("window")
+		window.joinTrysteroRoomWhenReady(room)
 
 
 func generate_topdown_map_texture(map_info: Dictionary, is_banned: bool = false) -> Texture2D:
@@ -495,8 +818,13 @@ func _build_map_ban_ui() -> void :
 	sub_header.add_theme_color_override("font_color", Color(0.8, 0.8, 0.8))
 	main_vbox.add_child(sub_header)
 
+	map_ban_timer_label = Label.new()
+	map_ban_timer_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	map_ban_timer_label.add_theme_font_size_override("font_size", 16)
+	main_vbox.add_child(map_ban_timer_label)
+
 	var spacer = Control.new()
-	spacer.custom_minimum_size = Vector2(0, 15)
+	spacer.custom_minimum_size = Vector2(0, 10)
 	main_vbox.add_child(spacer)
 
 	map_row_container = HBoxContainer.new()
@@ -508,6 +836,10 @@ func _build_map_ban_ui() -> void :
 
 func _refresh_map_ban_ui() -> void :
 	if not map_ban_canvas or not map_row_container: return
+
+	# Every refresh marks the start of a new ban turn, so restart the clock.
+	map_ban_timer = MAP_BAN_TURN_TIME
+	_update_map_ban_timer_label()
 
 	if map_ban_header_label:
 		map_ban_header_label.text = "MAP BAN PHASE - SELECT MAP TO BAN" if local_ban_turn else "OPPONENT IS BANNING A MAP..."
@@ -561,6 +893,14 @@ func _refresh_map_ban_ui() -> void :
 		map_theme_lbl.add_theme_color_override("font_color", Color(0.7, 0.9, 1.0))
 		vbox.add_child(map_theme_lbl)
 
+		if map_info.get("crystals", false):
+			var crystal_lbl = Label.new()
+			crystal_lbl.text = "+ Power Crystals"
+			crystal_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+			crystal_lbl.add_theme_font_size_override("font_size", 10)
+			crystal_lbl.add_theme_color_override("font_color", Color(0.95, 0.5, 1.0))
+			vbox.add_child(crystal_lbl)
+
 		var ban_btn = Button.new()
 		if is_banned:
 			ban_btn.text = "BANNED"
@@ -570,6 +910,37 @@ func _refresh_map_ban_ui() -> void :
 			ban_btn.disabled = not local_ban_turn
 			ban_btn.pressed.connect( func(): _on_map_ban_clicked(i))
 		vbox.add_child(ban_btn)
+
+func _tick_map_ban_timer(delta: float) -> void :
+	map_ban_timer = max(0.0, map_ban_timer - delta)
+	_update_map_ban_timer_label()
+
+	# Only the player whose turn it is auto-bans, so both clients stay in sync:
+	# the resulting ban goes out through the normal ban_map packet.
+	if map_ban_timer <= 0.0 and local_ban_turn:
+		_auto_ban_random_map()
+
+func _update_map_ban_timer_label() -> void :
+	if not map_ban_timer_label:
+		return
+	var secs = int(ceil(map_ban_timer))
+	var who = "Your turn" if local_ban_turn else "Opponent's turn"
+	map_ban_timer_label.text = who + " - " + str(secs) + "s left"
+	if secs <= 5:
+		map_ban_timer_label.add_theme_color_override("font_color", Color(1.0, 0.3, 0.3))
+	else:
+		map_ban_timer_label.add_theme_color_override("font_color", Color(1.0, 1.0, 1.0))
+
+func _auto_ban_random_map() -> void :
+	var available: Array = []
+	for i in range(current_3_maps.size()):
+		if not banned_map_indices.has(i):
+			available.append(i)
+	if available.is_empty():
+		return
+	var pick: int = available[randi() % available.size()]
+	log_console("[Map Ban] Time's up! Randomly banned " + String(current_3_maps[pick]["name"]) + ".")
+	_on_map_ban_clicked(pick)
 
 func _on_map_ban_clicked(map_idx: int) -> void :
 	if not local_ban_turn or banned_map_indices.has(map_idx):
@@ -604,6 +975,9 @@ func _check_map_ban_completion() -> void :
 		if map_ban_canvas:
 			map_ban_canvas.queue_free()
 			map_ban_canvas = null
+			map_row_container = null
+			map_ban_header_label = null
+			map_ban_timer_label = null
 
 		_start_p2p_game()
 
@@ -619,14 +993,13 @@ func _on_find_match_pressed() -> void :
 	player_nicknames.clear()
 	player_elos.clear()
 
-	log_console("[Matchmaking] Joining Trystero P2P room...")
+	mm_skip_until.clear()
 
 	_clear_ui()
 	_build_hud_console()
 
-	if OS.has_feature("web"):
-		var window = JavaScriptBridge.get_interface("window")
-		window.joinTrysteroRoomWhenReady("public_1v1_room")
+	log_console("[Matchmaking] Joining matchmaking lobby...")
+	_mm_enter_lobby()
 
 func _on_single_player_pressed() -> void :
 	_save_nickname_from_input()
@@ -936,7 +1309,63 @@ func _build_hud_console() -> void :
 	waiting_opponent_label.visible = true
 	hud_canvas.add_child(waiting_opponent_label)
 
+	opponent_pointer = OpponentPointer.new()
+	opponent_pointer.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	opponent_pointer.visible = false
+	hud_canvas.add_child(opponent_pointer)
+
+	opponent_height_label = Label.new()
+	opponent_height_label.custom_minimum_size = Vector2(220, 24)
+	opponent_height_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	opponent_height_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	opponent_height_label.add_theme_font_size_override("font_size", 14)
+	opponent_height_label.add_theme_color_override("font_color", Color(1.0, 0.45, 0.3))
+	opponent_height_label.add_theme_constant_override("outline_size", 4)
+	opponent_height_label.add_theme_color_override("font_outline_color", Color(0, 0, 0))
+	opponent_height_label.visible = false
+	hud_canvas.add_child(opponent_height_label)
+
 	log_console("[System] Network Console initialized.")
+
+func get_local_player() -> NetworkPlayer:
+	if not players_container or not is_instance_valid(players_container):
+		return null
+	return players_container.get_node_or_null(str(1 if is_host_peer else 2)) as NetworkPlayer
+
+func get_opponent_player() -> NetworkPlayer:
+	if not players_container or not is_instance_valid(players_container):
+		return null
+	return players_container.get_node_or_null(str(2 if is_host_peer else 1)) as NetworkPlayer
+
+func _update_opponent_pointer() -> void :
+	if not opponent_pointer or not opponent_height_label:
+		return
+
+	var show_pointer = false
+	if is_match_active and not is_game_over:
+		var me = get_local_player()
+		var opp = get_opponent_player()
+		if me and opp and me.camera:
+			var height = opp.global_position.y - me.global_position.y
+			if height > OPPONENT_HIGH_THRESHOLD:
+				show_pointer = true
+				var cam: Camera3D = me.camera
+				var center = get_viewport().get_visible_rect().size * 0.5
+				var target = opp.global_position + Vector3(0, 0.9, 0)
+				var dir = cam.unproject_position(target) - center
+				# Projection of a point behind the camera comes out mirrored.
+				if cam.is_position_behind(target):
+					dir = -dir
+				if dir.length() < 0.001:
+					dir = Vector2(0, -1)
+				dir = dir.normalized()
+				opponent_pointer.position = center + dir * POINTER_RADIUS
+				opponent_pointer.rotation = dir.angle()
+				opponent_height_label.text = "OPPONENT ABOVE: " + str(int(round(height))) + "m"
+				opponent_height_label.position = center + Vector2(-110, POINTER_RADIUS + 30)
+
+	opponent_pointer.visible = show_pointer
+	opponent_height_label.visible = show_pointer
 
 func update_local_hud_hp(hp: int) -> void :
 	if local_hp_label:
@@ -950,6 +1379,10 @@ func update_local_hud_hp(hp: int) -> void :
 
 func _build_main_menu() -> void :
 	_clear_ui()
+	mm_phase = "idle"
+	mm_expected_opponent = ""
+	mm_lobby_peers.clear()
+	_mm_clear_pending()
 	opponent_trystero_id = ""
 	_leave_trystero_room()
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
@@ -1340,6 +1773,7 @@ func _clear_ui() -> void :
 		map_ban_canvas = null
 		map_row_container = null
 		map_ban_header_label = null
+		map_ban_timer_label = null
 	if menu_canvas:
 		menu_canvas.queue_free()
 		menu_canvas = null
@@ -1354,6 +1788,8 @@ func _clear_ui() -> void :
 		waiting_opponent_label = null
 		cooldown_progress_bar = null
 		cooldown_bar_container = null
+		opponent_pointer = null
+		opponent_height_label = null
 	if results_canvas:
 		results_canvas.queue_free()
 		results_canvas = null
@@ -1417,6 +1853,10 @@ func _build_3d_environment() -> void :
 	floor_body.add_child(floor_shape)
 	world_root.add_child(floor_body)
 
+	# Nav grid is rebuilt for each map, once the physics bodies exist.
+	nav_grid = null
+	nav_floor_rid = floor_body.get_rid()
+
 	_create_wall_block(Vector3(0, 2, -25), Vector3(50, 4, 1), wall_color)
 	_create_wall_block(Vector3(0, 2, 25), Vector3(50, 4, 1), wall_color)
 	_create_wall_block(Vector3(-25, 2, 0), Vector3(1, 4, 50), wall_color)
@@ -1461,6 +1901,24 @@ func _build_map_mechanics(mechanic: String, wall_color: Color) -> void :
 			_create_wall_block(Vector3(10, 2, 10), Vector3(20, 4, 1), wall_color)
 			_create_wall_block(Vector3(0, 2, -5), Vector3(1, 4, 15), wall_color)
 			_create_wall_block(Vector3(0, 2, 5), Vector3(1, 4, 15), wall_color)
+		"ladders":
+			# Tall walls with walkable tops, linked by bridges, climbed by ladders.
+			var h = 6.0
+			_create_wall_block(Vector3(-12, h / 2.0, 0), Vector3(3, h, 20), wall_color)
+			_create_wall_block(Vector3(12, h / 2.0, 0), Vector3(3, h, 20), wall_color)
+			_create_wall_block(Vector3(0, h / 2.0, 0), Vector3(6, h, 6), wall_color)
+			_create_wall_block(Vector3(-6.75, h - 0.25, 0), Vector3(7.5, 0.5, 2.5), wall_color)
+			_create_wall_block(Vector3(6.75, h - 0.25, 0), Vector3(7.5, 0.5, 2.5), wall_color)
+			for z in [-6.0, 6.0]:
+				# Left rampart: outer face (spawn side) and inner face
+				_create_ladder(Vector3(-13.5, 0, z), Vector3(-1, 0, 0), h)
+				_create_ladder(Vector3(-10.5, 0, z), Vector3(1, 0, 0), h)
+				# Right rampart
+				_create_ladder(Vector3(13.5, 0, z), Vector3(1, 0, 0), h)
+				_create_ladder(Vector3(10.5, 0, z), Vector3(-1, 0, 0), h)
+			# Central tower, north and south faces
+			_create_ladder(Vector3(0, 0, -3), Vector3(0, 0, -1), h)
+			_create_ladder(Vector3(0, 0, 3), Vector3(0, 0, 1), h)
 		"glass_barriers":
 			var glass_col = Color(0.7, 0.9, 1.0, 0.35)
 			_create_wall_block(Vector3(-8, 1.5, 0), Vector3(1, 3, 16), glass_col)
@@ -1539,10 +1997,114 @@ func _create_toxic_pool(pos: Vector3, size: Vector3) -> void :
 	pool.position = pos
 	world_root.add_child(pool)
 
+func _create_ladder(face_pos: Vector3, outward_normal: Vector3, height: float) -> void :
+	var ladder = MapLadder.new(outward_normal, height)
+	ladder.position = face_pos
+	ladder.rotation.y = atan2(outward_normal.x, outward_normal.z) # local +Z faces outward
+	world_root.add_child(ladder)
+
 func _create_recharge_pad(pos: Vector3) -> void :
 	var pad = MapRechargePad.new(self)
 	pad.position = pos
 	world_root.add_child(pad)
+
+# --- NAV GRID (practice dummy pathfinding) ---
+
+func nav_world_to_cell(p: Vector3) -> Vector2i:
+	var size = NAV_HALF_EXTENT * 2 + 1
+	return Vector2i(
+		clampi(roundi(p.x) + NAV_HALF_EXTENT, 0, size - 1),
+		clampi(roundi(p.z) + NAV_HALF_EXTENT, 0, size - 1))
+
+func nav_cell_to_world(c: Vector2i) -> Vector3:
+	return Vector3(c.x - NAV_HALF_EXTENT, 0.0, c.y - NAV_HALF_EXTENT)
+
+# Must be called from _physics_process (direct space state is only valid there).
+func build_nav_grid(space_state: PhysicsDirectSpaceState3D) -> void :
+	var size = NAV_HALF_EXTENT * 2 + 1
+	nav_grid = AStarGrid2D.new()
+	nav_grid.region = Rect2i(0, 0, size, size)
+	nav_grid.cell_size = Vector2(1, 1)
+	nav_grid.diagonal_mode = AStarGrid2D.DIAGONAL_MODE_ONLY_IF_NO_OBSTACLES
+	nav_grid.update()
+
+	# Probe a body-sized box in each cell, from just above the floor to head
+	# height. Slightly wider than the dummy so paths keep clear of walls.
+	var probe = BoxShape3D.new()
+	probe.size = Vector3(1.2, 1.56, 1.2)
+	var params = PhysicsShapeQueryParameters3D.new()
+	params.shape = probe
+	params.collide_with_bodies = true
+	params.collide_with_areas = true
+	params.exclude = [nav_floor_rid]
+
+	var solid_count = 0
+	for ix in range(size):
+		for iz in range(size):
+			var cell = Vector2i(ix, iz)
+			var w = nav_cell_to_world(cell)
+			params.transform = Transform3D(Basis(), Vector3(w.x, 0.8, w.z))
+			for hit in space_state.intersect_shape(params, 16):
+				var c = hit.get("collider")
+				if c is CharacterBody3D:
+					continue
+				if c is StaticBody3D or c is MapPortal:
+					# Walls, ramps, glass - and portals, so the dummy doesn't
+					# teleport away mid-path.
+					nav_grid.set_point_solid(cell, true)
+					solid_count += 1
+					break
+				if c is MapToxicPool:
+					nav_grid.set_point_weight_scale(cell, 12.0)
+				elif c is MapJumpPad or c is MapRechargePad:
+					nav_grid.set_point_weight_scale(cell, 3.0)
+
+	log_console("[Practice] Dummy nav grid ready (" + str(size * size - solid_count) + " walkable cells).")
+
+func _nav_nearest_open(c: Vector2i) -> Vector2i:
+	if not nav_grid.is_point_solid(c):
+		return c
+	for r in range(1, 8):
+		for dx in range(-r, r + 1):
+			for dz in range(-r, r + 1):
+				if abs(dx) != r and abs(dz) != r:
+					continue
+				var n = c + Vector2i(dx, dz)
+				if nav_grid.is_in_boundsv(n) and not nav_grid.is_point_solid(n):
+					return n
+	return c
+
+func get_nav_path(from: Vector3, to: Vector3) -> PackedVector3Array:
+	var out = PackedVector3Array()
+	if not nav_grid:
+		return out
+	var a = _nav_nearest_open(nav_world_to_cell(from))
+	var b = _nav_nearest_open(nav_world_to_cell(to))
+	for id in nav_grid.get_id_path(a, b):
+		var wp = nav_cell_to_world(id)
+		wp.y = from.y
+		out.append(wp)
+	return out
+
+func get_random_nav_point() -> Vector3:
+	var size = NAV_HALF_EXTENT * 2 + 1
+	for _i in range(40):
+		var c = Vector2i(randi() % size, randi() % size)
+		if not nav_grid.is_point_solid(c) and nav_grid.get_point_weight_scale(c) <= 1.0:
+			return nav_cell_to_world(c)
+	return Vector3.ZERO
+
+# Picks a reachable open spot that is far from the threat (used to flee).
+func get_nav_point_away_from(threat: Vector3, from: Vector3) -> Vector3:
+	var best = get_random_nav_point()
+	var best_score = -INF
+	for _i in range(24):
+		var p = get_random_nav_point()
+		var score = p.distance_to(Vector3(threat.x, 0, threat.z)) - 0.3 * p.distance_to(Vector3(from.x, 0, from.z))
+		if score > best_score:
+			best_score = score
+			best = p
+	return best
 
 func _spawn_player(peer_id: int) -> void :
 	var player = NetworkPlayer.new(peer_id, self)
@@ -1566,6 +2128,77 @@ func _spawn_test_dummy(peer_id: int) -> void :
 	players_container.add_child(dummy)
 	player_nicknames[peer_id] = "Test Dummy"
 	player_elos[peer_id] = 0
+
+
+class OpponentPointer extends Control:
+	# Arrow drawn around this control's origin, pointing along +X.
+	# Position and rotation are set every frame by _update_opponent_pointer().
+	var pulse: float = 0.0
+
+	func _process(delta: float) -> void:
+		if visible:
+			pulse += delta
+			queue_redraw()
+
+	func _draw() -> void:
+		var a = 0.75 + 0.25 * sin(pulse * 6.0)
+		var pts = PackedVector2Array([Vector2(24, 0), Vector2(-12, -16), Vector2(-4, 0), Vector2(-12, 16)])
+		draw_colored_polygon(pts, Color(1.0, 0.35, 0.25, a))
+		var outline = pts.duplicate()
+		outline.append(pts[0])
+		draw_polyline(outline, Color(0, 0, 0, 0.7 * a), 2.0, true)
+
+
+class MapLadder extends Area3D:
+	# Placed at the base of a wall face; local +Z points away from the wall.
+	var outward_normal: Vector3
+	var height: float
+
+	func _init(normal: Vector3, h: float) -> void:
+		outward_normal = normal.normalized()
+		height = h
+
+	func _ready() -> void:
+		# Climb zone: in front of the wall, reaching a little above the top so
+		# the player's feet clear the edge before the climb ends.
+		var zone_h = height + 0.25
+		var col = CollisionShape3D.new()
+		var box = BoxShape3D.new()
+		box.size = Vector3(1.4, zone_h, 1.0)
+		col.shape = box
+		col.position = Vector3(0, zone_h / 2.0, 0.5)
+		add_child(col)
+
+		var mat = StandardMaterial3D.new()
+		mat.albedo_color = Color(0.45, 0.28, 0.12)
+
+		# Two rails plus rungs every 0.4m (visual only, no collision).
+		for x in [-0.5, 0.5]:
+			_add_box(Vector3(x, height / 2.0, 0.1), Vector3(0.1, height, 0.1), mat)
+		var y = 0.3
+		while y < height:
+			_add_box(Vector3(0, y, 0.1), Vector3(1.0, 0.07, 0.07), mat)
+			y += 0.4
+
+		body_entered.connect(_on_body_entered)
+		body_exited.connect(_on_body_exited)
+
+	func _add_box(pos: Vector3, size: Vector3, mat: Material) -> void:
+		var mesh = MeshInstance3D.new()
+		var bm = BoxMesh.new()
+		bm.size = size
+		mesh.mesh = bm
+		mesh.position = pos
+		mesh.material_override = mat
+		add_child(mesh)
+
+	func _on_body_entered(body: Node3D) -> void:
+		if body.has_method("enter_ladder"):
+			body.enter_ladder(self)
+
+	func _on_body_exited(body: Node3D) -> void:
+		if body.has_method("exit_ladder"):
+			body.exit_ladder(self)
 
 
 class MapPortal extends Area3D:
@@ -1746,6 +2379,11 @@ class NetworkPlayer extends CharacterBody3D:
 	var qte_target_start: float = 0.4
 	var qte_target_width: float = 0.2
 
+	var qte_elapsed: float = 0.0
+	const QTE_MAX_DURATION: float = 4.0
+	var lock_failsafe_timer: float = 0.0
+	const MOVEMENT_LOCK_FAILSAFE: float = 6.0
+
 	var is_launching: bool = false
 	var launch_target_pos: Vector3 = Vector3.ZERO
 	var launch_timer: float = 0.0
@@ -1753,9 +2391,26 @@ class NetworkPlayer extends CharacterBody3D:
 	var gravity_mult: float = 1.0
 	var friction: float = 1.0
 
+	const LADDER_CLIMB_SPEED: float = 5.0
+	var ladder_contacts: Array = []
+
+	# Practice dummy AI
+	const DUMMY_SPEED: float = 4.5
+	const DUMMY_FLEE_RANGE: float = 9.0
+	var nav_path: PackedVector3Array = PackedVector3Array()
+	var nav_path_index: int = 0
+	var dummy_repath_timer: float = 0.0
+	var dummy_stuck_timer: float = 0.0
+	var dummy_last_pos: Vector3 = Vector3.ZERO
+	var dummy_frames: int = 0
+
 	func _init(id: int = 1, manager: Node = null) -> void :
 		peer_id = id
 		main_manager = manager
+
+	func set_movement_lock(locked: bool) -> void :
+		is_movement_locked = locked
+		lock_failsafe_timer = MOVEMENT_LOCK_FAILSAFE if locked else 0.0
 
 	func is_local_player() -> bool:
 		if is_dummy:
@@ -1899,18 +2554,23 @@ class NetworkPlayer extends CharacterBody3D:
 			return
 
 		if is_dummy:
-			if not is_on_floor():
-				velocity.y -= 20.0 * gravity_mult * delta
-				move_and_slide()
+			_process_dummy_ai(delta)
 			return
 
 		if not is_local_player():
 			return
 
 		if is_movement_locked:
+			# Failsafe: never stay frozen forever if the unlock packet is lost.
+			lock_failsafe_timer -= delta
+			if lock_failsafe_timer <= 0.0:
+				is_movement_locked = false
+				main_manager.log_console("[Combat] Movement lock expired.")
 			velocity.x = 0
 			velocity.z = 0
-			if not is_on_floor():
+			if get_active_ladder() and not is_on_floor():
+				velocity.y = 0.0 # hang on the ladder while frozen
+			elif not is_on_floor():
 				velocity.y -= 20.0 * gravity_mult * delta
 			move_and_slide()
 			_send_p2p_position()
@@ -1964,8 +2624,120 @@ class NetworkPlayer extends CharacterBody3D:
 			velocity.x = move_toward(velocity.x, 0, current_speed * friction)
 			velocity.z = move_toward(velocity.z, 0, current_speed * friction)
 
+		var ladder = get_active_ladder()
+		if ladder:
+			_apply_ladder_climb(ladder, direction, jump_pressed)
+
 		move_and_slide()
 		_send_p2p_position()
+
+	# --- LADDERS ---
+	func enter_ladder(ladder: Node) -> void :
+		if not ladder_contacts.has(ladder):
+			ladder_contacts.append(ladder)
+
+	func exit_ladder(ladder: Node) -> void :
+		ladder_contacts.erase(ladder)
+
+	func get_active_ladder() -> MapLadder:
+		for l in ladder_contacts:
+			if is_instance_valid(l):
+				return l
+		return null
+
+	# Walking into a ladder climbs it, walking away from it climbs down,
+	# no input hangs in place, and jump kicks off it.
+	func _apply_ladder_climb(ladder: MapLadder, direction: Vector3, jump_pressed: bool) -> void :
+		var push = direction.dot(-ladder.outward_normal)
+		if jump_pressed and not is_on_floor():
+			velocity = ladder.outward_normal * 6.0 + Vector3(0, 5.0, 0)
+			ladder_contacts.clear()
+			return
+
+		if not is_on_floor():
+			# While on the ladder, don't drift away from the wall (that's what
+			# jump is for) and slow sideways movement so you stay on it.
+			var n = ladder.outward_normal
+			var horiz = Vector3(velocity.x, 0.0, velocity.z)
+			var away = horiz.dot(n)
+			if away > 0.0:
+				horiz -= n * away
+			var into = horiz.dot(-n)
+			var lateral = horiz + n * into
+			horiz = (-n) * max(into, 0.0) + lateral * 0.5
+			velocity.x = horiz.x
+			velocity.z = horiz.z
+
+		if push > 0.3:
+			velocity.y = LADDER_CLIMB_SPEED
+		elif push < -0.3 and not is_on_floor():
+			velocity.y = -LADDER_CLIMB_SPEED
+		elif not is_on_floor():
+			velocity.y = 0.0
+
+	func _process_dummy_ai(delta: float) -> void :
+		if not is_on_floor():
+			velocity.y -= 20.0 * gravity_mult * delta
+
+		# Build the nav grid a few physics frames in, once the map's collision
+		# shapes are registered with the physics server.
+		dummy_frames += 1
+		if main_manager.nav_grid == null:
+			if dummy_frames >= 3:
+				main_manager.build_nav_grid(get_world_3d().direct_space_state)
+				dummy_last_pos = global_position
+			move_and_slide()
+			return
+
+		# Stand still while being hit by a QTE (or once defeated).
+		if is_movement_locked or health <= 0:
+			velocity.x = move_toward(velocity.x, 0.0, DUMMY_SPEED * friction)
+			velocity.z = move_toward(velocity.z, 0.0, DUMMY_SPEED * friction)
+			move_and_slide()
+			return
+
+		dummy_repath_timer -= delta
+		if nav_path_index >= nav_path.size() or dummy_repath_timer <= 0.0:
+			_dummy_pick_new_path()
+
+		var desired = Vector3.ZERO
+		if nav_path_index < nav_path.size():
+			var wp = nav_path[nav_path_index]
+			var to_wp = Vector3(wp.x - global_position.x, 0.0, wp.z - global_position.z)
+			if to_wp.length() < 0.35:
+				nav_path_index += 1
+			else:
+				desired = to_wp.normalized() * DUMMY_SPEED
+
+		velocity.x = lerp(velocity.x, desired.x, friction)
+		velocity.z = lerp(velocity.z, desired.z, friction)
+		if desired.length() > 0.1:
+			rotation.y = lerp_angle(rotation.y, atan2(-desired.x, -desired.z), 10.0 * delta)
+
+		move_and_slide()
+
+		# If we've barely moved for a second while trying to, pick a new path.
+		dummy_stuck_timer += delta
+		if dummy_stuck_timer >= 1.0:
+			if nav_path_index < nav_path.size() and global_position.distance_to(dummy_last_pos) < 0.3:
+				_dummy_pick_new_path()
+			dummy_last_pos = global_position
+			dummy_stuck_timer = 0.0
+
+	func _dummy_pick_new_path() -> void :
+		var target: Vector3
+		var player = main_manager.get_local_player()
+		if player and global_position.distance_to(player.global_position) < DUMMY_FLEE_RANGE:
+			# Player is close: run away, re-evaluating often.
+			target = main_manager.get_nav_point_away_from(player.global_position, global_position)
+			dummy_repath_timer = 1.5
+		else:
+			target = main_manager.get_random_nav_point()
+			dummy_repath_timer = randf_range(4.0, 7.0)
+
+		nav_path = main_manager.get_nav_path(global_position, target)
+		# Index 0 is the cell we're standing in; head for the next one.
+		nav_path_index = 1 if nav_path.size() > 1 else nav_path.size()
 
 	func _send_p2p_position() -> void :
 		main_manager.send_p2p_packet({
@@ -2043,12 +2815,19 @@ class NetworkPlayer extends CharacterBody3D:
 
 		if opp:
 			opp.is_movement_locked = false
-			var repulse_dir = (global_position - opp.global_position).normalized()
-			if repulse_dir == Vector3.ZERO:
-				repulse_dir = Vector3(1, 0, 0)
+			opp.qte_active = false
+			var repulse_dir = global_position - opp.global_position
+			repulse_dir.y = 0.0
+			if repulse_dir.length() < 0.01:
+				# Standing on top of each other: push along our own back direction.
+				repulse_dir = global_transform.basis.z
+				repulse_dir.y = 0.0
+			repulse_dir = repulse_dir.normalized()
 			is_launching = true
 			launch_timer = 0.45
-			launch_target_pos = global_position + repulse_dir * 12.0
+			# Target is farther than the launch can travel (32 u/s * 0.45s), so the
+			# fling direction never flips mid-flight.
+			launch_target_pos = global_position + repulse_dir * 20.0
 
 		main_manager.log_console("[Combat] Simultaneous attack clash! Both players repelled!")
 
@@ -2065,15 +2844,19 @@ class NetworkPlayer extends CharacterBody3D:
 		qte_e_released = false
 		qte_progress = 0.0
 		qte_direction = 1.0
+		qte_elapsed = 0.0
 		main_manager.is_qte_in_progress = true
 
 		if targeted_opponent:
 			targeted_opponent.is_movement_locked = true
 			if not main_manager.is_single_player:
+				# One packet both announces our QTE and locks the target. If the
+				# target is already in its own QTE when this arrives (both pressed E
+				# at once), the receiver resolves it as a clash instead of a lock.
 				main_manager.send_p2p_packet({
-					"action": "set_movement_lock", 
-					"peer_id": str(targeted_opponent.peer_id), 
-					"locked": true
+					"action": "qte_start",
+					"attacker": str(peer_id),
+					"target": str(targeted_opponent.peer_id)
 				})
 
 		qte_canvas = CanvasLayer.new()
@@ -2100,6 +2883,13 @@ class NetworkPlayer extends CharacterBody3D:
 	func _process_qte(delta: float) -> void :
 		if not Input.is_key_pressed(KEY_E):
 			qte_e_released = true
+
+		# Don't let an unanswered QTE hold the opponent frozen forever.
+		qte_elapsed += delta
+		if qte_elapsed >= QTE_MAX_DURATION:
+			qte_progress = -1.0
+			_evaluate_qte()
+			return
 
 		if qte_delay_timer > 0.0:
 			qte_delay_timer -= delta
@@ -2131,9 +2921,9 @@ class NetworkPlayer extends CharacterBody3D:
 			targeted_opponent.is_movement_locked = false
 			if not main_manager.is_single_player:
 				main_manager.send_p2p_packet({
-					"action": "set_movement_lock", 
-					"peer_id": str(targeted_opponent.peer_id), 
-					"locked": false
+					"action": "qte_end",
+					"attacker": str(peer_id),
+					"target": str(targeted_opponent.peer_id)
 				})
 
 		main_manager.start_combat_cooldown()
