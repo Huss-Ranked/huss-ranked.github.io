@@ -183,6 +183,21 @@ var crystal_spawn_timer: float = 0.0
 var crystal_id_counter: int = 0
 var ability_label: Label = null
 
+const CRYSTAL_POINTER_COLOR: Color = Color(0.72, 0.3, 1.0)
+const CRYSTAL_SPAWN_HALF_EXTENT: float = 22.0 # stay well inside the 25m outer walls
+var crystals_enabled: bool = false
+var crystal_high_ground: bool = false
+var crystal_active: Dictionary = {} # {id, type, pos} of the crystal on the map, if any
+var crystal_claim_sent: bool = false
+
+# The local player's current crystal ability ("" = none). One at a time.
+var local_ability: String = ""
+var local_ability_timer: float = 0.0
+
+var crystal_pointer: Control = null
+var crystal_distance_label: Label = null
+var crosshair: Control = null
+
 # --- OPPONENT-ABOVE POINTER ---
 const OPPONENT_HIGH_THRESHOLD: float = 4.0
 const POINTER_RADIUS: float = 90.0
@@ -268,6 +283,9 @@ func _process(delta: float) -> void :
 
 	if map_ban_canvas and map_row_container:
 		_tick_map_ban_timer(delta)
+
+	if is_match_active and not is_game_over:
+		_tick_local_ability(delta)
 
 	_update_opponent_pointer()
 
@@ -583,6 +601,23 @@ func _handle_incoming_p2p_packet(data: Dictionary) -> void :
 		"match_outcome":
 			var winner_id = int(data.get("winner_peer_id", 1))
 			_process_match_outcome(winner_id)
+		"crystal_spawn":
+			if not is_host_peer:
+				_apply_crystal_spawn({
+					"id": int(data.get("id", 0)),
+					"type": String(data.get("type", "speed_boost")),
+					"pos": Vector3(float(data.get("x", 0)), float(data.get("y", 1)), float(data.get("z", 0)))
+				})
+		"crystal_claim":
+			if is_host_peer:
+				_host_grant_crystal(int(data.get("id", -1)), 2)
+		"crystal_taken":
+			if not is_host_peer:
+				_apply_crystal_taken(int(data.get("id", -1)), int(data.get("by", 0)), String(data.get("type", "")))
+		"ability_end":
+			var opp_end = get_opponent_player()
+			if opp_end:
+				opp_end.set_ability_tag("", Color.WHITE)
 
 func send_p2p_packet(data: Dictionary) -> void :
 	if not OS.has_feature("web") or is_single_player:
@@ -783,6 +818,7 @@ func _draw_img_rect(img: Image, start_x: int, start_y: int, rect_w: int, rect_h:
 func _start_map_ban_phase() -> void :
 	banned_map_indices.clear()
 	local_ban_turn = is_host_peer or is_single_player
+	_reset_crystal_state()
 	_build_map_ban_ui()
 
 func _build_map_ban_ui() -> void :
@@ -1040,6 +1076,195 @@ func _start_p2p_game() -> void :
 		_spawn_test_dummy(2)
 	else:
 		_spawn_player(2)
+
+	crystals_enabled = bool(selected_map_data.get("crystals", false))
+	crystal_high_ground = bool(selected_map_data.get("crystal_high_ground", false))
+	crystal_spawn_timer = CRYSTAL_FIRST_SPAWN
+	if crystals_enabled:
+		log_console("[Crystals] Power crystals are active on this map!")
+		# The host may have told us about a crystal before our world existed.
+		if not crystal_active.is_empty() and crystal_node == null:
+			_spawn_crystal_node(crystal_active)
+
+
+# --- POWER CRYSTALS ---
+# Host-authoritative: the host picks when/where/what spawns and arbitrates who
+# picked it up. One crystal on the map at a time; the next spawns
+# CRYSTAL_RESPAWN_TIME seconds after the previous one is taken.
+
+func _reset_crystal_state() -> void :
+	crystals_enabled = false
+	crystal_active = {}
+	crystal_claim_sent = false
+	crystal_id_counter = 0
+	crystal_spawn_timer = CRYSTAL_FIRST_SPAWN
+	if crystal_node and is_instance_valid(crystal_node):
+		crystal_node.queue_free()
+	crystal_node = null
+	local_ability = ""
+	local_ability_timer = 0.0
+
+func _physics_process(delta: float) -> void :
+	# Spawning needs raycasts, which are only valid during physics frames.
+	if not crystals_enabled or not is_match_active or is_game_over or not world_root:
+		return
+	if not is_host_peer or not crystal_active.is_empty():
+		return
+	crystal_spawn_timer -= delta
+	if crystal_spawn_timer > 0.0:
+		return
+	var pos = _find_crystal_spawn_point(world_root.get_world_3d().direct_space_state)
+	if typeof(pos) != TYPE_VECTOR3:
+		return # no valid spot this frame - try again next physics frame
+	crystal_id_counter += 1
+	var types = CRYSTAL_ABILITIES.keys()
+	var data = {"id": crystal_id_counter, "type": String(types[randi() % types.size()]), "pos": pos}
+	_apply_crystal_spawn(data)
+	send_p2p_packet({
+		"action": "crystal_spawn", "id": data["id"], "type": data["type"],
+		"x": pos.x, "y": pos.y, "z": pos.z
+	})
+
+# Picks a random spot on a walkable surface inside the arena: drop a ray from
+# the sky, require a flat solid surface, and make sure the crystal won't sit
+# inside a wall or on top of a pad/pool/portal/ladder. Returns null if none of
+# this frame's attempts worked.
+func _find_crystal_spawn_point(space: PhysicsDirectSpaceState3D):
+	var probe = BoxShape3D.new()
+	probe.size = Vector3(1.0, 1.6, 1.0)
+	var params = PhysicsShapeQueryParameters3D.new()
+	params.shape = probe
+	params.collide_with_bodies = true
+	params.collide_with_areas = true
+	params.exclude = [nav_floor_rid]
+
+	for _attempt in range(12):
+		var x = randf_range(-CRYSTAL_SPAWN_HALF_EXTENT, CRYSTAL_SPAWN_HALF_EXTENT)
+		var z = randf_range(-CRYSTAL_SPAWN_HALF_EXTENT, CRYSTAL_SPAWN_HALF_EXTENT)
+		var ray = PhysicsRayQueryParameters3D.create(Vector3(x, 30, z), Vector3(x, -1, z))
+		ray.collide_with_areas = false
+		var hit = space.intersect_ray(ray)
+		if hit.is_empty() or not (hit["collider"] is StaticBody3D):
+			continue
+		if hit["normal"].y < 0.85:
+			continue # too steep
+		var ground: Vector3 = hit["position"]
+		if ground.y < -0.5 or ground.y > 7.0:
+			continue
+		if ground.y > 0.5 and not crystal_high_ground:
+			continue # this map keeps crystals on the arena floor
+		params.transform = Transform3D(Basis(), ground + Vector3(0, 0.8, 0))
+		var blocked = false
+		for h in space.intersect_shape(params, 8):
+			var c = h.get("collider")
+			if c is CharacterBody3D or c is PowerCrystal:
+				continue
+			if c == hit["collider"] and ground.y > 0.5:
+				continue # the wall top we're standing on
+			blocked = true
+			break
+		if blocked:
+			continue
+		return ground + Vector3(0, 1.0, 0)
+	return null
+
+func _apply_crystal_spawn(data: Dictionary) -> void :
+	crystal_active = data
+	crystal_claim_sent = false
+	if world_root:
+		_spawn_crystal_node(data)
+
+func _spawn_crystal_node(data: Dictionary) -> void :
+	if crystal_node and is_instance_valid(crystal_node):
+		crystal_node.queue_free()
+	var info = CRYSTAL_ABILITIES.get(data["type"], {"name": "Crystal", "color": CRYSTAL_POINTER_COLOR})
+	crystal_node = PowerCrystal.new(int(data["id"]), String(data["type"]), info["color"], info["name"], self)
+	crystal_node.position = data["pos"]
+	world_root.add_child(crystal_node)
+	log_console("[Crystals] A " + String(info["name"]) + " crystal appeared! Follow the purple arrow.")
+
+# Called by the crystal when the local player is touching it.
+func on_crystal_touched(crystal: Node) -> void :
+	if local_ability != "" or is_game_over:
+		return # one ability at a time - leave it for later / the opponent
+	if crystal_active.is_empty() or int(crystal.crystal_id) != int(crystal_active["id"]):
+		return
+	var my_id = 1 if is_host_peer else 2
+	if is_host_peer:
+		_host_grant_crystal(int(crystal_active["id"]), my_id)
+	elif not crystal_claim_sent:
+		crystal_claim_sent = true
+		send_p2p_packet({"action": "crystal_claim", "id": int(crystal_active["id"])})
+
+func _host_grant_crystal(id: int, by_peer: int) -> void :
+	if crystal_active.is_empty() or int(crystal_active["id"]) != id:
+		return # already taken
+	var ability_type = String(crystal_active["type"])
+	send_p2p_packet({"action": "crystal_taken", "id": id, "by": by_peer, "type": ability_type})
+	_apply_crystal_taken(id, by_peer, ability_type)
+
+func _apply_crystal_taken(id: int, by_peer: int, ability_type: String) -> void :
+	if not crystal_active.is_empty() and int(crystal_active["id"]) == id:
+		crystal_active = {}
+		if crystal_node and is_instance_valid(crystal_node):
+			crystal_node.queue_free()
+		crystal_node = null
+	crystal_claim_sent = false
+	crystal_spawn_timer = CRYSTAL_RESPAWN_TIME
+
+	var my_id = 1 if is_host_peer else 2
+	var info = CRYSTAL_ABILITIES.get(ability_type, {"name": ability_type, "color": Color.WHITE})
+	if by_peer == my_id:
+		_give_local_ability(ability_type)
+	else:
+		var opp = get_opponent_player()
+		if opp:
+			opp.set_ability_tag(String(info["name"]), info["color"])
+		log_console("[Crystals] Opponent grabbed " + String(info["name"]) + "!")
+
+func _give_local_ability(ability_type: String) -> void :
+	local_ability = ability_type
+	local_ability_timer = ABILITY_DURATION
+	var info = CRYSTAL_ABILITIES.get(ability_type, {"name": ability_type})
+	log_console("[Crystals] You got " + String(info["name"]) + " for " + str(int(ABILITY_DURATION)) + "s!")
+	_update_ability_hud()
+
+# Ends the local ability, either because it was used or it timed out.
+func consume_local_ability(reason: String = "used") -> void :
+	if local_ability == "":
+		return
+	var info = CRYSTAL_ABILITIES.get(local_ability, {"name": local_ability})
+	log_console("[Crystals] " + String(info["name"]) + (" used up." if reason == "used" else " wore off."))
+	local_ability = ""
+	local_ability_timer = 0.0
+	send_p2p_packet({"action": "ability_end"})
+	_update_ability_hud()
+
+func _tick_local_ability(delta: float) -> void :
+	if local_ability == "":
+		return
+	local_ability_timer -= delta
+	if local_ability_timer <= 0.0:
+		consume_local_ability("expired")
+	else:
+		_update_ability_hud()
+
+func _update_ability_hud() -> void :
+	if not ability_label:
+		return
+	if local_ability == "":
+		ability_label.visible = false
+		return
+	var info = CRYSTAL_ABILITIES.get(local_ability, {"name": local_ability, "color": Color.WHITE})
+	var hint = ""
+	match local_ability:
+		"double_jump": hint = "Press Space again in mid-air"
+		"double_damage": hint = "Next QTE hits for 50 (smaller target)"
+		"speed_boost": hint = "Move " + str(int(round((SPEED_BOOST_MULT - 1.0) * 100))) + "% faster"
+		"lunge": hint = "Press Q to lunge forward"
+	ability_label.text = "CRYSTAL: " + String(info["name"]) + "  (" + str(int(ceil(local_ability_timer))) + "s)\n" + hint
+	ability_label.add_theme_color_override("font_color", info["color"])
+	ability_label.visible = true
 
 
 func get_rank_name(elo: int) -> String:
@@ -1325,6 +1550,39 @@ func _build_hud_console() -> void :
 	opponent_height_label.visible = false
 	hud_canvas.add_child(opponent_height_label)
 
+	# Purple arrow + distance readout pointing at the power crystal.
+	crystal_pointer = OpponentPointer.new()
+	crystal_pointer.arrow_color = CRYSTAL_POINTER_COLOR
+	crystal_pointer.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	crystal_pointer.visible = false
+	hud_canvas.add_child(crystal_pointer)
+
+	crystal_distance_label = Label.new()
+	crystal_distance_label.custom_minimum_size = Vector2(220, 24)
+	crystal_distance_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	crystal_distance_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	crystal_distance_label.add_theme_font_size_override("font_size", 14)
+	crystal_distance_label.add_theme_color_override("font_color", CRYSTAL_POINTER_COLOR)
+	crystal_distance_label.add_theme_constant_override("outline_size", 4)
+	crystal_distance_label.add_theme_color_override("font_outline_color", Color(0, 0, 0))
+	crystal_distance_label.visible = false
+	hud_canvas.add_child(crystal_distance_label)
+
+	# Active crystal ability (top-left, under HP)
+	ability_label = Label.new()
+	ability_label.position = Vector2(12, 56)
+	ability_label.add_theme_font_size_override("font_size", 14)
+	ability_label.add_theme_constant_override("outline_size", 4)
+	ability_label.add_theme_color_override("font_outline_color", Color(0, 0, 0))
+	ability_label.visible = false
+	hud_canvas.add_child(ability_label)
+
+	# Plus-shaped crosshair, always centered (anchored to the middle of the screen).
+	crosshair = Crosshair.new()
+	crosshair.set_anchors_preset(Control.PRESET_CENTER)
+	crosshair.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	hud_canvas.add_child(crosshair)
+
 	log_console("[System] Network Console initialized.")
 
 func get_local_player() -> NetworkPlayer:
@@ -1342,30 +1600,47 @@ func _update_opponent_pointer() -> void :
 		return
 
 	var show_pointer = false
-	if is_match_active and not is_game_over:
-		var me = get_local_player()
+	var show_crystal = false
+	var me = get_local_player() if is_match_active and not is_game_over else null
+	var center = get_viewport().get_visible_rect().size * 0.5
+
+	if me and me.camera:
+		var cam: Camera3D = me.camera
 		var opp = get_opponent_player()
-		if me and opp and me.camera:
+		if opp:
 			var height = opp.global_position.y - me.global_position.y
 			if height > OPPONENT_HIGH_THRESHOLD:
 				show_pointer = true
-				var cam: Camera3D = me.camera
-				var center = get_viewport().get_visible_rect().size * 0.5
-				var target = opp.global_position + Vector3(0, 0.9, 0)
-				var dir = cam.unproject_position(target) - center
-				# Projection of a point behind the camera comes out mirrored.
-				if cam.is_position_behind(target):
-					dir = -dir
-				if dir.length() < 0.001:
-					dir = Vector2(0, -1)
-				dir = dir.normalized()
-				opponent_pointer.position = center + dir * POINTER_RADIUS
-				opponent_pointer.rotation = dir.angle()
+				_aim_pointer(opponent_pointer, cam, center, opp.global_position + Vector3(0, 0.9, 0))
 				opponent_height_label.text = "OPPONENT ABOVE: " + str(int(round(height))) + "m"
 				opponent_height_label.position = center + Vector2(-110, POINTER_RADIUS + 30)
 
+		if crystal_pointer and crystal_node and is_instance_valid(crystal_node):
+			show_crystal = true
+			var cpos = crystal_node.global_position
+			_aim_pointer(crystal_pointer, cam, center, cpos)
+			var dist = cpos.distance_to(me.global_position + Vector3(0, 0.9, 0))
+			crystal_distance_label.text = "CRYSTAL: " + str(int(round(dist))) + "m"
+			crystal_distance_label.position = center + Vector2(-110, POINTER_RADIUS + (54 if show_pointer else 30))
+
 	opponent_pointer.visible = show_pointer
 	opponent_height_label.visible = show_pointer
+	if crystal_pointer:
+		crystal_pointer.visible = show_crystal
+		crystal_distance_label.visible = show_crystal
+	if crosshair:
+		crosshair.visible = me != null
+
+func _aim_pointer(pointer: Control, cam: Camera3D, center: Vector2, target: Vector3) -> void :
+	var dir = cam.unproject_position(target) - center
+	# Projection of a point behind the camera comes out mirrored.
+	if cam.is_position_behind(target):
+		dir = -dir
+	if dir.length() < 0.001:
+		dir = Vector2(0, -1)
+	dir = dir.normalized()
+	pointer.position = center + dir * POINTER_RADIUS
+	pointer.rotation = dir.angle()
 
 func update_local_hud_hp(hp: int) -> void :
 	if local_hp_label:
@@ -1790,6 +2065,10 @@ func _clear_ui() -> void :
 		cooldown_bar_container = null
 		opponent_pointer = null
 		opponent_height_label = null
+		crystal_pointer = null
+		crystal_distance_label = null
+		ability_label = null
+		crosshair = null
 	if results_canvas:
 		results_canvas.queue_free()
 		results_canvas = null
@@ -2130,10 +2409,123 @@ func _spawn_test_dummy(peer_id: int) -> void :
 	player_elos[peer_id] = 0
 
 
+class Crosshair extends Control:
+	# Plus-shaped crosshair drawn around this control's origin (screen center).
+	const ARM: float = 9.0
+	const GAP: float = 3.0
+	const THICK: float = 2.0
+
+	func _draw() -> void:
+		var outline = Color(0, 0, 0, 0.75)
+		var col = Color(1, 1, 1, 0.95)
+		for pass_i in range(2):
+			var c = outline if pass_i == 0 else col
+			var w = THICK + 2.0 if pass_i == 0 else THICK
+			var ext = 1.0 if pass_i == 0 else 0.0
+			draw_line(Vector2(-ARM - ext, 0), Vector2(-GAP + ext, 0), c, w)
+			draw_line(Vector2(GAP - ext, 0), Vector2(ARM + ext, 0), c, w)
+			draw_line(Vector2(0, -ARM - ext), Vector2(0, -GAP + ext), c, w)
+			draw_line(Vector2(0, GAP - ext), Vector2(0, ARM + ext), c, w)
+
+
+class PowerCrystal extends Area3D:
+	# A floating crystal. Touching it (local player only) asks the manager to
+	# grant its ability; the host decides who actually gets it.
+	var crystal_id: int
+	var ability: String
+	var main_manager: Node
+	var crystal_color: Color
+	var display_name: String
+	var visual: Node3D
+	var t: float = 0.0
+	var claim_cooldown: float = 0.0
+
+	func _init(id: int, ability_key: String, color: Color, label_text: String, manager: Node) -> void:
+		crystal_id = id
+		ability = ability_key
+		crystal_color = color
+		display_name = label_text
+		main_manager = manager
+
+	func _ready() -> void:
+		var col = CollisionShape3D.new()
+		var box = BoxShape3D.new()
+		box.size = Vector3(1.4, 1.8, 1.4)
+		col.shape = box
+		add_child(col)
+
+		visual = Node3D.new()
+		add_child(visual)
+
+		var mat = StandardMaterial3D.new()
+		mat.albedo_color = Color(crystal_color.r, crystal_color.g, crystal_color.b, 0.85)
+		mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		mat.emission_enabled = true
+		mat.emission = crystal_color
+		mat.emission_energy_multiplier = 2.5
+
+		# Two 4-sided cones tip to tip = an octahedron crystal.
+		var top = MeshInstance3D.new()
+		var top_mesh = CylinderMesh.new()
+		top_mesh.top_radius = 0.0
+		top_mesh.bottom_radius = 0.42
+		top_mesh.height = 0.6
+		top_mesh.radial_segments = 4
+		top_mesh.rings = 1
+		top.mesh = top_mesh
+		top.position.y = 0.3
+		top.material_override = mat
+		visual.add_child(top)
+
+		var bottom = MeshInstance3D.new()
+		var bottom_mesh = CylinderMesh.new()
+		bottom_mesh.top_radius = 0.42
+		bottom_mesh.bottom_radius = 0.0
+		bottom_mesh.height = 0.6
+		bottom_mesh.radial_segments = 4
+		bottom_mesh.rings = 1
+		bottom.mesh = bottom_mesh
+		bottom.position.y = -0.3
+		bottom.material_override = mat
+		visual.add_child(bottom)
+
+		var light = OmniLight3D.new()
+		light.light_color = crystal_color
+		light.light_energy = 1.5
+		light.omni_range = 4.0
+		add_child(light)
+
+		var tag = Label3D.new()
+		tag.text = display_name
+		tag.position = Vector3(0, 1.1, 0)
+		tag.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+		tag.font_size = 18
+		tag.outline_size = 5
+		tag.modulate = crystal_color
+		add_child(tag)
+
+	func _process(delta: float) -> void:
+		t += delta
+		if visual:
+			visual.rotation.y += 1.8 * delta
+			visual.position.y = sin(t * 2.5) * 0.15
+
+	func _physics_process(delta: float) -> void:
+		claim_cooldown -= delta
+		if claim_cooldown > 0.0:
+			return
+		for body in get_overlapping_bodies():
+			if body is CharacterBody3D and body.has_method("is_local_player") and body.is_local_player():
+				claim_cooldown = 0.75
+				main_manager.on_crystal_touched(self)
+				return
+
+
 class OpponentPointer extends Control:
 	# Arrow drawn around this control's origin, pointing along +X.
 	# Position and rotation are set every frame by _update_opponent_pointer().
 	var pulse: float = 0.0
+	var arrow_color: Color = Color(1.0, 0.35, 0.25)
 
 	func _process(delta: float) -> void:
 		if visible:
@@ -2143,7 +2535,7 @@ class OpponentPointer extends Control:
 	func _draw() -> void:
 		var a = 0.75 + 0.25 * sin(pulse * 6.0)
 		var pts = PackedVector2Array([Vector2(24, 0), Vector2(-12, -16), Vector2(-4, 0), Vector2(-12, 16)])
-		draw_colored_polygon(pts, Color(1.0, 0.35, 0.25, a))
+		draw_colored_polygon(pts, Color(arrow_color.r, arrow_color.g, arrow_color.b, a))
 		var outline = pts.duplicate()
 		outline.append(pts[0])
 		draw_polyline(outline, Color(0, 0, 0, 0.7 * a), 2.0, true)
@@ -2394,6 +2786,12 @@ class NetworkPlayer extends CharacterBody3D:
 	const LADDER_CLIMB_SPEED: float = 5.0
 	var ladder_contacts: Array = []
 
+	# Crystal abilities (local player reads main_manager.local_ability)
+	var ability_tag: Label3D = null
+	var jump_held_last: bool = false
+	var q_held_last: bool = false
+	var qte_double_damage: bool = false
+
 	# Practice dummy AI
 	const DUMMY_SPEED: float = 4.5
 	const DUMMY_FLEE_RANGE: float = 9.0
@@ -2407,6 +2805,13 @@ class NetworkPlayer extends CharacterBody3D:
 	func _init(id: int = 1, manager: Node = null) -> void :
 		peer_id = id
 		main_manager = manager
+
+	func set_ability_tag(text: String, color: Color) -> void :
+		if not ability_tag:
+			return
+		ability_tag.text = text
+		ability_tag.modulate = color
+		ability_tag.visible = text != ""
 
 	func set_movement_lock(locked: bool) -> void :
 		is_movement_locked = locked
@@ -2483,6 +2888,14 @@ class NetworkPlayer extends CharacterBody3D:
 		add_child(hussing_label)
 
 		_build_health_label()
+
+		ability_tag = Label3D.new()
+		ability_tag.position = Vector3(0, 2.95, 0)
+		ability_tag.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+		ability_tag.font_size = 16
+		ability_tag.outline_size = 4
+		ability_tag.visible = false
+		add_child(ability_tag)
 
 		if is_local_player():
 			camera = Camera3D.new()
@@ -2605,10 +3018,26 @@ class NetworkPlayer extends CharacterBody3D:
 
 		var is_sprinting: bool = Input.is_key_pressed(KEY_SHIFT) or Input.is_physical_key_pressed(KEY_SHIFT)
 		var current_speed: float = sprint_speed if is_sprinting else walk_speed
+		var ability: String = main_manager.local_ability
+		if ability == "speed_boost":
+			current_speed *= main_manager.SPEED_BOOST_MULT
 
 		var jump_pressed: bool = Input.is_key_pressed(KEY_SPACE) or Input.is_physical_key_pressed(KEY_SPACE) or Input.is_action_just_pressed("ui_accept")
+		var jump_just_pressed = jump_pressed and not jump_held_last
+		jump_held_last = jump_pressed
 		if jump_pressed and is_on_floor():
 			velocity.y = jump_velocity * (1.2 if is_sprinting else 1.0)
+		elif jump_just_pressed and ability == "double_jump" and get_active_ladder() == null:
+			# Second jump in mid-air - uses up the crystal.
+			velocity.y = jump_velocity * 1.1
+			main_manager.consume_local_ability("used")
+
+		var q_pressed = Input.is_key_pressed(KEY_Q) or Input.is_physical_key_pressed(KEY_Q)
+		var q_just_pressed = q_pressed and not q_held_last
+		q_held_last = q_pressed
+		if q_just_pressed and ability == "lunge":
+			_start_lunge()
+			return
 
 		var input_dir: Vector3 = Vector3.ZERO
 		if Input.is_key_pressed(KEY_W) or Input.is_key_pressed(KEY_UP): input_dir.z -= 1
@@ -2674,6 +3103,20 @@ class NetworkPlayer extends CharacterBody3D:
 			velocity.y = -LADDER_CLIMB_SPEED
 		elif not is_on_floor():
 			velocity.y = 0.0
+
+	func _start_lunge() -> void :
+		# Dash forward (where you're facing, flat) using the launch movement.
+		var forward = -global_transform.basis.z
+		forward.y = 0.0
+		if forward.length() < 0.01:
+			forward = Vector3(0, 0, -1)
+		forward = forward.normalized()
+		is_launching = true
+		launch_timer = 0.3
+		# Farther than the dash can travel, so the direction never flips mid-dash.
+		launch_target_pos = global_position + forward * 20.0
+		main_manager.consume_local_ability("used")
+		_send_p2p_position()
 
 	func _process_dummy_ai(delta: float) -> void :
 		if not is_on_floor():
@@ -2847,6 +3290,15 @@ class NetworkPlayer extends CharacterBody3D:
 		qte_elapsed = 0.0
 		main_manager.is_qte_in_progress = true
 
+		# Double Damage crystal: hits for 50, but the green target is half as wide.
+		qte_double_damage = main_manager.local_ability == "double_damage"
+		if qte_double_damage:
+			qte_target_width = 0.1
+			qte_target_start = 0.45
+		else:
+			qte_target_width = 0.2
+			qte_target_start = 0.4
+
 		if targeted_opponent:
 			targeted_opponent.is_movement_locked = true
 			if not main_manager.is_single_player:
@@ -2928,7 +3380,14 @@ class NetworkPlayer extends CharacterBody3D:
 
 		main_manager.start_combat_cooldown()
 
-		if qte_progress >= qte_target_start and qte_progress <= (qte_target_start + qte_target_width):
+		var damage = 50 if qte_double_damage else 25
+		var hit = qte_progress >= qte_target_start and qte_progress <= (qte_target_start + qte_target_width)
+		if qte_double_damage:
+			qte_double_damage = false
+			if main_manager.local_ability == "double_damage":
+				main_manager.consume_local_ability("used")
+
+		if hit:
 			if targeted_opponent:
 				is_launching = true
 				launch_timer = 0.45
@@ -2938,13 +3397,13 @@ class NetworkPlayer extends CharacterBody3D:
 					main_manager.send_p2p_packet({
 						"action": "take_damage", 
 						"peer_id": str(targeted_opponent.peer_id), 
-						"amount": 25
+						"amount": damage
 					})
 					main_manager.send_p2p_packet({
 						"action": "trigger_cooldown", 
 						"peer_id": str(targeted_opponent.peer_id)
 					})
-				targeted_opponent.apply_damage(25)
-				main_manager.log_console("[Combat] Precision strike landed on " + targeted_opponent.name_label.text + "!")
+				targeted_opponent.apply_damage(damage)
+				main_manager.log_console("[Combat] " + ("DOUBLE DAMAGE strike" if damage > 25 else "Precision strike") + " landed on " + targeted_opponent.name_label.text + "!")
 		else:
 			main_manager.log_console("[Combat] Timing missed! Cooldown triggered.")
