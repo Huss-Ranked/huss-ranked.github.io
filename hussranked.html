@@ -93,69 +93,76 @@ body {
 		<link id="-gd-engine-icon" rel="icon" type="image/png" href="hussranked.icon.png" />
 <link rel="apple-touch-icon" href="hussranked.apple-touch-icon.png"/>
 <link rel="manifest" href="hussranked.manifest.json">
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>3D Ranked 1v1</title>
+<!-- Load Trystero Nostr via ES Module -->
+<script type="module">
+    import { joinRoom, selfId } from 'https://esm.sh/trystero@0.18.0/nostr';
 
-    <!-- Load Trystero Torrent Bundle -->
-    <script src="https://cdn.jsdelivr.net/npm/trystero@0.18.0/dist/trystero-torrent.min.js"></script>
+    window.trysteroSelfId = selfId;
 
-    <script>
-        window.trysteroRoom = null;
-        window.trysteroSendAction = null;
-
-        window.joinTrysteroRoom = function(roomCode) {
-            // Provide explicit, high-availability WebTorrent signaling trackers
-            const config = { 
-                appId: 'huss_ranked_1v1_game',
-                trackerUrls: [
-                    'wss://tracker.openwebtorrent.com',
-                    'wss://tracker.files.fm:7073/announce',
-                    'wss://tracker.btorrent.xyz'
+    window.joinTrysteroRoom = function(roomCode) {
+        console.log("[Trystero] Local Peer ID:", selfId, "Joining room:", roomCode);
+        
+        const config = { 
+            appId: 'huss_ranked_1v1_game',
+            relayConfig: {
+                urls: [
+                    'wss://relay.damus.io',
+                    'wss://nos.lol',
+                    'wss://relay.snort.social'
                 ]
-            };
+            },
+            rtcConfig: {
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:stun1.l.google.com:19302' },
+                    { urls: 'stun:stun.cloudflare.com:3478' }
+                ]
+            }
+        };
 
-            window.trysteroRoom = trystero.joinRoom(config, roomCode);
+        try {
+            window.trysteroRoom = joinRoom(config, roomCode);
 
             const [sendData, getData] = window.trysteroRoom.makeAction('gameData');
             window.trysteroSendAction = sendData;
 
             getData((data, peerId) => {
                 if (window._godot_on_data_received) {
-                    window._godot_on_data_received(JSON.stringify(data));
+                    window._godot_on_data_received(JSON.stringify(data), peerId);
                 }
             });
 
             window.trysteroRoom.onPeerJoin(peerId => {
-                console.log("[Trystero JS] Peer Joined:", peerId);
+                const connectedPeers = window.trysteroRoom.getPeers();
+                // Enforce strict 1v1 limit: reject 3rd+ connections
+                if (Object.keys(connectedPeers).length > 1) {
+                    console.warn("[Trystero] Lobby full! Rejecting extra peer:", peerId);
+                    return;
+                }
+                
+                console.log("[Trystero] Opponent peer joined:", peerId);
                 if (window._godot_on_peer_joined) {
                     window._godot_on_peer_joined(peerId);
                 }
             });
 
             window.trysteroRoom.onPeerLeave(peerId => {
-                console.log("[Trystero JS] Peer Left:", peerId);
+                console.log("[Trystero] Peer disconnected:", peerId);
                 if (window._godot_on_peer_left) {
                     window._godot_on_peer_left(peerId);
                 }
             });
-        };
+        } catch (err) {
+            console.error("[Trystero] Room initialization error:", err);
+        }
+    };
 
-        window.sendTrysteroPacket = function(jsonStr) {
-            if (window.trysteroSendAction) {
-                const data = JSON.parse(jsonStr);
-                window.trysteroSendAction(data);
-            }
-        };
-    </script>
-</head>
-<body style="margin:0; overflow:hidden; background-color:#111;">
-    <canvas id="canvas"></canvas>
-</body>
-</html>
+    window.sendTrysteroPacket = function(jsonStr) {
+        if (window.trysteroSendAction) {
+            window.trysteroSendAction(JSON.parse(jsonStr));
+        }
+    };
+</script>
 	</head>
 	<body>
 		<canvas id="canvas">
