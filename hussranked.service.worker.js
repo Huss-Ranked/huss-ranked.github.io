@@ -4,20 +4,20 @@
 // Incrementing CACHE_VERSION will kick off the install event and force
 // previously cached resources to be updated from the network.
 /** @type {string} */
-const CACHE_VERSION = '1792808340|80505498';
+const CACHE_VERSION = '1792808447|187630930';
 /** @type {string} */
 const CACHE_PREFIX = 'Huss Ranked [BUG-sw-cache-';
 const CACHE_NAME = CACHE_PREFIX + CACHE_VERSION;
 /** @type {string} */
-const OFFLINE_URL = 'Huss ranked V2.offline.html';
+const OFFLINE_URL = 'hussranked.offline.html';
 /** @type {boolean} */
 const ENSURE_CROSSORIGIN_ISOLATION_HEADERS = true;
 // Files that will be cached on load.
 /** @type {string[]} */
-const CACHED_FILES = ["Huss ranked V2.html","Huss ranked V2.js","Huss ranked V2.offline.html","Huss ranked V2.icon.png","Huss ranked V2.apple-touch-icon.png","Huss ranked V2.audio.worklet.js","Huss ranked V2.audio.position.worklet.js"];
+const CACHED_FILES = ["hussranked.html","hussranked.js","hussranked.offline.html","hussranked.icon.png","hussranked.apple-touch-icon.png","hussranked.audio.worklet.js","hussranked.audio.position.worklet.js"];
 // Files that we might not want the user to preload, and will only be cached on first load.
 /** @type {string[]} */
-const CACHEABLE_FILES = ["Huss ranked V2.wasm","Huss ranked V2.pck"];
+const CACHEABLE_FILES = ["hussranked.wasm","hussranked.pck"];
 const FULL_CACHE = CACHED_FILES.concat(CACHEABLE_FILES);
 
 self.addEventListener('install', (event) => {
