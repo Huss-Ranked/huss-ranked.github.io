@@ -6,17 +6,46 @@ var is_match_active: bool = false
 var is_game_over: bool = false
 var is_host_peer: bool = false
 var is_single_player: bool = false
-var opponent_trystero_id: String = ""
+# --- GAME MODES & TEAMS ---
+const GAME_MODES: Dictionary = {
+	"1v1": {"team_size": 1, "label": "Ranked 1v1"},
+	"2v2": {"team_size": 2, "label": "Ranked 2v2"},
+	"3v3": {"team_size": 3, "label": "Ranked 3v3"},
+}
+const TEAM_NAMES: Array = ["BLUE", "RED"]
+const TEAM_COLORS: Array = [Color(0.25, 0.55, 1.0), Color(1.0, 0.3, 0.3)]
+# Spawn spread along Z for each team size (team 0 at x = -15, team 1 at x = 15).
+const TEAM_SPAWN_Z: Dictionary = {1: [0.0], 2: [-3.5, 3.5], 3: [-7.0, 0.0, 7.0]}
 
-# --- MATCHMAKING (public lobby -> private 1v1 room) ---
-# Everyone searching meets in the lobby room. Players pair up there with a
-# propose -> accept -> confirm handshake, then each pair moves into its own
-# private room so a third (or fourth...) player can never merge into a match.
-const LOBBY_ROOM_CODE: String = "public_1v1_lobby"
+var game_mode: String = "1v1"
+var team_size: int = 1
+# Everyone in a match gets a peer ID 1..N from the sorted room roster; 1 = host.
+var local_peer_id: int = 1
+var player_teams: Dictionary = {} # peer_id -> 0 (Blue) / 1 (Red)
+var dead_peers: Dictionary = {} # peer_id -> true once eliminated (or left)
+var forfeited_peers: Dictionary = {} # peer_id -> true if they quit/disconnected (always a loss)
+var match_start_elos: Dictionary = {} # peer_id -> ELO when the match started
+var match_setup_done: bool = false
+var leave_room_timer: float = -1.0
+var team_hud_label: RichTextLabel = null
+var dead_banner_label: Label = null
+var team_hud_timer: float = 0.0
+const LEAVE_CONFIRM_MS: int = 3000
+var leave_confirm_ms: int = -100000
+var leave_confirm_label: Label = null
+
+# --- MATCHMAKING (per-mode public lobby -> private room per match) ---
+# Everyone searching for a mode meets in that mode's lobby room. Groups of 2/4/6
+# form there with a leader handshake (invite -> accept -> confirm), then each
+# group moves into its own private room so extra players can never merge in.
 const MM_HELLO_INTERVAL: float = 1.0
 const MM_HANDSHAKE_TIMEOUT: float = 3.0
+const MM_INVITE_TIMEOUT: float = 6.0
 const MM_SKIP_DURATION_MS: int = 4000
-const MM_PRIVATE_JOIN_TIMEOUT: float = 25.0
+const MM_PRIVATE_JOIN_TIMEOUT: float = 30.0
+# If the player who should be leading stays silent this long, skip them.
+const MM_LEADER_PATIENCE: float = 5.0
+const MM_LEADER_SKIP_MS: int = 10000
 # After sending the final "confirm", stay in the lobby briefly so the message is
 # actually delivered before leaving the room tears down the connection.
 const MM_CONFIRM_LINGER: float = 1.5
@@ -24,17 +53,47 @@ const MM_CONFIRM_LINGER: float = 1.5
 var mm_phase: String = "idle" # "idle", "lobby", "match"
 var mm_self_id: String = ""
 var mm_lobby_peers: Dictionary = {} # trystero id -> "searching" / "busy" / "unknown"
-var mm_skip_until: Dictionary = {} # trystero id -> ticks_msec until we can propose again
-var mm_pending_out: String = "" # peer we proposed to
-var mm_pending_in: String = "" # peer whose proposal we accepted
-var mm_pending_room: String = ""
-var mm_pending_timer: float = 0.0
+var mm_skip_until: Dictionary = {} # trystero id -> ticks_msec until we can invite them again
 var mm_hello_timer: float = 0.0
-var mm_expected_opponent: String = ""
-var mm_private_join_timer: float = 0.0
-var mm_linger_opponent: String = ""
+var mm_leader_wait_timer: float = 0.0
+# Leading a group
+var mm_lead_room: String = ""
+var mm_lead_roster: Array = []
+var mm_lead_accepted: Array = []
+var mm_lead_timer: float = 0.0
+# Invited into someone else's group
+var mm_invited_by: String = ""
+var mm_invite_room: String = ""
+var mm_invite_roster: Array = []
+var mm_invite_timer: float = 0.0
+# Leader: confirmed, waiting for the confirms to be delivered
 var mm_linger_room: String = ""
+var mm_linger_roster: Array = []
 var mm_linger_timer: float = 0.0
+# Private room
+var mm_roster: Array = [] # sorted trystero ids of everyone in this match
+var mm_room_joined: Dictionary = {} # trystero id -> true once they joined our room
+var mm_room_left: Dictionary = {} # trystero id -> true if they left
+var mm_private_join_timer: float = 0.0
+# Players who were unresponsive when it was their turn to start a group (e.g. a
+# frozen tab): someone else leads instead, but they can still be invited.
+var mm_no_lead_until: Dictionary = {}
+var last_setup_packet: Dictionary = {}
+
+# --- NETWORK LAYER (relays, heartbeats, background ticking) ---
+const NET_HEARTBEAT: float = 1.0
+const LOBBY_PEER_TIMEOUT_MS: int = 4000
+const ROOM_PEER_TIMEOUT_MS: int = 6000
+var direct_peers: Dictionary = {} # trystero id -> true while directly connected in this room
+var link_map: Dictionary = {} # trystero id -> Array of ids they're directly connected to
+var last_heard: Dictionary = {} # trystero id -> _now_ms() of their last packet
+var seen_mids: Dictionary = {} # message id -> _now_ms(), to drop relayed duplicates
+var relay_cache: Dictionary = {} # sender id -> should we relay their packets
+var msg_seq: int = 0
+var net_last_tick_ms: int = -1
+var net_heartbeat_timer: float = 0.0
+var seen_prune_timer: float = 0.0
+var js_tick_cb: JavaScriptObject
 
 # --- GLOBAL COMBAT LOCKS ---
 var is_qte_in_progress: bool = false
@@ -144,14 +203,21 @@ var map_pool: Array = [
 	}
 ]
 
+# The maps up for banning: one more than the number of players (3 in 1v1 and
+# practice, 5 in 2v2, 7 in 3v3). Every player bans one; the last one is played.
 var current_3_maps: Array = []
 var banned_map_indices: Array = []
+# Bans received over the network, by turn number. In team modes the two bans come
+# from different players, so they can arrive out of order (or before the match
+# setup); they're applied strictly in turn order.
+var ban_log: Dictionary = {} # turn -> {"idx": map index, "by": peer_id}
 var local_ban_turn: bool = true
 var selected_map_data: Dictionary = {}
 
 var map_ban_canvas: CanvasLayer = null
 var map_ban_header_label: Label = null
-var map_row_container: HBoxContainer = null
+var map_row_container: HFlowContainer = null
+var ban_order_label: RichTextLabel = null
 
 # Each ban turn has a time limit; if it runs out, a random map is banned for you.
 const MAP_BAN_TURN_TIME: float = 20.0
@@ -271,18 +337,14 @@ func _ready() -> void :
 	_build_main_menu()
 
 func _process(delta: float) -> void :
-	if mm_phase == "lobby":
-		_mm_tick(delta)
-	elif mm_phase == "match" and opponent_trystero_id == "":
-		# Paired in the lobby but the opponent never showed up in the private room.
-		mm_private_join_timer -= delta
-		if mm_private_join_timer <= 0.0:
-			log_console("[Matchmaking] Opponent never arrived, returning to queue...")
-			mm_skip_until[mm_expected_opponent] = Time.get_ticks_msec() + MM_SKIP_DURATION_MS
-			_mm_enter_lobby()
+	_net_tick()
 
-	if map_ban_canvas and map_row_container:
-		_tick_map_ban_timer(delta)
+	team_hud_timer -= delta
+	if team_hud_timer <= 0.0:
+		team_hud_timer = 0.2
+		_update_team_hud()
+		if leave_confirm_label and leave_confirm_label.visible and _now_ms() - leave_confirm_ms > LEAVE_CONFIRM_MS:
+			leave_confirm_label.visible = false
 
 	if is_match_active and not is_game_over:
 		_tick_local_ability(delta)
@@ -330,6 +392,14 @@ func _unhandled_input(_event: InputEvent) -> void :
 	if Input.is_action_just_pressed("ui_cancel"):
 		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 		if is_match_active and not is_game_over:
+			# In 2v2/3v3 leaving hurts your team and is easy to do by accident
+			# (browsers use Esc to release the mouse), so it takes two presses.
+			if team_size > 1 and not is_single_player and _now_ms() - leave_confirm_ms > LEAVE_CONFIRM_MS:
+				leave_confirm_ms = _now_ms()
+				if leave_confirm_label:
+					leave_confirm_label.visible = true
+				log_console("[Match] Press Esc again within 3s to leave the match (counts as a loss).")
+				return
 			_forfeit_match()
 		else:
 			_return_to_main_menu()
@@ -343,7 +413,12 @@ func _init_trystero_bridge() -> void :
 	js_on_peer_leave_cb = JavaScriptBridge.create_callback(_on_trystero_peer_left)
 	js_on_data_receive_cb = JavaScriptBridge.create_callback(_on_trystero_data_received)
 
+	# Background tabs stop the game loop, but JS timers keep firing (about once
+	# a second), so matchmaking and the ban timer keep working while tabbed out.
+	js_tick_cb = JavaScriptBridge.create_callback(_on_js_tick)
+
 	var window = JavaScriptBridge.get_interface("window")
+	window._godot_tick = js_tick_cb
 	window._godot_on_peer_joined = js_on_peer_join_cb
 	window._godot_on_peer_left = js_on_peer_leave_cb
 	window._godot_on_data_received = js_on_data_receive_cb
@@ -377,6 +452,12 @@ func _init_trystero_bridge() -> void :
 
 			window.joinTrysteroRoom(roomCode);
 		};
+
+		if (!window._godotTickTimer) {
+			window._godotTickTimer = setInterval(function() {
+				if (window._godot_tick) { window._godot_tick(); }
+			}, 500);
+		}
 	""", true)
 
 func _leave_trystero_room() -> void :
@@ -403,77 +484,179 @@ func _on_trystero_peer_joined(args: Array) -> void :
 		log_console("[Trystero] selfId missing - check the HTML import.")
 		return
 
+	direct_peers[peer_id_str] = true
+	last_heard[peer_id_str] = _now_ms()
+	relay_cache.clear()
+
 	if mm_phase == "lobby":
-		mm_lobby_peers[peer_id_str] = "unknown"
+		if not mm_lobby_peers.has(peer_id_str):
+			mm_lobby_peers[peer_id_str] = "unknown"
 		_mm_send_hello(peer_id_str)
+		_update_waiting_label()
 		return
 
 	if mm_phase != "match":
 		return
 
-	# Private room: only the player we paired with in the lobby is allowed in.
-	if peer_id_str != mm_expected_opponent:
+	# Private room: only the players we grouped with in the lobby are allowed in.
+	if not mm_roster.has(peer_id_str):
 		log_console("[Matchmaking] Ignoring unexpected peer in private room: " + peer_id_str)
 		return
-	if opponent_trystero_id != "":
-		return
 
-	_begin_match_with(peer_id_str)
+	_mark_room_member_present(peer_id_str)
+	# Share our links right away so relaying can start, and announce ourselves.
+	net_heartbeat_timer = 0.0
+	if not match_setup_done:
+		_send_register()
 
-func _begin_match_with(peer_id_str: String) -> void :
-	var my_trystero_id = _get_self_trystero_id()
-	opponent_trystero_id = peer_id_str
-	is_host_peer = my_trystero_id < peer_id_str
-	log_console("[Trystero] Opponent found! Peer ID: " + peer_id_str)
-
-	if waiting_opponent_label:
-		waiting_opponent_label.visible = false
-
+func _send_register() -> void :
 	send_p2p_packet({
 		"action": "register", 
-		"peer_id": 1 if is_host_peer else 2, 
+		"peer_id": local_peer_id, 
 		"nickname": local_nickname, 
 		"elo": local_elo, 
 		"leaderboard": leaderboard_data
 	})
 
-	if is_host_peer and current_3_maps.is_empty():
-		var indices: Array = range(map_pool.size())
-		indices.shuffle()
-		var picked: Array = [indices[0], indices[1], indices[2]]
-		for i in picked:
-			current_3_maps.append(map_pool[i])
+func _peer_id_of(trystero_id: String) -> int:
+	return mm_roster.find(trystero_id) + 1
 
-		send_p2p_packet({
-			"action": "init_map_ban", 
-			"map_indices": picked
-		})
-		_start_map_ban_phase()
+func _sort_by_elo_desc(a, b) -> bool:
+	var ea = int(player_elos.get(a, 0))
+	var eb = int(player_elos.get(b, 0))
+	if ea != eb:
+		return ea > eb
+	return a < b
+
+# Host only: once every player in the room has registered, split them into
+# ELO-balanced teams, pick the 3 maps for the ban phase and tell everyone.
+func _host_try_setup() -> void :
+	if not is_host_peer or match_setup_done or mm_phase != "match":
+		return
+	var n = mm_roster.size()
+	for pid in range(1, n + 1):
+		if not player_nicknames.has(pid):
+			return
+
+	# Snake draft by ELO: 1v1 A B, 2v2 A B B A, 3v3 A B B A A B.
+	var order: Array = range(1, n + 1)
+	order.sort_custom(_sort_by_elo_desc)
+	var pattern = [0, 1, 1, 0, 0, 1]
+	var teams: Dictionary = {}
+	for i in range(n):
+		teams[order[i]] = pattern[i]
+
+	var indices: Array = range(map_pool.size())
+	indices.shuffle()
+	var picked: Array = indices.slice(0, n + 1)
+
+	var setup = {
+		"action": "match_setup", 
+		"teams": teams, 
+		"map_indices": picked, 
+		"nicknames": player_nicknames.duplicate(), 
+		"elos": player_elos.duplicate()
+	}
+	last_setup_packet = setup.duplicate(true)
+	send_p2p_packet(setup.duplicate(true))
+	_apply_match_setup(setup)
+
+func _apply_match_setup(data: Dictionary) -> void :
+	if match_setup_done:
+		return
+	match_setup_done = true
+
+	player_teams.clear()
+	var t = data.get("teams", {})
+	for k in t:
+		player_teams[int(k)] = int(t[k])
+	var nicks = data.get("nicknames", {})
+	for k in nicks:
+		player_nicknames[int(k)] = String(nicks[k])
+	var elos = data.get("elos", {})
+	for k in elos:
+		player_elos[int(k)] = int(elos[k])
+	player_nicknames[local_peer_id] = local_nickname
+	player_elos[local_peer_id] = local_elo
+
+	current_3_maps.clear()
+	for i in data.get("map_indices", []):
+		current_3_maps.append(map_pool[int(i)])
+
+	if waiting_opponent_label:
+		waiting_opponent_label.visible = false
+
+	var my_team = get_team(local_peer_id)
+	if team_size > 1:
+		var mates: Array = []
+		for pid in all_player_ids():
+			if pid != local_peer_id and get_team(pid) == my_team:
+				mates.append(String(player_nicknames.get(pid, "Player")))
+		log_console("[Match] You're on " + TEAM_NAMES[my_team] + " team with " + ", ".join(PackedStringArray(mates)) + ".")
+	else:
+		log_console("[Match] Opponent: " + String(player_nicknames.get(_first_enemy_id(), "Opponent")))
+
+	_start_map_ban_phase()
 
 func _on_trystero_peer_left(args: Array) -> void :
 	var peer_id_str: String = String(args[0])
+	direct_peers.erase(peer_id_str)
+	relay_cache.clear()
 
+	# Losing the direct link doesn't mean they left: they may still reach us
+	# through another player. They count as gone once nobody has heard from
+	# them for a while (_mm_expire_lobby_peers / _room_tick). In a 1v1 there's
+	# nobody to relay, so it's immediate.
 	if mm_phase == "lobby":
-		mm_lobby_peers.erase(peer_id_str)
-		if peer_id_str == mm_pending_out or peer_id_str == mm_pending_in:
-			_mm_clear_pending()
+		_update_waiting_label()
+	elif mm_phase == "match" and mm_roster.size() <= 2 and mm_roster.has(peer_id_str):
+		_on_room_member_gone(peer_id_str)
+
+func _on_room_member_gone(peer_id_str: String) -> void :
+	if mm_room_left.has(peer_id_str):
+		return
+	mm_room_left[peer_id_str] = true
+	relay_cache.clear()
+	if is_game_over or is_single_player:
 		return
 
-	if opponent_trystero_id == "" or peer_id_str != opponent_trystero_id or is_game_over or is_single_player:
+	var pid = _peer_id_of(peer_id_str)
+	var nick = String(player_nicknames.get(pid, "A player"))
+	if not match_setup_done:
+		log_console("[Matchmaking] " + nick + " dropped before the match started. Back to the queue...")
+		_mm_skip(peer_id_str)
+		_mm_enter_lobby()
+		return
+	if not is_match_active:
+		_return_to_main_menu(nick + " disconnected during map selection. No ELO was changed.")
 		return
 
-	log_console("[Trystero] Opponent disconnected: " + peer_id_str)
-	if is_match_active:
-		_process_match_outcome(1 if is_host_peer else 2)
-	else:
-		_return_to_main_menu("Opponent disconnected.")
+	log_console("[Trystero] " + nick + " disconnected.")
+	_mark_player_forfeited(pid)
+
+func _mm_expire_lobby_peers(now: int) -> void :
+	for tid in mm_lobby_peers.keys():
+		if direct_peers.has(tid) or now - int(last_heard.get(tid, 0)) <= LOBBY_PEER_TIMEOUT_MS:
+			continue
+		mm_lobby_peers.erase(tid)
+		link_map.erase(tid)
+		relay_cache.clear()
+		if mm_lead_room != "" and mm_lead_roster.has(tid):
+			_mm_abort_lead()
+		elif mm_invited_by == tid:
+			# Our leader left the lobby without us hearing its confirm - it's
+			# most likely already in the private room, so meet it there. (If it
+			# really quit, the private-room timeout brings us back.)
+			_mm_enter_private_room(mm_invite_roster, mm_invite_room)
+			return
+		_update_waiting_label()
 
 func _on_trystero_data_received(args: Array) -> void :
-	var raw_json: String = args[0]
+	var raw_json: String = String(args[0])
 	var json = JSON.new()
-	if json.parse(raw_json) == OK:
-		var data_dict: Dictionary = json.data
-		_handle_incoming_p2p_packet(data_dict)
+	if json.parse(raw_json) != OK or typeof(json.data) != TYPE_DICTIONARY:
+		return
+	_receive_packet(json.data, raw_json)
 
 func _handle_incoming_p2p_packet(data: Dictionary) -> void :
 	var action = String(data.get("action", ""))
@@ -489,17 +672,20 @@ func _handle_incoming_p2p_packet(data: Dictionary) -> void :
 	if mm_phase != "match":
 		return
 
-	# Only ever accept game packets from the one opponent we paired with.
-	if sender == "" or sender != mm_expected_opponent:
+	# Only ever accept game packets from the players we grouped with.
+	if sender == "" or not mm_roster.has(sender):
+		return
+	var sender_pid = _peer_id_of(sender)
+	# Once our match is over, only the final ELO sync still matters.
+	if is_game_over and action != "sync_state":
 		return
 
 	match action:
 		"register":
-			var sender_id = int(data.get("peer_id", 2))
 			var nick = String(data.get("nickname", "Player"))
 			var elo = int(data.get("elo", 0))
-			player_nicknames[sender_id] = nick
-			player_elos[sender_id] = elo
+			player_nicknames[sender_pid] = nick
+			player_elos[sender_pid] = elo
 
 			var incoming_lb = data.get("leaderboard", {})
 			for p_nick in incoming_lb:
@@ -511,12 +697,18 @@ func _handle_incoming_p2p_packet(data: Dictionary) -> void :
 			_save_leaderboard_cache()
 
 			if is_host_peer:
-				send_p2p_packet({
-					"action": "sync_state", 
-					"nicknames": player_nicknames, 
-					"elos": player_elos, 
-					"leaderboard": leaderboard_data
-				})
+				if match_setup_done:
+					# They missed the setup (it was sent before we could reach them).
+					if not last_setup_packet.is_empty():
+						send_p2p_packet(last_setup_packet.duplicate(true))
+				else:
+					send_p2p_packet({
+						"action": "sync_state", 
+						"nicknames": player_nicknames, 
+						"elos": player_elos, 
+						"leaderboard": leaderboard_data
+					})
+					_host_try_setup()
 		"sync_state":
 			var incoming_nicks = data.get("nicknames", {})
 			for k in incoming_nicks:
@@ -530,149 +722,390 @@ func _handle_incoming_p2p_packet(data: Dictionary) -> void :
 					continue
 				leaderboard_data[p_nick] = incoming_lb[p_nick]
 			_save_leaderboard_cache()
-		"init_map_ban":
-			current_3_maps.clear()
-			for i in data.get("map_indices", []):
-				current_3_maps.append(map_pool[int(i)])
-			_start_map_ban_phase()
+		"match_setup":
+			if sender_pid == 1:
+				_apply_match_setup(data)
 		"ban_map":
-			var banned_idx = int(data.get("banned_index", -1))
-			if banned_idx != -1 and not banned_map_indices.has(banned_idx):
-				banned_map_indices.append(banned_idx)
-				local_ban_turn = true
-				_refresh_map_ban_ui()
-				_check_map_ban_completion()
+			var turn = int(data.get("turn", banned_map_indices.size()))
+			if not ban_log.has(turn):
+				ban_log[turn] = {"idx": int(data.get("banned_index", -1)), "by": sender_pid}
+			_apply_pending_bans()
 		"move":
-			var peer_id = String(data.get("peer_id", "2"))
-			if players_container and players_container.has_node(peer_id):
-				var p_node = players_container.get_node(peer_id)
+			var p_node = get_player(int(data.get("peer_id", sender_pid)))
+			if p_node and not p_node.is_local_player():
 				p_node.global_position = Vector3(data["pos_x"], data["pos_y"], data["pos_z"])
 				p_node.rotation_degrees.y = data["rot_y"]
 		"set_movement_lock":
-			var target_id = String(data.get("peer_id", ""))
-			var locked_state = bool(data.get("locked", false))
-			if players_container and players_container.has_node(target_id):
-				var p_node = players_container.get_node(target_id) as NetworkPlayer
-				if p_node:
-					p_node.set_movement_lock(locked_state)
+			var p_lock = get_player(int(data.get("peer_id", -1)))
+			if p_lock and p_lock.is_local_player():
+				if bool(data.get("locked", false)):
+					p_lock.add_movement_lock(sender_pid)
+				else:
+					p_lock.remove_movement_lock(sender_pid)
 		"qte_start":
-			if not players_container:
-				return
-			var attacker = players_container.get_node_or_null(String(data.get("attacker", ""))) as NetworkPlayer
-			var target = players_container.get_node_or_null(String(data.get("target", ""))) as NetworkPlayer
+			var attacker = get_player(int(data.get("attacker", sender_pid)))
+			var target = get_player(int(data.get("target", -1)))
 			if attacker:
 				attacker.qte_active = true
-			if target and target.is_local_player():
-				if target.qte_active:
-					# Both players pressed E at the same time: each side sees the
-					# other's qte_start while its own QTE is running, so both
-					# clients resolve this as a clash and fling apart.
-					if attacker:
-						attacker.qte_active = false
+				attacker.qte_target_peer = target.peer_id if target else -1
+			if target and target.is_local_player() and attacker:
+				if target.qte_active and target.qte_target_peer == attacker.peer_id:
+					# Both players pressed E on each other at the same time: each
+					# side sees the other's qte_start while its own QTE is running,
+					# so both clients resolve this as a clash and fling apart.
+					attacker.qte_active = false
 					target.trigger_repulse_clash(attacker)
-				else:
-					target.set_movement_lock(true)
+				elif not target.is_dead:
+					target.add_movement_lock(attacker.peer_id)
 		"qte_end":
-			if not players_container:
-				return
-			var attacker_end = players_container.get_node_or_null(String(data.get("attacker", ""))) as NetworkPlayer
-			var target_end = players_container.get_node_or_null(String(data.get("target", ""))) as NetworkPlayer
+			var attacker_end = get_player(int(data.get("attacker", sender_pid)))
+			var target_end = get_player(int(data.get("target", -1)))
 			if attacker_end:
 				attacker_end.qte_active = false
+				attacker_end.qte_target_peer = -1
 			if target_end and target_end.is_local_player():
-				target_end.set_movement_lock(false)
+				target_end.remove_movement_lock(attacker_end.peer_id if attacker_end else sender_pid)
 		"trigger_clash":
-			var my_id = 1 if is_host_peer else 2
-			if players_container and players_container.has_node(str(my_id)):
-				var local_p = players_container.get_node(str(my_id)) as NetworkPlayer
-				if local_p:
-					var opp_id = 2 if my_id == 1 else 1
-					var opp_p = players_container.get_node_or_null(str(opp_id)) as NetworkPlayer
-					local_p.trigger_repulse_clash(opp_p)
+			var clash_a = get_player(int(data.get("a", sender_pid)))
+			var clash_b = get_player(int(data.get("b", -1)))
+			var me = get_local_player()
+			if me and clash_b == me:
+				me.trigger_repulse_clash(clash_a)
+			else:
+				if clash_a:
+					clash_a.qte_active = false
+				if clash_b:
+					clash_b.qte_active = false
 		"trigger_cooldown":
-			start_combat_cooldown()
+			if int(data.get("peer_id", local_peer_id)) == local_peer_id:
+				start_combat_cooldown()
 		"take_damage":
-			var target_id = String(data.get("peer_id", ""))
-			var amount = int(data.get("amount", 25))
-			if players_container and players_container.has_node(target_id):
-				var p_node = players_container.get_node(target_id) as NetworkPlayer
-				if p_node:
-					p_node.apply_damage(amount)
+			var hurt = get_player(int(data.get("peer_id", -1)))
+			if hurt:
+				hurt.apply_damage(int(data.get("amount", 25)))
 		"match_outcome":
-			var winner_id = int(data.get("winner_peer_id", 1))
-			_process_match_outcome(winner_id)
+			if data.has("winning_team"):
+				var dead_list: Array = []
+				for d in data.get("dead", []):
+					dead_list.append(int(d))
+				_process_match_outcome(int(data.get("winning_team", 0)), dead_list if data.has("dead") else null)
+		"player_forfeit":
+			_mark_player_forfeited(sender_pid)
 		"crystal_spawn":
 			if not is_host_peer:
 				_apply_crystal_spawn({
-					"id": int(data.get("id", 0)),
-					"type": String(data.get("type", "speed_boost")),
+					"id": int(data.get("id", 0)), 
+					"type": String(data.get("type", "speed_boost")), 
 					"pos": Vector3(float(data.get("x", 0)), float(data.get("y", 1)), float(data.get("z", 0)))
 				})
 		"crystal_claim":
 			if is_host_peer:
-				_host_grant_crystal(int(data.get("id", -1)), 2)
+				_host_grant_crystal(int(data.get("id", -1)), sender_pid)
 		"crystal_taken":
 			if not is_host_peer:
 				_apply_crystal_taken(int(data.get("id", -1)), int(data.get("by", 0)), String(data.get("type", "")))
 		"ability_end":
-			var opp_end = get_opponent_player()
-			if opp_end:
-				opp_end.set_ability_tag("", Color.WHITE)
+			var p_end = get_player(sender_pid)
+			if p_end:
+				p_end.set_ability_tag("", Color.WHITE)
+
+# --- NETWORK LAYER ---
+# Real P2P meshes are messy: some pairs of players can't connect directly
+# (home routers / NAT), connections form at different speeds, and background
+# tabs pause the game loop. So:
+#  - every packet has a unique id, and a player relays packets to anyone it's
+#    connected to who has no direct link to the sender (ids stop duplicates)
+#  - everyone shares who they're directly connected to, in a heartbeat
+#  - matchmaking also runs off a JS timer, so it keeps going in background tabs
+#  - a player only counts as gone once nobody has heard from them for a while
+
+func _now_ms() -> int:
+	return Time.get_ticks_msec()
+
+func _on_js_tick(_args: Array) -> void :
+	_net_tick()
+
+func _net_reset() -> void :
+	direct_peers.clear()
+	link_map.clear()
+	relay_cache.clear()
+	seen_mids.clear()
+	net_heartbeat_timer = 0.0
+
+func _switch_room(code: String) -> void :
+	_net_reset()
+	_join_room(code)
+
+# Runs from _process AND from a JS interval (background tabs), using real
+# elapsed time, so it only does work every ~30ms however often it's called.
+func _net_tick() -> void :
+	var now = _now_ms()
+	if net_last_tick_ms < 0:
+		net_last_tick_ms = now
+	var dt = float(now - net_last_tick_ms) / 1000.0
+	if dt < 0.03:
+		return
+	net_last_tick_ms = now
+	dt = min(dt, 5.0)
+
+	if mm_phase == "lobby":
+		_mm_expire_lobby_peers(now)
+		if mm_phase == "lobby":
+			_mm_tick(dt)
+	elif mm_phase == "match" and not is_single_player:
+		_room_tick(dt, now)
+
+	# After a match ends, stay in the room briefly so the final ELO sync is
+	# delivered, then leave.
+	if leave_room_timer > 0.0:
+		leave_room_timer -= dt
+		if leave_room_timer <= 0.0:
+			leave_room_timer = -1.0
+			if mm_phase == "match":
+				mm_phase = "idle"
+				_leave_trystero_room()
+				_net_reset()
+
+	if map_ban_canvas and map_row_container:
+		_tick_map_ban_timer(dt)
+
+	seen_prune_timer -= dt
+	if seen_prune_timer <= 0.0:
+		seen_prune_timer = 2.0
+		var cutoff = now - 15000
+		for mid in seen_mids.keys():
+			if int(seen_mids[mid]) < cutoff:
+				seen_mids.erase(mid)
 
 func send_p2p_packet(data: Dictionary) -> void :
-	if not OS.has_feature("web") or is_single_player:
+	if is_single_player:
 		return
+	var me = _get_self_trystero_id()
+	if me == "":
+		return
+	msg_seq += 1
+	data["from"] = me
+	data["mid"] = me + ":" + str(msg_seq)
+	_transport_send(JSON.stringify(data))
 
-	data["from"] = _get_self_trystero_id()
-	var json_string = JSON.stringify(data)
+func _transport_send(json_string: String) -> void :
+	if not OS.has_feature("web"):
+		return
 	var window = JavaScriptBridge.get_interface("window")
 	window.sendTrysteroPacket(json_string)
 
+func _join_room(code: String) -> void :
+	if OS.has_feature("web"):
+		var window = JavaScriptBridge.get_interface("window")
+		window.joinTrysteroRoomWhenReady(code)
+
+func _are_linked(a: String, b: String) -> bool:
+	if a == mm_self_id:
+		return direct_peers.has(b)
+	if b == mm_self_id:
+		return direct_peers.has(a)
+	return (link_map.get(a, []) as Array).has(b) or (link_map.get(b, []) as Array).has(a)
+
+# Relay `orig`'s packets if someone we're connected to can't hear `orig`
+# directly and we're the lowest-ID player connected to both of them (so exactly
+# one player relays each missing link).
+func _should_relay(orig: String) -> bool:
+	if relay_cache.has(orig):
+		return relay_cache[orig]
+	var result = false
+	for r in direct_peers:
+		if r == orig or _are_linked(orig, r):
+			continue
+		var best = mm_self_id
+		for c in link_map:
+			if c < best and c != orig and c != r and _are_linked(c, orig) and _are_linked(c, r):
+				best = c
+		if best == mm_self_id:
+			result = true
+			break
+	relay_cache[orig] = result
+	return result
+
+func _receive_packet(data: Dictionary, raw: String) -> void :
+	var orig = String(data.get("from", ""))
+	if orig == "" or orig == _get_self_trystero_id():
+		return
+	var mid = String(data.get("mid", ""))
+	if mid != "":
+		if seen_mids.has(mid):
+			return
+		seen_mids[mid] = _now_ms()
+	last_heard[orig] = _now_ms()
+
+	if data.has("links"):
+		var links: Array = []
+		for l in data["links"]:
+			links.append(String(l))
+		if link_map.get(orig, []) != links:
+			link_map[orig] = links
+			relay_cache.clear()
+
+	# Pass it on to anyone we're connected to who can't hear the sender directly.
+	if mid != "" and direct_peers.has(orig) and _should_relay(orig):
+		_transport_send(raw)
+
+	if mm_phase == "match" and mm_roster.has(orig):
+		_mark_room_member_present(orig)
+
+	if String(data.get("action", "")) == "net_links":
+		if mm_phase == "match" and mm_roster.has(orig) and data.has("bans"):
+			_merge_ban_heartbeat(data["bans"])
+		return
+	_handle_incoming_p2p_packet(data)
+
+func _mark_room_member_present(tid: String) -> void :
+	if mm_room_joined.has(tid) or mm_room_left.has(tid):
+		return
+	mm_room_joined[tid] = true
+	mm_private_join_timer = max(mm_private_join_timer, 20.0)
+	_update_waiting_label()
+
+func _room_tick(dt: float, now: int) -> void :
+	net_heartbeat_timer -= dt
+	if net_heartbeat_timer <= 0.0:
+		net_heartbeat_timer = NET_HEARTBEAT
+		var hb = {"action": "net_links", "links": direct_peers.keys()}
+		if map_ban_canvas and not ban_log.is_empty():
+			var bans: Array = []
+			for turn in ban_log:
+				bans.append([turn, ban_log[turn]["idx"], ban_log[turn]["by"]])
+			hb["bans"] = bans
+		send_p2p_packet(hb)
+		# Keep announcing ourselves until the host has set the match up.
+		if not match_setup_done:
+			_send_register()
+
+	# Someone counts as gone once nobody has heard from them for a while (a
+	# dropped direct link alone doesn't mean they left - we may be relaying).
+	for tid in mm_roster.duplicate():
+		if tid == mm_self_id or mm_room_left.has(tid) or not mm_room_joined.has(tid) or direct_peers.has(tid):
+			continue
+		if now - int(last_heard.get(tid, 0)) > ROOM_PEER_TIMEOUT_MS:
+			_on_room_member_gone(tid)
+			if mm_phase != "match":
+				return
+
+	if not match_setup_done and mm_phase == "match":
+		mm_private_join_timer -= dt
+		if mm_private_join_timer <= 0.0:
+			var missing = 0
+			for tid in mm_roster:
+				if tid != mm_self_id and not mm_room_joined.has(tid):
+					_mm_skip(tid)
+					missing += 1
+			log_console("[Matchmaking] " + str(missing) + " player(s) never connected, returning to queue...")
+			_mm_enter_lobby()
+
+func _merge_ban_heartbeat(bans) -> void :
+	var added = false
+	for e in bans:
+		if typeof(e) != TYPE_ARRAY or e.size() < 3:
+			continue
+		var turn = int(e[0])
+		if not ban_log.has(turn):
+			ban_log[turn] = {"idx": int(e[1]), "by": int(e[2])}
+			added = true
+	if added:
+		_apply_pending_bans()
+
 
 # --- LOBBY MATCHMAKING ---
-# Pairing rule: a free player proposes only to the lowest-ID free player whose
-# ID is higher than its own. Proposals therefore never form cycles, and every
-# player is in at most one handshake at a time, so with N players in the queue
-# you always get N/2 separate private matches.
+# Each mode has its own lobby room, and groups of 2/4/6 form like this:
+#  - The lowest-ID free player who can see enough free players leads: it
+#    invites the next-lowest ones (invite -> accept -> confirm).
+#  - A player is only ever in one handshake at a time. If two leaders collide,
+#    the lower ID wins and the other steps down.
+#  - Any refusal or timeout releases everyone in that group and they retry.
+#  - A confirmed group moves into its own private room, so N players in the
+#    queue always form floor(N / group size) separate matches.
+
+func _mm_group_size() -> int:
+	return team_size * 2
+
+func _mm_lobby_code() -> String:
+	return "public_" + game_mode + "_lobby"
 
 func _mm_enter_lobby() -> void :
 	mm_phase = "lobby"
 	mm_lobby_peers.clear()
-	mm_expected_opponent = ""
-	opponent_trystero_id = ""
+	mm_roster = []
+	mm_room_joined.clear()
+	mm_room_left.clear()
+	match_setup_done = false
 	mm_hello_timer = 0.0
+	mm_leader_wait_timer = 0.0
 	_mm_clear_pending()
-	if waiting_opponent_label:
-		waiting_opponent_label.text = "Searching for Opponent..."
+	_update_waiting_label()
+	_switch_room(_mm_lobby_code())
+
+func _update_waiting_label() -> void :
+	if not waiting_opponent_label:
+		return
+	var mode_label = String(GAME_MODES.get(game_mode, {"label": "match"})["label"])
+	if mm_phase == "lobby":
+		if mm_linger_room != "":
+			waiting_opponent_label.text = "Match found! Connecting..."
+		else:
+			waiting_opponent_label.text = "Searching for " + mode_label + "... (" + str(mm_lobby_peers.size() + 1) + " in queue, " + str(_mm_group_size()) + " needed)"
 		waiting_opponent_label.visible = true
-	if OS.has_feature("web"):
-		var window = JavaScriptBridge.get_interface("window")
-		window.joinTrysteroRoomWhenReady(LOBBY_ROOM_CODE)
+	elif mm_phase == "match" and not match_setup_done:
+		waiting_opponent_label.text = "Match found! Connecting players (" + str(mm_room_joined.size() + 1) + "/" + str(mm_roster.size()) + ")..."
+		waiting_opponent_label.visible = true
 
 func _mm_is_free() -> bool:
-	return mm_pending_out == "" and mm_pending_in == "" and mm_linger_opponent == ""
+	return mm_lead_room == "" and mm_invited_by == "" and mm_linger_room == ""
 
 func _mm_status() -> String:
 	return "searching" if _mm_is_free() else "busy"
 
 func _mm_send_hello(to: String = "") -> void :
-	var pkt = {"action": "mm_hello", "status": _mm_status()}
+	var pkt = {"action": "mm_hello", "status": _mm_status(), "links": direct_peers.keys()}
 	if to != "":
 		pkt["to"] = to
 	send_p2p_packet(pkt)
 
 func _mm_clear_pending() -> void :
-	mm_pending_out = ""
-	mm_pending_in = ""
-	mm_pending_room = ""
-	mm_pending_timer = 0.0
-	mm_linger_opponent = ""
+	mm_lead_room = ""
+	mm_lead_roster = []
+	mm_lead_accepted = []
+	mm_lead_timer = 0.0
+	mm_invited_by = ""
+	mm_invite_room = ""
+	mm_invite_roster = []
+	mm_invite_timer = 0.0
 	mm_linger_room = ""
+	mm_linger_roster = []
 	mm_linger_timer = 0.0
 
-func _mm_skip(peer: String) -> void :
+func _mm_skip(peer: String, ms: int = MM_SKIP_DURATION_MS) -> void :
 	if peer != "":
-		mm_skip_until[peer] = Time.get_ticks_msec() + MM_SKIP_DURATION_MS
+		mm_skip_until[peer] = _now_ms() + ms
+
+# Cancel the group we're leading: release everyone we invited.
+func _mm_abort_lead(skip_peers: Array = []) -> void :
+	for p in mm_lead_roster:
+		if p != mm_self_id:
+			send_p2p_packet({"action": "mm_release", "to": p, "room": mm_lead_room})
+	for p in skip_peers:
+		_mm_skip(p)
+	_mm_clear_pending()
+
+func _mm_searching_peers() -> Array:
+	var now = _now_ms()
+	var out: Array = []
+	for peer in mm_lobby_peers:
+		if mm_lobby_peers[peer] != "searching":
+			continue
+		if mm_skip_until.has(peer) and now < int(mm_skip_until[peer]):
+			continue
+		out.append(peer)
+	out.sort()
+	return out
 
 func _mm_tick(delta: float) -> void :
 	if _get_self_trystero_id() == "":
@@ -682,53 +1115,71 @@ func _mm_tick(delta: float) -> void :
 	if mm_hello_timer <= 0.0:
 		mm_hello_timer = MM_HELLO_INTERVAL
 		_mm_send_hello()
+		_update_waiting_label()
 
-	# Proposer: confirm was sent, give it time to arrive, then switch rooms.
-	if mm_linger_opponent != "":
+	# Leader: confirms were sent, give them time to arrive, then switch rooms.
+	if mm_linger_room != "":
 		mm_linger_timer -= delta
 		if mm_linger_timer <= 0.0:
-			_mm_enter_private_room(mm_linger_opponent, mm_linger_room)
+			_mm_enter_private_room(mm_linger_roster, mm_linger_room)
 		return
 
-	if mm_pending_out != "":
-		mm_pending_timer -= delta
-		if mm_pending_timer <= 0.0:
-			# Our proposal got no answer: try someone else for a while.
-			_mm_skip(mm_pending_out)
-			_mm_clear_pending()
+	if mm_lead_room != "":
+		mm_lead_timer -= delta
+		if mm_lead_timer <= 0.0:
+			# Someone never answered: release the group and skip the silent ones.
+			var silent: Array = []
+			for p in mm_lead_roster:
+				if p != mm_self_id and not mm_lead_accepted.has(p):
+					silent.append(p)
+			_mm_abort_lead(silent)
 		return
 
-	if mm_pending_in != "":
-		mm_pending_timer -= delta
-		if mm_pending_timer <= 0.0:
-			# We accepted and the proposer never said "busy", so it's going to
-			# the private room even if its confirm got lost. Go meet it there.
-			# (If it really isn't coming, the private-room timeout brings us back.)
-			_mm_enter_private_room(mm_pending_in, mm_pending_room)
+	if mm_invited_by != "":
+		mm_invite_timer -= delta
+		if mm_invite_timer <= 0.0:
+			# We accepted and were never released, so the leader went ahead even
+			# though its confirm got lost. Go meet the group there.
+			_mm_enter_private_room(mm_invite_roster, mm_invite_room)
 		return
 
-	_mm_try_propose()
+	_mm_try_lead(delta)
 
-func _mm_try_propose() -> void :
-	var now = Time.get_ticks_msec()
-	var best: String = ""
-	for peer in mm_lobby_peers:
-		if mm_lobby_peers[peer] != "searching":
-			continue
-		if peer <= mm_self_id:
-			continue
-		if mm_skip_until.has(peer) and now < int(mm_skip_until[peer]):
-			continue
-		if best == "" or peer < best:
-			best = peer
-
-	if best == "":
+func _mm_try_lead(delta: float) -> void :
+	var n = _mm_group_size()
+	var pool = _mm_searching_peers()
+	if pool.size() + 1 < n:
+		mm_leader_wait_timer = 0.0
 		return
 
-	mm_pending_out = best
-	mm_pending_room = "hussle_1v1_" + mm_self_id + "_" + best + "_" + str(randi() % 1000000)
-	mm_pending_timer = MM_HANDSHAKE_TIMEOUT
-	send_p2p_packet({"action": "mm_propose", "to": best, "room": mm_pending_room})
+	# The lowest-ID searching player leads, unless they were unresponsive when
+	# it was their turn (frozen tab etc.) - then the next one leads, and they
+	# can still be invited.
+	var now = _now_ms()
+	var leaders: Array = [mm_self_id]
+	for p in pool:
+		if not (mm_no_lead_until.has(p) and now < int(mm_no_lead_until[p])):
+			leaders.append(p)
+	leaders.sort()
+	if leaders[0] != mm_self_id:
+		mm_leader_wait_timer += delta
+		if mm_leader_wait_timer >= MM_LEADER_PATIENCE:
+			mm_leader_wait_timer = 0.0
+			mm_no_lead_until[leaders[0]] = now + MM_LEADER_SKIP_MS
+		return
+
+	mm_leader_wait_timer = 0.0
+	var roster: Array = pool.slice(0, n - 1)
+	roster.append(mm_self_id)
+	roster.sort()
+	mm_lead_roster = roster
+	mm_lead_room = "hussle_" + game_mode + "_" + mm_self_id + "_" + str(randi() % 1000000)
+	mm_lead_accepted = []
+	mm_lead_timer = MM_HANDSHAKE_TIMEOUT
+	log_console("[Matchmaking] Inviting " + str(n - 1) + " players into a group...")
+	for p in mm_lead_roster:
+		if p != mm_self_id:
+			send_p2p_packet({"action": "mm_invite", "to": p, "room": mm_lead_room, "roster": mm_lead_roster})
 
 func _mm_handle_lobby_packet(action: String, sender: String, data: Dictionary) -> void :
 	if sender == "" or sender == mm_self_id:
@@ -738,48 +1189,78 @@ func _mm_handle_lobby_packet(action: String, sender: String, data: Dictionary) -
 	match action:
 		"mm_hello":
 			mm_lobby_peers[sender] = String(data.get("status", "unknown"))
-		"mm_propose":
-			if _mm_is_free() and room != "":
-				mm_pending_in = sender
-				mm_pending_room = room
-				mm_pending_timer = MM_HANDSHAKE_TIMEOUT
+		"mm_invite":
+			var roster: Array = []
+			for r in data.get("roster", []):
+				roster.append(String(r))
+			var valid = room != "" and roster.size() == _mm_group_size() and roster.has(mm_self_id) and roster.has(sender)
+			if valid and mm_lead_room != "" and sender < mm_self_id:
+				# Two leaders collided: the lower ID wins, so we step down.
+				_mm_abort_lead()
+			if valid and _mm_is_free():
+				mm_invited_by = sender
+				mm_invite_room = room
+				mm_invite_roster = roster
+				mm_invite_timer = MM_INVITE_TIMEOUT
+				mm_leader_wait_timer = 0.0
 				send_p2p_packet({"action": "mm_accept", "to": sender, "room": room})
 			else:
 				send_p2p_packet({"action": "mm_busy", "to": sender, "room": room})
 		"mm_accept":
-			if sender == mm_pending_out and room == mm_pending_room:
-				send_p2p_packet({"action": "mm_confirm", "to": sender, "room": room})
-				# Don't leave yet - leaving immediately drops the confirm in flight.
-				_mm_clear_pending()
-				mm_linger_opponent = sender
-				mm_linger_room = room
-				mm_linger_timer = MM_CONFIRM_LINGER
-				log_console("[Matchmaking] Opponent found! Setting up match...")
-				if waiting_opponent_label:
-					waiting_opponent_label.text = "Opponent found! Connecting..."
+			if mm_lead_room != "" and room == mm_lead_room and mm_lead_roster.has(sender):
+				if not mm_lead_accepted.has(sender):
+					mm_lead_accepted.append(sender)
+				if mm_lead_accepted.size() >= mm_lead_roster.size() - 1:
+					for p in mm_lead_roster:
+						if p != mm_self_id:
+							send_p2p_packet({"action": "mm_confirm", "to": p, "room": mm_lead_room})
+					# Don't leave yet - leaving immediately drops the confirms in flight.
+					var r_room = mm_lead_room
+					var r_roster = mm_lead_roster
+					_mm_clear_pending()
+					mm_linger_room = r_room
+					mm_linger_roster = r_roster
+					mm_linger_timer = MM_CONFIRM_LINGER
+					log_console("[Matchmaking] Match found! Setting up the room...")
+					_update_waiting_label()
 			else:
-				send_p2p_packet({"action": "mm_busy", "to": sender, "room": room})
+				# They accepted a group we already gave up on: tell them they're free.
+				send_p2p_packet({"action": "mm_release", "to": sender, "room": room})
 		"mm_confirm":
-			if sender == mm_pending_in and room == mm_pending_room:
-				_mm_enter_private_room(sender, room)
-		"mm_busy":
-			if (sender == mm_pending_out or sender == mm_pending_in) and room == mm_pending_room:
-				_mm_skip(sender)
+			if sender == mm_invited_by and room == mm_invite_room:
+				_mm_enter_private_room(mm_invite_roster, mm_invite_room)
+		"mm_release":
+			if sender == mm_invited_by and room == mm_invite_room:
 				_mm_clear_pending()
+		"mm_busy":
+			if mm_lead_room != "" and room == mm_lead_room and mm_lead_roster.has(sender):
+				_mm_abort_lead([sender])
 
-func _mm_enter_private_room(opponent: String, room: String) -> void :
+func _mm_enter_private_room(roster: Array, room: String) -> void :
+	var sorted_roster: Array = roster.duplicate()
+	sorted_roster.sort()
 	mm_phase = "match"
-	mm_expected_opponent = opponent
-	opponent_trystero_id = ""
+	mm_roster = sorted_roster
+	local_peer_id = _peer_id_of(mm_self_id)
+	is_host_peer = local_peer_id == 1
+	mm_room_joined.clear()
+	mm_room_left.clear()
+	match_setup_done = false
+	player_nicknames.clear()
+	player_elos.clear()
+	player_teams.clear()
+	current_3_maps.clear()
+	banned_map_indices.clear()
+	ban_log.clear()
+	player_nicknames[local_peer_id] = local_nickname
+	player_elos[local_peer_id] = local_elo
 	mm_private_join_timer = MM_PRIVATE_JOIN_TIMEOUT
 	_mm_clear_pending()
 	mm_lobby_peers.clear()
-	log_console("[Matchmaking] Paired! Moving to private room...")
-	if waiting_opponent_label:
-		waiting_opponent_label.text = "Opponent found! Connecting..."
-	if OS.has_feature("web"):
-		var window = JavaScriptBridge.get_interface("window")
-		window.joinTrysteroRoomWhenReady(room)
+	last_setup_packet = {}
+	log_console("[Matchmaking] Grouped! Moving to private room...")
+	_update_waiting_label()
+	_switch_room(room)
 
 
 func generate_topdown_map_texture(map_info: Dictionary, is_banned: bool = false) -> Texture2D:
@@ -817,9 +1298,88 @@ func _draw_img_rect(img: Image, start_x: int, start_y: int, rect_w: int, rect_h:
 
 func _start_map_ban_phase() -> void :
 	banned_map_indices.clear()
-	local_ban_turn = is_host_peer or is_single_player
+	local_ban_turn = _is_my_ban_turn()
 	_reset_crystal_state()
 	_build_map_ban_ui()
+	_apply_pending_bans()
+
+func _apply_pending_bans() -> void :
+	if not map_ban_canvas or current_3_maps.is_empty():
+		return # not in the ban phase yet - keep them for later
+	var applied = false
+	while true:
+		var turn = banned_map_indices.size()
+		if not ban_log.has(turn):
+			break
+		var entry = ban_log[turn]
+		var order = _ban_order()
+		var idx = int(entry["idx"])
+		if turn >= order.size() or int(entry["by"]) != order[turn] or idx < 0 or idx >= current_3_maps.size() or banned_map_indices.has(idx):
+			ban_log.erase(turn) # not a valid ban for this turn
+			break
+		banned_map_indices.append(idx)
+		applied = true
+	if applied:
+		local_ban_turn = _is_my_ban_turn()
+		_refresh_map_ban_ui()
+		_check_map_ban_completion()
+
+# Ban turns: every player bans one map, alternating teams - Blue 1, Red 1,
+# Blue 2, Red 2, ... (by peer ID within each team). In 1v1 that's simply each
+# player once; in practice mode you make both bans.
+func _team_captain(team: int) -> int:
+	var best = -1
+	for pid in all_player_ids():
+		if get_team(pid) == team and (best == -1 or pid < best):
+			best = pid
+	return best
+
+func _ban_order() -> Array:
+	if is_single_player:
+		return [local_peer_id, local_peer_id]
+	var blue: Array = []
+	var red: Array = []
+	for pid in all_player_ids():
+		if get_team(pid) == 0:
+			blue.append(pid)
+		else:
+			red.append(pid)
+	var order: Array = []
+	for i in range(max(blue.size(), red.size())):
+		if i < blue.size():
+			order.append(blue[i])
+		if i < red.size():
+			order.append(red[i])
+	return order
+
+func _required_bans() -> int:
+	return max(current_3_maps.size() - 1, 0)
+
+func _ban_who(pid: int) -> String:
+	if pid == local_peer_id:
+		return "You"
+	var nick = String(player_nicknames.get(pid, "Player " + str(pid)))
+	if team_size > 1:
+		return ("Teammate " if is_teammate(pid, local_peer_id) else "Enemy ") + nick
+	return nick
+
+func _current_banner() -> int:
+	var order = _ban_order()
+	var i = banned_map_indices.size()
+	return order[i] if i < order.size() else -1
+
+func _is_my_ban_turn() -> bool:
+	return _current_banner() == local_peer_id
+
+func _ban_header_text() -> String:
+	if local_ban_turn:
+		return "MAP BAN PHASE - SELECT MAP TO BAN"
+	var banner = _current_banner()
+	if banner <= 0:
+		return "MAP BAN PHASE"
+	if team_size > 1:
+		return _ban_who(banner).to_upper() + " IS BANNING..."
+	return "OPPONENT IS BANNING A MAP..."
 
 func _build_map_ban_ui() -> void :
 	if map_ban_canvas: map_ban_canvas.queue_free()
@@ -832,8 +1392,9 @@ func _build_map_ban_ui() -> void :
 	center.set_anchors_preset(Control.PRESET_FULL_RECT)
 	map_ban_canvas.add_child(center)
 
+	var many = current_3_maps.size() > 3
 	var panel = PanelContainer.new()
-	panel.custom_minimum_size = Vector2(620, 360)
+	panel.custom_minimum_size = Vector2(700 if many else 620, 360)
 	center.add_child(panel)
 
 	var main_vbox = VBoxContainer.new()
@@ -841,14 +1402,19 @@ func _build_map_ban_ui() -> void :
 	panel.add_child(main_vbox)
 
 	map_ban_header_label = Label.new()
-	map_ban_header_label.text = "MAP BAN PHASE - BAN A MAP" if local_ban_turn else "OPPONENT IS BANNING A MAP..."
+	map_ban_header_label.text = _ban_header_text()
 	map_ban_header_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	map_ban_header_label.add_theme_font_size_override("font_size", 22)
 	map_ban_header_label.add_theme_color_override("font_color", Color(1.0, 0.9, 0.2))
 	main_vbox.add_child(map_ban_header_label)
 
 	var sub_header = Label.new()
-	sub_header.text = "Single Player Mode: You get 2 Bans" if is_single_player else "Ranked 1v1: Each Player bans 1 map"
+	if is_single_player:
+		sub_header.text = "Single Player Mode: You get 2 Bans"
+	elif team_size > 1:
+		sub_header.text = String(GAME_MODES[game_mode]["label"]) + ": " + str(current_3_maps.size()) + " maps, every player bans 1  -  You are " + TEAM_NAMES[get_team(local_peer_id)] + " team"
+	else:
+		sub_header.text = "Ranked 1v1: Each Player bans 1 map"
 	sub_header.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	sub_header.add_theme_font_size_override("font_size", 13)
 	sub_header.add_theme_color_override("font_color", Color(0.8, 0.8, 0.8))
@@ -859,14 +1425,35 @@ func _build_map_ban_ui() -> void :
 	map_ban_timer_label.add_theme_font_size_override("font_size", 16)
 	main_vbox.add_child(map_ban_timer_label)
 
+	# Ban order, e.g. "You > Enemy Kai > Teammate Bea > Enemy Mo"
+	ban_order_label = RichTextLabel.new()
+	ban_order_label.bbcode_enabled = true
+	ban_order_label.fit_content = true
+	ban_order_label.scroll_active = false
+	ban_order_label.custom_minimum_size = Vector2(660 if many else 580, 0)
+	ban_order_label.add_theme_font_size_override("normal_font_size", 12)
+	ban_order_label.visible = team_size > 1 and not is_single_player
+	main_vbox.add_child(ban_order_label)
+
 	var spacer = Control.new()
-	spacer.custom_minimum_size = Vector2(0, 10)
+	spacer.custom_minimum_size = Vector2(0, 6)
 	main_vbox.add_child(spacer)
 
-	map_row_container = HBoxContainer.new()
-	map_row_container.alignment = BoxContainer.ALIGNMENT_CENTER
-	map_row_container.custom_minimum_size = Vector2(580, 240)
-	main_vbox.add_child(map_row_container)
+	# 3 maps on one row, 5 as 3 + 2, 7 as 4 + 3 (rows centered).
+	var cols = 4 if current_3_maps.size() > 5 else 3
+	var card_w = 150 if many else 180
+	var grid_center = CenterContainer.new()
+	main_vbox.add_child(grid_center)
+	map_row_container = HFlowContainer.new()
+	map_row_container.alignment = FlowContainer.ALIGNMENT_CENTER
+	map_row_container.custom_minimum_size = Vector2(cols * (card_w + 8), 0)
+	map_row_container.add_theme_constant_override("h_separation", 8)
+	map_row_container.add_theme_constant_override("v_separation", 8)
+	grid_center.add_child(map_row_container)
+
+	var bottom_pad = Control.new()
+	bottom_pad.custom_minimum_size = Vector2(0, 8)
+	main_vbox.add_child(bottom_pad)
 
 	_refresh_map_ban_ui()
 
@@ -878,7 +1465,34 @@ func _refresh_map_ban_ui() -> void :
 	_update_map_ban_timer_label()
 
 	if map_ban_header_label:
-		map_ban_header_label.text = "MAP BAN PHASE - SELECT MAP TO BAN" if local_ban_turn else "OPPONENT IS BANNING A MAP..."
+		map_ban_header_label.text = _ban_header_text()
+
+	if ban_order_label and ban_order_label.visible:
+		var parts: Array = []
+		var order = _ban_order()
+		var cur = banned_map_indices.size()
+		for t in range(order.size()):
+			var pid = order[t]
+			var col = (TEAM_COLORS[get_team(pid)] as Color).lerp(Color.WHITE, 0.35).to_html(false)
+			var txt = _ban_who(pid).replace("[", "(")
+			if t < cur:
+				parts.append("[color=#777777][s]" + txt + "[/s][/color]")
+			elif t == cur:
+				parts.append("[b][color=#ffe066]> " + txt + "[/color][/b]")
+			else:
+				parts.append("[color=#" + col + "]" + txt + "[/color]")
+		ban_order_label.text = "[center]Ban order:  " + "  -  ".join(PackedStringArray(parts)) + "[/center]"
+
+	# Who banned which map (for the "Banned by" line on the cards)
+	var banned_by: Dictionary = {}
+	for t in ban_log:
+		if t < banned_map_indices.size():
+			banned_by[int(ban_log[t]["idx"])] = int(ban_log[t]["by"])
+
+	var many = current_3_maps.size() > 3
+	var card_w = 150 if many else 180
+	var prev_w = 134 if many else 160
+	var prev_h = 92 if many else 130
 
 	for child in map_row_container.get_children():
 		child.queue_free()
@@ -888,22 +1502,22 @@ func _refresh_map_ban_ui() -> void :
 		var is_banned = banned_map_indices.has(i)
 
 		var card = PanelContainer.new()
-		card.custom_minimum_size = Vector2(180, 230)
+		card.custom_minimum_size = Vector2(card_w, 0)
 		map_row_container.add_child(card)
 
 		var vbox = VBoxContainer.new()
-		vbox.alignment = BoxContainer.ALIGNMENT_CENTER
+		vbox.alignment = BoxContainer.ALIGNMENT_BEGIN
 		card.add_child(vbox)
 
 		var preview_container = PanelContainer.new()
-		preview_container.custom_minimum_size = Vector2(160, 130)
+		preview_container.custom_minimum_size = Vector2(prev_w, prev_h)
 		vbox.add_child(preview_container)
 
 		var preview_rect = TextureRect.new()
 		preview_rect.texture = generate_topdown_map_texture(map_info, is_banned)
 		preview_rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 		preview_rect.stretch_mode = TextureRect.STRETCH_SCALE
-		preview_rect.custom_minimum_size = Vector2(160, 130)
+		preview_rect.custom_minimum_size = Vector2(prev_w, prev_h)
 		preview_container.add_child(preview_rect)
 
 		if is_banned:
@@ -926,6 +1540,8 @@ func _refresh_map_ban_ui() -> void :
 		map_theme_lbl.text = map_info.get("theme", "")
 		map_theme_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		map_theme_lbl.add_theme_font_size_override("font_size", 10)
+		map_theme_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		map_theme_lbl.custom_minimum_size = Vector2(card_w - 12, 0)
 		map_theme_lbl.add_theme_color_override("font_color", Color(0.7, 0.9, 1.0))
 		vbox.add_child(map_theme_lbl)
 
@@ -936,6 +1552,19 @@ func _refresh_map_ban_ui() -> void :
 			crystal_lbl.add_theme_font_size_override("font_size", 10)
 			crystal_lbl.add_theme_color_override("font_color", Color(0.95, 0.5, 1.0))
 			vbox.add_child(crystal_lbl)
+
+		if is_banned and banned_by.has(i) and not is_single_player:
+			var by_lbl = Label.new()
+			by_lbl.text = "by " + _ban_who(banned_by[i])
+			by_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+			by_lbl.add_theme_font_size_override("font_size", 10)
+			by_lbl.add_theme_color_override("font_color", Color(1.0, 0.55, 0.55))
+			vbox.add_child(by_lbl)
+
+		# Push the button to the bottom so buttons line up across a row.
+		var push = Control.new()
+		push.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		vbox.add_child(push)
 
 		var ban_btn = Button.new()
 		if is_banned:
@@ -960,7 +1589,13 @@ func _update_map_ban_timer_label() -> void :
 	if not map_ban_timer_label:
 		return
 	var secs = int(ceil(map_ban_timer))
-	var who = "Your turn" if local_ban_turn else "Opponent's turn"
+	var who = "Your turn"
+	if not local_ban_turn:
+		var banner = _current_banner()
+		if team_size > 1 and banner > 0:
+			who = _ban_who(banner) + "'s turn"
+		else:
+			who = "Opponent's turn"
 	map_ban_timer_label.text = who + " - " + str(secs) + "s left"
 	if secs <= 5:
 		map_ban_timer_label.add_theme_color_override("font_color", Color(1.0, 0.3, 0.3))
@@ -982,27 +1617,24 @@ func _on_map_ban_clicked(map_idx: int) -> void :
 	if not local_ban_turn or banned_map_indices.has(map_idx):
 		return
 
+	var turn = banned_map_indices.size()
+	ban_log[turn] = {"idx": map_idx, "by": local_peer_id}
 	banned_map_indices.append(map_idx)
-	local_ban_turn = false
+	local_ban_turn = _is_my_ban_turn()
 	_refresh_map_ban_ui()
 
 	if not is_single_player:
 		send_p2p_packet({
 			"action": "ban_map", 
-			"banned_index": map_idx
+			"banned_index": map_idx, 
+			"turn": turn
 		})
 
 	_check_map_ban_completion()
 
 func _check_map_ban_completion() -> void :
-	var required_bans = 2
-
-	if is_single_player and banned_map_indices.size() < 2:
-		local_ban_turn = true
-		_refresh_map_ban_ui()
-		return
-
-	if banned_map_indices.size() >= required_bans:
+	var required_bans = _required_bans()
+	if required_bans > 0 and banned_map_indices.size() >= required_bans:
 		for i in range(current_3_maps.size()):
 			if not banned_map_indices.has(i):
 				selected_map_data = current_3_maps[i]
@@ -1014,37 +1646,58 @@ func _check_map_ban_completion() -> void :
 			map_row_container = null
 			map_ban_header_label = null
 			map_ban_timer_label = null
+			ban_order_label = null
 
 		_start_p2p_game()
 
 
-func _on_find_match_pressed() -> void :
-	_save_nickname_from_input()
-
-	is_single_player = false
-	is_host_peer = false
-	opponent_trystero_id = ""
+func _reset_match_state() -> void :
+	is_match_active = false
+	is_game_over = false
+	is_qte_in_progress = false
 	current_3_maps.clear()
 	banned_map_indices.clear()
+	ban_log.clear()
 	player_nicknames.clear()
 	player_elos.clear()
+	player_teams.clear()
+	dead_peers.clear()
+	forfeited_peers.clear()
+	match_start_elos.clear()
+	match_setup_done = false
+	mm_roster = []
+	mm_room_joined.clear()
+	mm_room_left.clear()
+	leave_room_timer = -1.0
+	local_peer_id = 1
 
+func _on_find_match_pressed(mode: String = "1v1") -> void :
+	_save_nickname_from_input()
+
+	game_mode = mode if GAME_MODES.has(mode) else "1v1"
+	team_size = int(GAME_MODES[game_mode]["team_size"])
+	is_single_player = false
+	is_host_peer = false
+	_reset_match_state()
 	mm_skip_until.clear()
 
 	_clear_ui()
 	_build_hud_console()
 
-	log_console("[Matchmaking] Joining matchmaking lobby...")
+	log_console("[Matchmaking] Joining the " + String(GAME_MODES[game_mode]["label"]) + " lobby...")
 	_mm_enter_lobby()
 
 func _on_single_player_pressed() -> void :
 	_save_nickname_from_input()
 
+	game_mode = "1v1"
+	team_size = 1
+	_reset_match_state()
 	is_single_player = true
 	is_host_peer = true
 	is_match_active = true
-	is_game_over = false
-	is_qte_in_progress = false
+	local_peer_id = 1
+	player_teams = {1: 0, 2: 1}
 
 	_clear_ui()
 	_build_hud_console()
@@ -1065,17 +1718,22 @@ func _start_p2p_game() -> void :
 	is_game_over = false
 	is_qte_in_progress = false
 
+	dead_peers.clear()
+	forfeited_peers.clear()
+	player_nicknames[local_peer_id] = local_nickname
+	player_elos[local_peer_id] = local_elo
+	match_start_elos = player_elos.duplicate()
+
 	_build_3d_environment()
 
-	var my_id = 1 if is_host_peer else 2
-	player_nicknames[my_id] = local_nickname
-	player_elos[my_id] = local_elo
-
-	_spawn_player(1)
 	if is_single_player:
+		_spawn_player(1)
 		_spawn_test_dummy(2)
 	else:
-		_spawn_player(2)
+		for pid in all_player_ids():
+			_spawn_player(pid)
+		if team_size > 1:
+			log_console("[Match] Eliminate the whole enemy team to win. If you die, you turn invisible and can roam until the match ends.")
 
 	crystals_enabled = bool(selected_map_data.get("crystals", false))
 	crystal_high_ground = bool(selected_map_data.get("crystal_high_ground", false))
@@ -1085,6 +1743,170 @@ func _start_p2p_game() -> void :
 		# The host may have told us about a crystal before our world existed.
 		if not crystal_active.is_empty() and crystal_node == null:
 			_spawn_crystal_node(crystal_active)
+
+
+# --- TEAMS & ELIMINATION ---
+# Everyone tracks deaths from the same damage packets, but only the host
+# (lowest connected peer ID) declares the winner, so all clients agree even when
+# the last two players trade hits at the same moment.
+
+func all_player_ids() -> Array:
+	var n = 2 if is_single_player else max(mm_roster.size(), 2)
+	return range(1, n + 1)
+
+func get_team(pid: int) -> int:
+	return int(player_teams.get(pid, 0 if pid == 1 else 1))
+
+func is_teammate(a: int, b: int) -> bool:
+	return get_team(a) == get_team(b)
+
+func get_player(pid: int) -> NetworkPlayer:
+	if not players_container or not is_instance_valid(players_container):
+		return null
+	return players_container.get_node_or_null(str(pid)) as NetworkPlayer
+
+func _first_enemy_id() -> int:
+	for pid in all_player_ids():
+		if not is_teammate(pid, local_peer_id):
+			return pid
+	return 2
+
+func _team_alive_count(team: int) -> int:
+	var c = 0
+	for pid in all_player_ids():
+		if get_team(pid) == team and not dead_peers.has(pid):
+			c += 1
+	return c
+
+func _team_avg_elo(team: int) -> int:
+	var total = 0
+	var count = 0
+	for pid in all_player_ids():
+		if get_team(pid) == team:
+			total += local_elo if pid == local_peer_id else int(match_start_elos.get(pid, player_elos.get(pid, 1000)))
+			count += 1
+	return int(round(float(total) / float(max(count, 1))))
+
+func _spawn_point(pid: int) -> Vector3:
+	var team = get_team(pid)
+	var mates: Array = []
+	for p in all_player_ids():
+		if get_team(p) == team:
+			mates.append(p)
+	var zs: Array = TEAM_SPAWN_Z.get(team_size, [0.0])
+	var z = float(zs[mates.find(pid) % zs.size()])
+	return Vector3(-15.0 if team == 0 else 15.0, 1.0, z)
+
+# Called on every client when a player's health reaches 0.
+func on_player_killed(p: NetworkPlayer) -> void :
+	if dead_peers.has(p.peer_id) or is_game_over:
+		return
+	dead_peers[p.peer_id] = true
+
+	if is_single_player:
+		if p.is_dummy:
+			_process_match_outcome(0)
+		else:
+			_forfeit_match()
+		return
+
+	if p.is_local_player():
+		consume_local_ability("died")
+		log_console("[Match] You were eliminated!")
+	else:
+		var side = ""
+		if team_size > 1:
+			side = " (teammate)" if is_teammate(p.peer_id, local_peer_id) else " (enemy)"
+		log_console("[Match] " + String(player_nicknames.get(p.peer_id, "Player")) + side + " was eliminated!")
+
+	p.set_dead_state()
+	if p.is_local_player() and team_size > 1 and _team_alive_count(p.team) > 0:
+		_show_dead_banner(true)
+	_host_check_team_wipe()
+
+# A player quit or disconnected: they're out (and take a loss).
+func _mark_player_forfeited(pid: int) -> void :
+	if pid <= 0 or forfeited_peers.has(pid) or is_game_over:
+		return
+	forfeited_peers[pid] = true
+	log_console("[Match] " + String(player_nicknames.get(pid, "A player")) + " left the match.")
+	if not dead_peers.has(pid):
+		dead_peers[pid] = true
+		var node = get_player(pid)
+		if node:
+			node.set_dead_state()
+	var me = get_local_player()
+	if me:
+		me.remove_movement_lock(pid)
+	_recompute_host()
+	_host_check_team_wipe()
+
+# The host is the lowest peer ID still in the match; if it leaves, the next one
+# takes over deciding the winner and running the crystals.
+func _recompute_host() -> void :
+	if is_single_player:
+		return
+	var lowest = local_peer_id
+	for i in range(mm_roster.size()):
+		var pid = i + 1
+		if mm_roster[i] == mm_self_id or mm_room_left.has(mm_roster[i]) or forfeited_peers.has(pid):
+			continue
+		lowest = min(lowest, pid)
+	var was_host = is_host_peer
+	is_host_peer = lowest == local_peer_id
+	crystal_claim_sent = false
+	if is_host_peer and not was_host:
+		log_console("[Network] You are now the match host.")
+
+func _host_check_team_wipe() -> void :
+	if not is_host_peer or is_game_over or not is_match_active or is_single_player:
+		return
+	for team in [0, 1]:
+		if _team_alive_count(team) == 0:
+			var winner = 1 - team
+			var dead_list: Array = dead_peers.keys()
+			send_p2p_packet({"action": "match_outcome", "winning_team": winner, "dead": dead_list})
+			_process_match_outcome(winner, dead_list)
+			return
+
+func kill_local_player_from_fall() -> void :
+	var me = get_local_player()
+	if not me or me.is_dead:
+		return
+	var amount = me.health
+	send_p2p_packet({"action": "take_damage", "peer_id": str(local_peer_id), "amount": amount})
+	me.apply_damage(amount)
+
+func _show_dead_banner(show: bool) -> void :
+	if dead_banner_label:
+		dead_banner_label.visible = show
+
+func _update_team_hud() -> void :
+	if not team_hud_label:
+		return
+	if not is_match_active or is_game_over or is_single_player or team_size <= 1 or players_container == null:
+		team_hud_label.visible = false
+		return
+	var my_team = get_team(local_peer_id)
+	var text = ""
+	for team in [my_team, 1 - my_team]:
+		var col = (TEAM_COLORS[team] as Color).lerp(Color.WHITE, 0.3).to_html(false)
+		text += "[color=#" + col + "][b]" + TEAM_NAMES[team] + " TEAM" + (" (you)" if team == my_team else "") + "[/b][/color]\n"
+		for pid in all_player_ids():
+			if get_team(pid) != team:
+				continue
+			var status = ""
+			if forfeited_peers.has(pid):
+				status = "[color=#888888]LEFT[/color]"
+			elif dead_peers.has(pid):
+				status = "[color=#ff5555]DEAD[/color]"
+			else:
+				var node = get_player(pid)
+				status = str(node.health if node else 100) + " HP"
+			var nick = String(player_nicknames.get(pid, "Player")).replace("[", "(")
+			text += "  " + ("> " if pid == local_peer_id else "") + nick + "  " + status + "\n"
+	team_hud_label.text = text
+	team_hud_label.visible = true
 
 
 # --- POWER CRYSTALS ---
@@ -1108,10 +1930,12 @@ func _physics_process(delta: float) -> void :
 	# Spawning needs raycasts, which are only valid during physics frames.
 	if not crystals_enabled or not is_match_active or is_game_over or not world_root:
 		return
-	if not is_host_peer or not crystal_active.is_empty():
+	if not crystal_active.is_empty():
 		return
+	# The countdown runs on every client so a new host can pick up where the
+	# old one left off; only the host actually spawns.
 	crystal_spawn_timer -= delta
-	if crystal_spawn_timer > 0.0:
+	if crystal_spawn_timer > 0.0 or not is_host_peer:
 		return
 	var pos = _find_crystal_spawn_point(world_root.get_world_3d().direct_space_state)
 	if typeof(pos) != TYPE_VECTOR3:
@@ -1187,11 +2011,13 @@ func _spawn_crystal_node(data: Dictionary) -> void :
 func on_crystal_touched(crystal: Node) -> void :
 	if local_ability != "" or is_game_over:
 		return # one ability at a time - leave it for later / the opponent
+	var me = get_local_player()
+	if not me or me.is_dead:
+		return
 	if crystal_active.is_empty() or int(crystal.crystal_id) != int(crystal_active["id"]):
 		return
-	var my_id = 1 if is_host_peer else 2
 	if is_host_peer:
-		_host_grant_crystal(int(crystal_active["id"]), my_id)
+		_host_grant_crystal(int(crystal_active["id"]), local_peer_id)
 	elif not crystal_claim_sent:
 		crystal_claim_sent = true
 		send_p2p_packet({"action": "crystal_claim", "id": int(crystal_active["id"])})
@@ -1199,6 +2025,8 @@ func on_crystal_touched(crystal: Node) -> void :
 func _host_grant_crystal(id: int, by_peer: int) -> void :
 	if crystal_active.is_empty() or int(crystal_active["id"]) != id:
 		return # already taken
+	if dead_peers.has(by_peer):
+		return
 	var ability_type = String(crystal_active["type"])
 	send_p2p_packet({"action": "crystal_taken", "id": id, "by": by_peer, "type": ability_type})
 	_apply_crystal_taken(id, by_peer, ability_type)
@@ -1212,15 +2040,17 @@ func _apply_crystal_taken(id: int, by_peer: int, ability_type: String) -> void :
 	crystal_claim_sent = false
 	crystal_spawn_timer = CRYSTAL_RESPAWN_TIME
 
-	var my_id = 1 if is_host_peer else 2
 	var info = CRYSTAL_ABILITIES.get(ability_type, {"name": ability_type, "color": Color.WHITE})
-	if by_peer == my_id:
+	if by_peer == local_peer_id:
 		_give_local_ability(ability_type)
 	else:
-		var opp = get_opponent_player()
-		if opp:
-			opp.set_ability_tag(String(info["name"]), info["color"])
-		log_console("[Crystals] Opponent grabbed " + String(info["name"]) + "!")
+		var grabber = get_player(by_peer)
+		if grabber:
+			grabber.set_ability_tag(String(info["name"]), info["color"])
+		var who = "Opponent"
+		if team_size > 1:
+			who = ("Teammate " if is_teammate(by_peer, local_peer_id) else "Enemy ") + String(player_nicknames.get(by_peer, "player"))
+		log_console("[Crystals] " + who + " grabbed " + String(info["name"]) + "!")
 
 func _give_local_ability(ability_type: String) -> void :
 	local_ability = ability_type
@@ -1234,7 +2064,12 @@ func consume_local_ability(reason: String = "used") -> void :
 	if local_ability == "":
 		return
 	var info = CRYSTAL_ABILITIES.get(local_ability, {"name": local_ability})
-	log_console("[Crystals] " + String(info["name"]) + (" used up." if reason == "used" else " wore off."))
+	var ending = " wore off."
+	if reason == "used":
+		ending = " used up."
+	elif reason == "died":
+		ending = " lost."
+	log_console("[Crystals] " + String(info["name"]) + ending)
 	local_ability = ""
 	local_ability_timer = 0.0
 	send_p2p_packet({"action": "ability_end"})
@@ -1526,8 +2361,8 @@ func _build_hud_console() -> void :
 	waiting_opponent_label = Label.new()
 	waiting_opponent_label.text = "Searching for Opponent..."
 	waiting_opponent_label.set_anchors_preset(Control.PRESET_CENTER_TOP)
-	waiting_opponent_label.position = Vector2(-150, 10)
-	waiting_opponent_label.custom_minimum_size = Vector2(300, 30)
+	waiting_opponent_label.position = Vector2(-260, 10)
+	waiting_opponent_label.custom_minimum_size = Vector2(520, 30)
 	waiting_opponent_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	waiting_opponent_label.add_theme_font_size_override("font_size", 16)
 	waiting_opponent_label.add_theme_color_override("font_color", Color(1.0, 0.9, 0.2))
@@ -1577,6 +2412,51 @@ func _build_hud_console() -> void :
 	ability_label.visible = false
 	hud_canvas.add_child(ability_label)
 
+	# Team roster (top-right) for 2v2 / 3v3
+	team_hud_label = RichTextLabel.new()
+	team_hud_label.bbcode_enabled = true
+	team_hud_label.fit_content = true
+	team_hud_label.scroll_active = false
+	team_hud_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	team_hud_label.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	team_hud_label.position = Vector2(-250, 10)
+	team_hud_label.custom_minimum_size = Vector2(240, 0)
+	team_hud_label.add_theme_font_size_override("normal_font_size", 13)
+	team_hud_label.add_theme_font_size_override("bold_font_size", 14)
+	team_hud_label.add_theme_constant_override("outline_size", 4)
+	team_hud_label.add_theme_color_override("font_outline_color", Color(0, 0, 0))
+	team_hud_label.visible = false
+	hud_canvas.add_child(team_hud_label)
+
+	# Shown while you're dead but your team is still fighting
+	dead_banner_label = Label.new()
+	dead_banner_label.text = "YOU WERE ELIMINATED\nYou're invisible - roam freely while your team fights on.\nStay until the end: if your team wins you still get half the ELO."
+	dead_banner_label.set_anchors_preset(Control.PRESET_CENTER_TOP)
+	dead_banner_label.position = Vector2(-300, 48)
+	dead_banner_label.custom_minimum_size = Vector2(600, 70)
+	dead_banner_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	dead_banner_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	dead_banner_label.add_theme_font_size_override("font_size", 15)
+	dead_banner_label.add_theme_color_override("font_color", Color(0.85, 0.85, 1.0))
+	dead_banner_label.add_theme_constant_override("outline_size", 5)
+	dead_banner_label.add_theme_color_override("font_outline_color", Color(0, 0, 0))
+	dead_banner_label.visible = false
+	hud_canvas.add_child(dead_banner_label)
+
+	leave_confirm_label = Label.new()
+	leave_confirm_label.text = "Press Esc again to leave the match (counts as a loss)"
+	leave_confirm_label.set_anchors_preset(Control.PRESET_CENTER)
+	leave_confirm_label.position = Vector2(-260, 40)
+	leave_confirm_label.custom_minimum_size = Vector2(520, 30)
+	leave_confirm_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	leave_confirm_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	leave_confirm_label.add_theme_font_size_override("font_size", 18)
+	leave_confirm_label.add_theme_color_override("font_color", Color(1.0, 0.5, 0.4))
+	leave_confirm_label.add_theme_constant_override("outline_size", 5)
+	leave_confirm_label.add_theme_color_override("font_outline_color", Color(0, 0, 0))
+	leave_confirm_label.visible = false
+	hud_canvas.add_child(leave_confirm_label)
+
 	# Plus-shaped crosshair, always centered (anchored to the middle of the screen).
 	crosshair = Crosshair.new()
 	crosshair.set_anchors_preset(Control.PRESET_CENTER)
@@ -1586,14 +2466,11 @@ func _build_hud_console() -> void :
 	log_console("[System] Network Console initialized.")
 
 func get_local_player() -> NetworkPlayer:
-	if not players_container or not is_instance_valid(players_container):
-		return null
-	return players_container.get_node_or_null(str(1 if is_host_peer else 2)) as NetworkPlayer
+	return get_player(local_peer_id)
 
+# The (first) enemy player - in 1v1 and practice that's simply the opponent.
 func get_opponent_player() -> NetworkPlayer:
-	if not players_container or not is_instance_valid(players_container):
-		return null
-	return players_container.get_node_or_null(str(2 if is_host_peer else 1)) as NetworkPlayer
+	return get_player(_first_enemy_id())
 
 func _update_opponent_pointer() -> void :
 	if not opponent_pointer or not opponent_height_label:
@@ -1606,16 +2483,26 @@ func _update_opponent_pointer() -> void :
 
 	if me and me.camera:
 		var cam: Camera3D = me.camera
-		var opp = get_opponent_player()
+		# Point at the nearest living enemy that's high above us.
+		var opp: NetworkPlayer = null
+		var best_dist = INF
+		for pid in all_player_ids():
+			if is_teammate(pid, local_peer_id) or dead_peers.has(pid):
+				continue
+			var cand = get_player(pid)
+			if cand and cand.global_position.y - me.global_position.y > OPPONENT_HIGH_THRESHOLD:
+				var d = cand.global_position.distance_to(me.global_position)
+				if d < best_dist:
+					best_dist = d
+					opp = cand
 		if opp:
 			var height = opp.global_position.y - me.global_position.y
-			if height > OPPONENT_HIGH_THRESHOLD:
-				show_pointer = true
-				_aim_pointer(opponent_pointer, cam, center, opp.global_position + Vector3(0, 0.9, 0))
-				opponent_height_label.text = "OPPONENT ABOVE: " + str(int(round(height))) + "m"
-				opponent_height_label.position = center + Vector2(-110, POINTER_RADIUS + 30)
+			show_pointer = true
+			_aim_pointer(opponent_pointer, cam, center, opp.global_position + Vector3(0, 0.9, 0))
+			opponent_height_label.text = ("ENEMY ABOVE: " if team_size > 1 else "OPPONENT ABOVE: ") + str(int(round(height))) + "m"
+			opponent_height_label.position = center + Vector2(-110, POINTER_RADIUS + 30)
 
-		if crystal_pointer and crystal_node and is_instance_valid(crystal_node):
+		if crystal_pointer and crystal_node and is_instance_valid(crystal_node) and not me.is_dead:
 			show_crystal = true
 			var cpos = crystal_node.global_position
 			_aim_pointer(crystal_pointer, cam, center, cpos)
@@ -1629,7 +2516,7 @@ func _update_opponent_pointer() -> void :
 		crystal_pointer.visible = show_crystal
 		crystal_distance_label.visible = show_crystal
 	if crosshair:
-		crosshair.visible = me != null
+		crosshair.visible = me != null and not me.is_dead
 
 func _aim_pointer(pointer: Control, cam: Camera3D, center: Vector2, target: Vector3) -> void :
 	var dir = cam.unproject_position(target) - center
@@ -1655,15 +2542,12 @@ func update_local_hud_hp(hp: int) -> void :
 func _build_main_menu() -> void :
 	_clear_ui()
 	mm_phase = "idle"
-	mm_expected_opponent = ""
 	mm_lobby_peers.clear()
 	_mm_clear_pending()
-	opponent_trystero_id = ""
+	_reset_match_state()
 	_leave_trystero_room()
+	_net_reset()
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
-	is_match_active = false
-	is_game_over = false
-	is_qte_in_progress = false
 	is_single_player = false
 
 	menu_canvas = CanvasLayer.new()
@@ -1735,10 +2619,22 @@ func _build_main_menu() -> void :
 	container.add_child(spacer)
 
 	var play_btn = Button.new()
-	play_btn.text = "Find Auto 1v1 Match (Ranked)"
+	play_btn.text = "Find Ranked 1v1 Match"
 	play_btn.custom_minimum_size = Vector2(320, 45)
-	play_btn.pressed.connect(_on_find_match_pressed)
+	play_btn.pressed.connect( func(): _on_find_match_pressed("1v1"))
 	container.add_child(play_btn)
+
+	var duo_btn = Button.new()
+	duo_btn.text = "Find Ranked 2v2 Match (4 players)"
+	duo_btn.custom_minimum_size = Vector2(320, 40)
+	duo_btn.pressed.connect( func(): _on_find_match_pressed("2v2"))
+	container.add_child(duo_btn)
+
+	var trio_btn = Button.new()
+	trio_btn.text = "Find Ranked 3v3 Match (6 players)"
+	trio_btn.custom_minimum_size = Vector2(320, 40)
+	trio_btn.pressed.connect( func(): _on_find_match_pressed("3v3"))
+	container.add_child(trio_btn)
 
 	var sp_btn = Button.new()
 	sp_btn.text = "Single Player Practice (No ELO)"
@@ -1864,53 +2760,98 @@ func calculate_elo_change(player_elo: int, opponent_elo: int, score: float, k_fa
 	var expected: float = 1.0 / (1.0 + pow(10.0, float(opponent_elo - player_elo) / 400.0))
 	return int(round(k_factor * (score - expected)))
 
-func _process_match_outcome(winner_peer_id: int) -> void :
+# Team ELO: each team's rating is its players' average at the start of the
+# match, and every player on a team gains/loses the same amount. (1v1 is just
+# teams of one, so this is the same formula as before.) In 2v2/3v3, winners who
+# were eliminated (killed or fell off) get half the gain, rounded down - so a
+# +16 win is +8 for them, and a +1 win is +0. Anyone who quit or disconnected
+# always gets the loss, even if their team went on to win.
+# `dead_list` is the host's list of eliminated players when it called the
+# result, so every client halves exactly the same players.
+func _process_match_outcome(winning_team: int, dead_list = null) -> void :
 	if is_game_over:
 		return
 	is_game_over = true
+	_show_dead_banner(false)
 
 	if is_single_player:
 		_show_match_results_screen("Practice Dummy Defeated", true, 0, local_elo, local_elo, false)
 		return
 
-	var my_id = 1 if is_host_peer else 2
-	var opponent_id = 2 if my_id == 1 else 1
-	var is_winner = (my_id == winner_peer_id)
-
-	var opponent_elo = player_elos.get(opponent_id, 1000)
-	var opponent_nick = player_nicknames.get(opponent_id, "Opponent")
+	var my_team = get_team(local_peer_id)
+	var is_winner = my_team == winning_team and not forfeited_peers.has(local_peer_id)
+	var avg = [_team_avg_elo(0), _team_avg_elo(1)]
 	var start_elo = local_elo
+	var my_change = 0
+	var my_halved = false
+	var updated: Dictionary = {}
+	var eliminated: Dictionary = {}
+	if dead_list == null:
+		eliminated = dead_peers.duplicate()
+	else:
+		for d in dead_list:
+			eliminated[int(d)] = true
 
-	var my_score = 1.0 if is_winner else 0.0
-	var my_elo_change = calculate_elo_change(local_elo, opponent_elo, my_score)
-	local_elo = clamp(local_elo + my_elo_change, 0, MAX_ELO)
+	for pid in all_player_ids():
+		var team = get_team(pid)
+		var won = team == winning_team and not forfeited_peers.has(pid)
+		var change = calculate_elo_change(avg[team], avg[1 - team], 1.0 if won else 0.0)
+		if won and team_size > 1 and eliminated.has(pid):
+			change = int(floor(change / 2.0))
+			if pid == local_peer_id:
+				my_halved = true
+		var before = local_elo if pid == local_peer_id else int(match_start_elos.get(pid, player_elos.get(pid, 1000)))
+		updated[pid] = int(clamp(before + change, 0, MAX_ELO))
+		var nick = local_nickname if pid == local_peer_id else String(player_nicknames.get(pid, "Player " + str(pid)))
+		leaderboard_data[nick] = {"elo": updated[pid]}
+		if pid == local_peer_id:
+			my_change = change
 
-	var opp_score = 0.0 if is_winner else 1.0
-	var opp_elo_change = calculate_elo_change(opponent_elo, start_elo, opp_score)
-	var updated_opp_elo = clamp(opponent_elo + opp_elo_change, 0, MAX_ELO)
-
-	leaderboard_data[local_nickname] = {"elo": local_elo}
-	leaderboard_data[opponent_nick] = {"elo": updated_opp_elo}
-	
+	local_elo = int(updated[local_peer_id])
 	_save_leaderboard_cache()
 	save_player_data()
 
 	send_p2p_packet({
-		"action": "sync_state",
-		"nicknames": player_nicknames,
-		"elos": {my_id: local_elo, opponent_id: updated_opp_elo},
+		"action": "sync_state", 
+		"nicknames": player_nicknames, 
+		"elos": updated, 
 		"leaderboard": leaderboard_data
 	})
+	_schedule_room_leave()
 
 	var banner_text = "You won the 1v1" if is_winner else "You lost the 1v1"
-	_show_match_results_screen(banner_text, is_winner, my_elo_change, start_elo, local_elo, local_elo >= MAX_ELO)
+	if team_size > 1:
+		banner_text = ("Your team won the " if is_winner else "Your team lost the ") + game_mode
+	var note = "Half ELO - you were eliminated before your team won." if my_halved else ""
+	_show_match_results_screen(banner_text, is_winner, my_change, start_elo, local_elo, local_elo >= MAX_ELO, note)
 
-func _show_match_results_screen(outcome_title: String, is_winner: bool, elo_change: int, start_elo: int, target_elo: int, hit_max_elo: bool = false) -> void :
+# Leaving a team match early: you take your team's loss right away, while
+# your teammates play on.
+func _process_forfeit_result() -> void :
+	if is_game_over:
+		return
+	is_game_over = true
+	var my_team = get_team(local_peer_id)
+	var change = calculate_elo_change(_team_avg_elo(my_team), _team_avg_elo(1 - my_team), 0.0)
+	var start_elo = local_elo
+	local_elo = int(clamp(local_elo + change, 0, MAX_ELO))
+	leaderboard_data[local_nickname] = {"elo": local_elo}
+	_save_leaderboard_cache()
+	save_player_data()
+	_schedule_room_leave()
+	_show_match_results_screen("You left the " + game_mode, false, change, start_elo, local_elo, local_elo >= MAX_ELO)
+
+func _schedule_room_leave() -> void :
+	if not is_single_player:
+		leave_room_timer = MM_CONFIRM_LINGER + 0.5
+
+func _show_match_results_screen(outcome_title: String, is_winner: bool, elo_change: int, start_elo: int, target_elo: int, hit_max_elo: bool = false, note: String = "") -> void :
 	_clear_ui()
 
 	if world_root:
 		world_root.queue_free()
 		world_root = null
+	players_container = null
 
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 
@@ -1951,6 +2892,14 @@ func _show_match_results_screen(outcome_title: String, is_winner: bool, elo_chan
 	delta_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	delta_lbl.add_theme_font_size_override("font_size", 18 if hit_max_elo else 20)
 	container.add_child(delta_lbl)
+
+	if note != "":
+		var note_lbl = Label.new()
+		note_lbl.text = note
+		note_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		note_lbl.add_theme_font_size_override("font_size", 13)
+		note_lbl.add_theme_color_override("font_color", Color(0.85, 0.85, 1.0))
+		container.add_child(note_lbl)
 
 	var rank_row = HBoxContainer.new()
 	rank_row.alignment = BoxContainer.ALIGNMENT_CENTER
@@ -2049,6 +2998,7 @@ func _clear_ui() -> void :
 		map_row_container = null
 		map_ban_header_label = null
 		map_ban_timer_label = null
+		ban_order_label = null
 	if menu_canvas:
 		menu_canvas.queue_free()
 		menu_canvas = null
@@ -2069,6 +3019,9 @@ func _clear_ui() -> void :
 		crystal_distance_label = null
 		ability_label = null
 		crosshair = null
+		team_hud_label = null
+		dead_banner_label = null
+		leave_confirm_label = null
 	if results_canvas:
 		results_canvas.queue_free()
 		results_canvas = null
@@ -2084,9 +3037,13 @@ func _forfeit_match() -> void :
 		_return_to_main_menu()
 		return
 
-	var winner_id = 2 if is_host_peer else 1
-	send_p2p_packet({"action": "match_outcome", "winner_peer_id": winner_id})
-	_process_match_outcome(winner_id)
+	send_p2p_packet({"action": "player_forfeit"})
+	forfeited_peers[local_peer_id] = true
+	if team_size == 1:
+		# 1v1: leaving hands the win straight to the opponent.
+		_process_match_outcome(1 - get_team(local_peer_id))
+	else:
+		_process_forfeit_result()
 
 func _return_to_main_menu(error_msg: String = "") -> void :
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
@@ -2094,6 +3051,7 @@ func _return_to_main_menu(error_msg: String = "") -> void :
 	if world_root:
 		world_root.queue_free()
 		world_root = null
+	players_container = null
 	_build_main_menu()
 
 
@@ -2389,12 +3347,10 @@ func _spawn_player(peer_id: int) -> void :
 	var player = NetworkPlayer.new(peer_id, self)
 	player.name = str(peer_id)
 
-	if peer_id == 1:
-		player.position = Vector3(-15, 1, 0)
-		player.rotation_degrees.y = -90
-	else:
-		player.position = Vector3(15, 1, 0)
-		player.rotation_degrees.y = 90
+	# Blue team on the west side facing east, Red team on the east facing west.
+	player.position = _spawn_point(peer_id)
+	player.rotation_degrees.y = -90 if get_team(peer_id) == 0 else 90
+	player.spawn_position = player.position
 
 	players_container.add_child(player)
 
@@ -2403,6 +3359,7 @@ func _spawn_test_dummy(peer_id: int) -> void :
 	dummy.name = str(peer_id)
 	dummy.position = Vector3(15, 1, 0)
 	dummy.rotation_degrees.y = 90
+	dummy.spawn_position = dummy.position
 	dummy.is_dummy = true
 	players_container.add_child(dummy)
 	player_nicknames[peer_id] = "Test Dummy"
@@ -2551,6 +3508,7 @@ class MapLadder extends Area3D:
 		height = h
 
 	func _ready() -> void:
+		collision_mask = 1 | 2 # living players and ghosts (dead teammates roaming)
 		# Climb zone: in front of the wall, reaching a little above the top so
 		# the player's feet clear the edge before the climb ends.
 		var zone_h = height + 0.25
@@ -2601,6 +3559,7 @@ class MapPortal extends Area3D:
 		dest_pos = target
 
 	func _ready() -> void:
+		collision_mask = 1 | 2 # living players and ghosts (dead teammates roaming)
 		var col = CollisionShape3D.new()
 		var box = BoxShape3D.new()
 		box.size = Vector3(2.5, 3.5, 0.5)
@@ -2643,6 +3602,7 @@ class MapJumpPad extends Area3D:
 		force = boost_force
 
 	func _ready() -> void:
+		collision_mask = 1 | 2 # living players and ghosts (dead teammates roaming)
 		var col = CollisionShape3D.new()
 		var box = BoxShape3D.new()
 		box.size = Vector3(3.0, 0.5, 3.0)
@@ -2752,6 +3712,11 @@ class NetworkPlayer extends CharacterBody3D:
 
 	var is_dummy: bool = false
 	var is_movement_locked: bool = false
+	var lock_sources: Dictionary = {} # attacker peer_id -> true while their QTE holds us
+	var team: int = 0
+	var is_dead: bool = false
+	var spawn_position: Vector3 = Vector3.ZERO
+	var qte_target_peer: int = -1
 	var mouse_sensitivity: float = 0.003
 	var walk_speed: float = 8.0
 	var sprint_speed: float = 14.0
@@ -2814,16 +3779,80 @@ class NetworkPlayer extends CharacterBody3D:
 		ability_tag.visible = text != ""
 
 	func set_movement_lock(locked: bool) -> void :
+		lock_sources.clear()
 		is_movement_locked = locked
 		lock_failsafe_timer = MOVEMENT_LOCK_FAILSAFE if locked else 0.0
+
+	# Several enemies can hold you at once in team modes; you're free again
+	# once every one of their QTEs has ended.
+	func add_movement_lock(source: int) -> void :
+		lock_sources[source] = true
+		is_movement_locked = true
+		lock_failsafe_timer = MOVEMENT_LOCK_FAILSAFE
+
+	func remove_movement_lock(source: int) -> void :
+		lock_sources.erase(source)
+		if lock_sources.is_empty():
+			is_movement_locked = false
+			lock_failsafe_timer = 0.0
 
 	func is_local_player() -> bool:
 		if is_dummy:
 			return false
-		var local_id = 1 if main_manager.is_host_peer else 2
-		return peer_id == local_id
+		return peer_id == main_manager.local_peer_id
+
+	# Eliminated: invisible to everyone, can't be hit or block anyone, but the
+	# local player can still walk, jump and climb around the map.
+	func set_dead_state() -> void :
+		if is_dead:
+			return
+		is_dead = true
+		health = 0
+		_cancel_own_qte()
+		lock_sources.clear()
+		is_movement_locked = false
+		is_launching = false
+		set_highlight(false)
+		if targeted_opponent:
+			targeted_opponent.set_highlight(false)
+			targeted_opponent = null
+		if mesh_inst:
+			mesh_inst.visible = false
+		for lbl in [name_label, hussing_label, ability_tag, get_node_or_null("HPLabel")]:
+			if lbl:
+				lbl.visible = false
+		# Layer 2 = ghost: living players (mask 1) pass through us and their
+		# targeting rays ignore us; we still stand on the world.
+		collision_layer = 2
+		var parent = get_parent()
+		if parent:
+			for other in parent.get_children():
+				if other != self and other is PhysicsBody3D:
+					add_collision_exception_with(other)
+
+	func _cancel_own_qte() -> void :
+		if not qte_active:
+			return
+		qte_active = false
+		qte_target_peer = -1
+		if not is_local_player():
+			return
+		main_manager.is_qte_in_progress = false
+		if qte_canvas:
+			qte_canvas.queue_free()
+			qte_canvas = null
+		if targeted_opponent:
+			targeted_opponent.is_movement_locked = false
+			if not main_manager.is_single_player:
+				main_manager.send_p2p_packet({
+					"action": "qte_end", 
+					"attacker": str(peer_id), 
+					"target": str(targeted_opponent.peer_id)
+				})
 
 	func _ready() -> void :
+		if main_manager:
+			team = main_manager.get_team(peer_id)
 		if main_manager and main_manager.selected_map_data:
 			var mech = main_manager.selected_map_data.get("mechanic", "")
 			if mech == "low_gravity":
@@ -2842,6 +3871,9 @@ class NetworkPlayer extends CharacterBody3D:
 		base_material = StandardMaterial3D.new()
 		if is_dummy:
 			base_material.albedo_color = Color(0.6, 0.6, 0.6)
+		elif main_manager.team_size > 1 and not main_manager.is_single_player:
+			var team_col: Color = main_manager.TEAM_COLORS[team]
+			base_material.albedo_color = team_col.lerp(Color(randf(), randf(), randf()), 0.15)
 		else:
 			base_material.albedo_color = Color(randf(), randf(), randf())
 
@@ -2906,7 +3938,11 @@ class NetworkPlayer extends CharacterBody3D:
 	func update_nametag(nickname: String, elo: int) -> void :
 		if name_label and main_manager and not is_dummy:
 			var rank_title = main_manager.get_rank_name(elo)
-			name_label.text = "[" + rank_title + "] " + nickname
+			var prefix = ""
+			if main_manager.team_size > 1 and not main_manager.is_single_player:
+				prefix = "[" + main_manager.TEAM_NAMES[team] + "] "
+				name_label.modulate = (main_manager.TEAM_COLORS[team] as Color).lerp(Color.WHITE, 0.35)
+			name_label.text = prefix + "[" + rank_title + "] " + nickname
 
 	func _build_health_label() -> void :
 		var hp_label = Label3D.new()
@@ -2934,16 +3970,13 @@ class NetworkPlayer extends CharacterBody3D:
 			main_manager.update_local_hud_hp(health)
 
 	func apply_damage(amount: int) -> void :
+		if is_dead:
+			return
 		health = max(0, health - amount)
 		_update_health_display()
 
 		if health <= 0:
-			if main_manager.is_single_player:
-				main_manager._process_match_outcome(1)
-			elif main_manager.is_host_peer:
-				var winner_id = 1 if peer_id != 1 else 2
-				main_manager.send_p2p_packet({"action": "match_outcome", "winner_peer_id": winner_id})
-				main_manager._process_match_outcome(winner_id)
+			main_manager.on_player_killed(self)
 
 	func _unhandled_input(event: InputEvent) -> void :
 		if not is_local_player() or is_dummy or is_movement_locked:
@@ -2959,11 +3992,24 @@ class NetworkPlayer extends CharacterBody3D:
 		_update_health_display()
 
 		if global_position.y < FALL_BOUNDARY_Y:
-			if is_local_player():
-				main_manager.log_console("[Match] You fell off the map!")
-				main_manager._forfeit_match()
-			elif is_dummy:
+			if is_dummy:
 				apply_damage(100)
+			elif is_local_player():
+				if is_dead:
+					# Ghosts can't die twice - just send them home.
+					global_position = spawn_position
+					velocity = Vector3.ZERO
+					main_manager.log_console("[Match] You fell off the map - back to your spawn.")
+					_send_p2p_position()
+				else:
+					main_manager.log_console("[Match] You fell off the map!")
+					main_manager.kill_local_player_from_fall()
+					if is_dead and main_manager.team_size > 1:
+						# 2v2/3v3: you're out but your team plays on - roam
+						# invisibly from your spawn.
+						global_position = spawn_position
+						velocity = Vector3.ZERO
+						_send_p2p_position()
 			return
 
 		if is_dummy:
@@ -2973,10 +4019,16 @@ class NetworkPlayer extends CharacterBody3D:
 		if not is_local_player():
 			return
 
+		# Your own QTE keeps running even if an enemy grabs you mid-attack.
+		if qte_active:
+			_process_qte(delta)
+			return
+
 		if is_movement_locked:
 			# Failsafe: never stay frozen forever if the unlock packet is lost.
 			lock_failsafe_timer -= delta
 			if lock_failsafe_timer <= 0.0:
+				lock_sources.clear()
 				is_movement_locked = false
 				main_manager.log_console("[Combat] Movement lock expired.")
 			velocity.x = 0
@@ -2999,19 +4051,16 @@ class NetworkPlayer extends CharacterBody3D:
 				is_launching = false
 			return
 
-		if qte_active:
-			_process_qte(delta)
-			return
-
 		if Input.is_key_pressed(KEY_TAB):
 			Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 		elif Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
 			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 
-		_detect_and_highlight_opponents()
+		if not is_dead:
+			_detect_and_highlight_opponents()
 
-		if Input.is_key_pressed(KEY_E) and targeted_opponent and not main_manager.combat_cooldown_active and not main_manager.is_qte_in_progress:
-			_start_qte()
+			if Input.is_key_pressed(KEY_E) and targeted_opponent and not main_manager.combat_cooldown_active and not main_manager.is_qte_in_progress:
+				_start_qte()
 
 		if not is_on_floor():
 			velocity.y -= 20.0 * gravity_mult * delta
@@ -3210,6 +4259,7 @@ class NetworkPlayer extends CharacterBody3D:
 		var space_state = get_world_3d().direct_space_state
 		var query = PhysicsRayQueryParameters3D.create(camera.global_position, target_pos)
 		query.exclude = [self.get_rid()]
+		query.collision_mask = 1 # world + living players (ghosts are on layer 2)
 
 		var result = space_state.intersect_ray(query)
 		if result and result.get("collider") == target:
@@ -3226,7 +4276,7 @@ class NetworkPlayer extends CharacterBody3D:
 		var min_distance: float = 6.0
 
 		for child in players_container.get_children():
-			if child is NetworkPlayer and child != self:
+			if child is NetworkPlayer and child != self and not child.is_dead and not main_manager.is_teammate(child.peer_id, peer_id):
 				var dist = global_position.distance_to(child.global_position)
 				if dist < min_distance and is_in_camera_vision(child):
 					min_distance = dist
@@ -3247,7 +4297,9 @@ class NetworkPlayer extends CharacterBody3D:
 
 	func trigger_repulse_clash(opp: NetworkPlayer) -> void:
 		qte_active = false
+		qte_target_peer = -1
 		main_manager.is_qte_in_progress = false
+		lock_sources.clear()
 		is_movement_locked = false
 
 		if qte_canvas:
@@ -3275,14 +4327,17 @@ class NetworkPlayer extends CharacterBody3D:
 		main_manager.log_console("[Combat] Simultaneous attack clash! Both players repelled!")
 
 	func _start_qte() -> void :
-		if targeted_opponent and targeted_opponent.qte_active:
+		# Clash only when the two players are attacking EACH OTHER (in team modes
+		# the target may be busy attacking someone else).
+		if targeted_opponent and targeted_opponent.qte_active and targeted_opponent.qte_target_peer == peer_id:
 			trigger_repulse_clash(targeted_opponent)
 			targeted_opponent.trigger_repulse_clash(self)
 			if not main_manager.is_single_player:
-				main_manager.send_p2p_packet({"action": "trigger_clash"})
+				main_manager.send_p2p_packet({"action": "trigger_clash", "a": peer_id, "b": targeted_opponent.peer_id})
 			return
 
 		qte_active = true
+		qte_target_peer = targeted_opponent.peer_id if targeted_opponent else -1
 		qte_delay_timer = 0.35
 		qte_e_released = false
 		qte_progress = 0.0
@@ -3363,6 +4418,7 @@ class NetworkPlayer extends CharacterBody3D:
 
 	func _evaluate_qte() -> void :
 		qte_active = false
+		qte_target_peer = -1
 		main_manager.is_qte_in_progress = false
 
 		if qte_canvas:
@@ -3387,7 +4443,9 @@ class NetworkPlayer extends CharacterBody3D:
 			if main_manager.local_ability == "double_damage":
 				main_manager.consume_local_ability("used")
 
-		if hit:
+		if hit and targeted_opponent and targeted_opponent.is_dead:
+			main_manager.log_console("[Combat] Too late - they were already eliminated.")
+		elif hit:
 			if targeted_opponent:
 				is_launching = true
 				launch_timer = 0.45
