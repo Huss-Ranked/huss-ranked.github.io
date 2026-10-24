@@ -4,9 +4,9 @@
 // Incrementing CACHE_VERSION will kick off the install event and force
 // previously cached resources to be updated from the network.
 /** @type {string} */
-const CACHE_VERSION = '1792812579|14439246';
+const CACHE_VERSION = '1792869192|48453686';
 /** @type {string} */
-const CACHE_PREFIX = 'Huss Ranked [BUG-sw-cache-';
+const CACHE_PREFIX = 'Huss Ranked [2v2-sw-cache-';
 const CACHE_NAME = CACHE_PREFIX + CACHE_VERSION;
 /** @type {string} */
 const OFFLINE_URL = 'hussranked.offline.html';
