@@ -77,6 +77,51 @@ var lb_ui_dirty: bool = false
 var lb_ui_timer: float = 0.0
 var menu_online_label: Label = null
 var leaderboard_list: VBoxContainer = null
+
+# --- SOCIAL (challenges + parties) ---
+const CHALLENGE_IS_RANKED: bool = true
+const SOCIAL_REQUEST_TIMEOUT_MS: int = 20000
+const SOCIAL_LINGER: float = 1.5
+const PARTY_MAX: int = 5
+const PARTY_PRUNE_MS: int = 600000 # drop a party member nobody has heard from in 10 min
+const PARTY_LOBBY_WAIT_MS: int = 20000
+var challenge_out: Dictionary = {} # {cid, to, nick, ms}
+var challenge_in: Array = [] # [{cid, from, nick, ms}]
+var party_id: String = ""
+var party_leader: String = ""
+var party_members: Array = [] # [[trystero id, nick], ...]
+var party_joining: String = ""
+var party_joining_ms: int = 0
+var party_invites_in: Array = [] # [{pid, from, nick, size, ms}]
+var party_invites_out: Dictionary = {} # trystero id -> ms
+var party_leader_heard_ms: int = 0
+var party_ver: int = 0 # bumped on every membership change, so late/stale updates are ignored
+var party_queued: bool = false # queueing together with our party
+var party_lobby_missing_since: int = 0
+var party_lobby_seen: Dictionary = {}
+var social_status: String = ""
+var social_dirty: bool = false
+var social_ui_timer: float = 0.0
+var social_linger: Dictionary = {} # waiting a moment before switching rooms
+var popup_canvas: CanvasLayer = null
+var popup_key: String = ""
+var popup_sub_label: Label = null
+# Party codes: a 6-digit code the whole party can share; anyone on the main
+# menu can type it in to join without an invite.
+const PARTY_CODE_WAIT_MS: int = 6000
+var party_code: String = ""
+var party_code_joining: String = ""
+var party_code_join_ms: int = 0
+var party_code_joined: String = ""
+var party_code_input: LineEdit = null
+var party_panel_sig: String = ""
+var lb_list_sig: String = ""
+var party_panel_box: VBoxContainer = null
+var party_panel_w: float = 265.0
+var lb_status_label: Label = null
+var mm_custom_match: bool = false # a challenge (not from the queue)
+var mm_lobby_party: Dictionary = {} # lobby peer id -> [party id, party size]
+var mm_peer_party: Dictionary = {} # match peer_id -> party id (for team assignment)
 var mm_self_id: String = ""
 var mm_lobby_peers: Dictionary = {} # trystero id -> "searching" / "busy" / "unknown"
 var mm_skip_until: Dictionary = {} # trystero id -> ticks_msec until we can invite them again
@@ -313,6 +358,43 @@ const SAVE_PATH: String = "user://player_data.json"
 const LEADERBOARD_CACHE_PATH: String = "user://leaderboard_cache.json"
 
 var local_nickname: String = "Player"
+# --- CHARACTER COLOR ---
+# Picked on the main menu (a preset or any hex code), saved with your profile,
+# and sent to the other players so everyone sees the same color.
+const COLOR_PRESETS: Array = [
+	["Red", "e53935"], ["Orange", "fb8c00"], ["Yellow", "fdd835"],
+	["Green", "43a047"], ["Blue", "1e88e5"], ["Purple", "8e24aa"],
+	["Brown", "795548"], ["Black", "111111"], ["Pink", "f06292"],
+]
+var local_color_hex: String = ""
+var player_colors: Dictionary = {} # peer_id -> "rrggbb"
+var color_canvas: CanvasLayer = null
+var color_preview: Panel = null
+var color_hex_input: LineEdit = null
+var color_status_label: Label = null
+var color_current_label: Label = null
+var color_field: Control = null
+# --- CONTROLS: PC or MOBILE (touch) ---
+# Picked on the main menu and saved. Mobile shows on-screen controls (joystick,
+# SPRINT toggle, HUSS = E, JUMP, Q when lunge is active, LEAVE), hides the
+# console, lets you drag anywhere else on the screen to look around, and adds
+# aim assist that pulls the camera toward a nearby opponent.
+const MOBILE_LOOK_SENSITIVITY: float = 0.006
+const AIM_ASSIST_RANGE: float = 12.0
+const AIM_ASSIST_CONE_DEG: float = 40.0
+const AIM_ASSIST_STRENGTH: float = 4.0
+var mobile_controls: bool = false
+var mobile_ui: Control = null
+var console_panel: Control = null
+var mobile_move: Vector2 = Vector2.ZERO
+var mobile_jump_held: bool = false
+var mobile_e_held: bool = false
+var mobile_q_held: bool = false
+var mobile_sprint_on: bool = false
+# Dead players can fly (look where you want to go, hold W; Shift = faster).
+const GHOST_FLY_MAX_HEIGHT: float = 60.0
+const GHOST_FAST_MULT: float = 2.0 # Shift while flying: 2x sprint speed (28)
+const GHOSTS_FLY_IN_FFA: bool = true
 var local_elo: int = 0
 var pre_match_elo: int = 0
 const MAX_ELO: int = 2100
@@ -361,6 +443,25 @@ const TITLE_CARD_PATH: String = "res://CARD.png"
 const SPRITE_SHEET_PATH_PNG: String = "res://rank_icons.png"
 const SPRITE_SHEET_PATH_JPG: String = "res://rank_icons.jpg"
 var loaded_sheet_texture: Texture2D = null
+# Where each rank icon sits on rank_icons.png (7 columns = ranks, 3 rows =
+# tiers 1-3), as fractions of the sheet's size: the top-left corner of a crop
+# that is the same size for every icon and centered on the icon, so all ranks
+# line up and none of the text above / below an icon is shown.
+const RANK_ICON_CROPS: Array = [
+	Vector2(0.02051, 0.20015), Vector2(0.02051, 0.42302), Vector2(0.02051, 0.65543),
+	Vector2(0.16162, 0.20381), Vector2(0.16064, 0.42522), Vector2(0.16016, 0.65762),
+	Vector2(0.30371, 0.20161), Vector2(0.30322, 0.42375), Vector2(0.30322, 0.65543),
+	Vector2(0.44531, 0.20381), Vector2(0.44482, 0.42669), Vector2(0.44434, 0.65836),
+	Vector2(0.59033, 0.20601), Vector2(0.59033, 0.42815), Vector2(0.59082, 0.66129),
+	Vector2(0.73340, 0.20674), Vector2(0.73340, 0.43035), Vector2(0.73340, 0.66496),
+	Vector2(0.87109, 0.20161), Vector2(0.87109, 0.42522), Vector2(0.87012, 0.65762),
+]
+const RANK_ICON_CROP_SIZE: Vector2 = Vector2(0.11328, 0.15836)
+const RANK_COUNT: int = 21
+const RANK_FAMILY_COLORS: Array = [Color(0.86, 0.78, 0.68), Color(0.45, 0.85, 0.42), Color(1.0, 0.58, 0.22), Color(0.4, 0.65, 1.0), Color(0.7, 0.5, 1.0), Color(0.95, 0.95, 0.95), Color(0.5, 0.82, 1.0)]
+var rank_tex_cache: Dictionary = {}
+var rank_panel_w: float = 240.0
+var rank_panel_box: VBoxContainer = null
 
 # --- JAVASCRIPT CALLBACK REFERENCES ---
 var js_on_peer_join_cb: JavaScriptObject
@@ -428,19 +529,28 @@ func reset_combat_cooldown() -> void :
 
 func _unhandled_input(_event: InputEvent) -> void :
 	if Input.is_action_just_pressed("ui_cancel"):
-		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
-		if is_match_active and not is_game_over:
-			# In 2v2/3v3 leaving hurts your team and is easy to do by accident
-			# (browsers use Esc to release the mouse), so it takes two presses.
-			if (team_size > 1 or is_ffa) and not is_single_player and _now_ms() - leave_confirm_ms > LEAVE_CONFIRM_MS:
-				leave_confirm_ms = _now_ms()
-				if leave_confirm_label:
-					leave_confirm_label.visible = true
-				log_console("[Match] Press Esc again within 3s to leave the match (counts as a loss).")
-				return
-			_forfeit_match()
-		else:
-			_return_to_main_menu()
+		_on_leave_requested()
+
+# Esc on PC, the LEAVE button on mobile.
+func _on_leave_requested() -> void :
+	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+	if is_match_active and not is_game_over:
+		# In 2v2/3v3/FFA leaving hurts and is easy to do by accident (browsers
+		# use Esc to release the mouse), and on mobile a stray tap is even
+		# easier - so those take two presses.
+		var ranked_team = (team_size > 1 or is_ffa) and not is_single_player
+		if (ranked_team or mobile_controls) and _now_ms() - leave_confirm_ms > LEAVE_CONFIRM_MS:
+			leave_confirm_ms = _now_ms()
+			var what = "Tap LEAVE" if mobile_controls else "Press Esc"
+			var cost = "" if is_single_player else " (counts as a loss)"
+			if leave_confirm_label:
+				leave_confirm_label.text = what + " again to leave the match" + cost
+				leave_confirm_label.visible = true
+			log_console("[Match] " + what + " again within 3s to leave the match" + cost + ".")
+			return
+		_forfeit_match()
+	else:
+		_return_to_main_menu()
 
 
 func _init_trystero_bridge() -> void :
@@ -557,6 +667,8 @@ func _send_register() -> void :
 		"peer_id": local_peer_id, 
 		"nickname": local_nickname, 
 		"elo": local_elo, 
+		"color": local_color_hex, 
+		"party": party_id if party_queued and _in_party() else "", 
 		"leaderboard": leaderboard_data
 	})
 
@@ -580,16 +692,7 @@ func _host_try_setup() -> void :
 		if not player_nicknames.has(pid):
 			return
 
-	# Snake draft by ELO: 1v1 A B, 2v2 A B B A, 3v3 A B B A A B.
-	var order: Array = range(1, n + 1)
-	order.sort_custom(_sort_by_elo_desc)
-	var pattern = [0, 1, 1, 0, 0, 1]
-	var teams: Dictionary = {}
-	for i in range(n):
-		teams[order[i]] = pattern[i]
-	if is_ffa:
-		for pid in range(1, n + 1):
-			teams[pid] = pid - 1
+	var teams: Dictionary = _assign_teams(n)
 
 	var indices: Array = range(map_pool.size())
 	indices.shuffle()
@@ -600,11 +703,67 @@ func _host_try_setup() -> void :
 		"teams": teams, 
 		"map_indices": picked, 
 		"nicknames": player_nicknames.duplicate(), 
-		"elos": player_elos.duplicate()
+		"elos": player_elos.duplicate(), 
+		"colors": player_colors.duplicate()
 	}
 	last_setup_packet = setup.duplicate(true)
 	send_p2p_packet(setup.duplicate(true))
 	_apply_match_setup(setup)
+
+# Splits players into two teams as evenly by ELO as possible, keeping each
+# party (that queued together) on one team. FFA: everyone on their own.
+func _assign_teams(n: int) -> Dictionary:
+	var teams: Dictionary = {}
+	if is_ffa:
+		for pid in range(1, n + 1):
+			teams[pid] = pid - 1
+		return teams
+	var units: Array = []
+	var by_party: Dictionary = {}
+	for pid in range(1, n + 1):
+		var pt = String(mm_peer_party.get(pid, ""))
+		if pt == "":
+			units.append([pid])
+		elif by_party.has(pt):
+			by_party[pt].append(pid)
+		else:
+			var u: Array = [pid]
+			by_party[pt] = u
+			units.append(u)
+	var best_mask = -1
+	var best_diff = INF
+	for mask in range(1 << units.size()):
+		if mask & 1:
+			continue # the unit with peer 1 stays on Blue (skips mirror copies)
+		var size0 = 0
+		var elo0 = 0
+		var elo1 = 0
+		for i in range(units.size()):
+			for pid in units[i]:
+				var e = int(player_elos.get(pid, 0))
+				if mask & (1 << i):
+					elo1 += e
+				else:
+					size0 += 1
+					elo0 += e
+		if size0 != team_size:
+			continue
+		var diff = abs(elo0 - elo1)
+		if diff < best_diff:
+			best_diff = diff
+			best_mask = mask
+	if best_mask < 0:
+		# Shouldn't happen (party sizes are checked when queueing): snake draft.
+		var order: Array = range(1, n + 1)
+		order.sort_custom(_sort_by_elo_desc)
+		var pattern = [0, 1, 1, 0, 0, 1]
+		for i in range(n):
+			teams[order[i]] = pattern[i]
+		return teams
+	for i in range(units.size()):
+		for pid in units[i]:
+			teams[pid] = 1 if best_mask & (1 << i) else 0
+	return teams
 
 func _apply_match_setup(data: Dictionary) -> void :
 	if match_setup_done:
@@ -621,8 +780,13 @@ func _apply_match_setup(data: Dictionary) -> void :
 	var elos = data.get("elos", {})
 	for k in elos:
 		player_elos[int(k)] = int(elos[k])
+	var cols = data.get("colors", {})
+	for k in cols:
+		if Color.html_is_valid(String(cols[k])):
+			player_colors[int(k)] = String(cols[k])
 	player_nicknames[local_peer_id] = local_nickname
 	player_elos[local_peer_id] = local_elo
+	player_colors[local_peer_id] = local_color_hex
 
 	current_3_maps.clear()
 	for i in data.get("map_indices", []):
@@ -681,6 +845,9 @@ func _on_room_member_gone(peer_id_str: String) -> void :
 	var pid = _peer_id_of(peer_id_str)
 	var nick = String(player_nicknames.get(pid, "A player"))
 	if not match_setup_done:
+		if mm_custom_match:
+			_return_to_main_menu(nick + " left before the challenge started.")
+			return
 		log_console("[Matchmaking] " + nick + " dropped before the match started. Back to the queue...")
 		_mm_skip(peer_id_str)
 		_mm_enter_lobby()
@@ -748,9 +915,13 @@ func _handle_incoming_p2p_packet(data: Dictionary) -> void :
 			var elo = int(data.get("elo", 0))
 			player_nicknames[sender_pid] = nick
 			player_elos[sender_pid] = elo
+			if Color.html_is_valid(String(data.get("color", ""))):
+				player_colors[sender_pid] = String(data.get("color", ""))
+			mm_peer_party[sender_pid] = String(data.get("party", ""))
 
 			_lb_merge(data.get("leaderboard", {}))
 			_lb_set(nick, elo)
+			_lb_mark_seen(nick)
 			_save_leaderboard_cache()
 
 			if is_host_peer:
@@ -1014,6 +1185,8 @@ func _receive_packet(data: Dictionary, raw: String) -> void :
 			return
 		seen_mids[mid] = _now_ms()
 	last_heard[orig] = _now_ms()
+	if orig == party_leader:
+		party_leader_heard_ms = _now_ms()
 
 	if data.has("links"):
 		var links: Array = []
@@ -1079,6 +1252,9 @@ func _room_tick(dt: float, now: int) -> void :
 				if tid != mm_self_id and not mm_room_joined.has(tid):
 					_mm_skip(tid)
 					missing += 1
+			if mm_custom_match:
+				_return_to_main_menu("Your opponent didn't connect, so the challenge was cancelled.")
+				return
 			log_console("[Matchmaking] " + str(missing) + " player(s) never connected, returning to queue...")
 			_mm_enter_lobby()
 
@@ -1127,6 +1303,8 @@ func _mm_enter_lobby() -> void :
 	mm_hello_timer = 0.0
 	mm_leader_wait_timer = 0.0
 	ffa_wait_timer = -1.0
+	mm_lobby_party.clear()
+	mm_custom_match = false
 	_mm_clear_pending()
 	_update_waiting_label()
 	_switch_room(_mm_lobby_code())
@@ -1138,6 +1316,8 @@ func _update_waiting_label() -> void :
 	if mm_phase == "lobby":
 		if mm_linger_room != "":
 			waiting_opponent_label.text = "Match found! Connecting..."
+		elif party_queued and _in_party() and not _mm_units(_mm_searching_peers()).has(_mm_my_unit()):
+			waiting_opponent_label.text = "Waiting for your party to join the queue..."
 		else:
 			var queued = 1
 			for lp in mm_lobby_peers:
@@ -1148,6 +1328,8 @@ func _update_waiting_label() -> void :
 				waiting_opponent_label.text = "Free For All: " + str(_mm_searching_peers().size() + 1) + " players queued - starting in " + str(left) + "s (or as soon as " + str(_mm_max_players()) + " are in)"
 			else:
 				waiting_opponent_label.text = "Searching for " + mode_label + "... (" + str(queued) + " in queue, " + str(_mm_min_players()) + " needed)"
+				if party_queued and _in_party():
+					waiting_opponent_label.text += " - with your party of " + str(party_members.size())
 		waiting_opponent_label.visible = true
 	elif mm_phase == "match" and not match_setup_done:
 		waiting_opponent_label.text = "Match found! Connecting players (" + str(mm_room_joined.size() + 1) + "/" + str(mm_roster.size()) + ")..."
@@ -1161,6 +1343,9 @@ func _mm_status() -> String:
 
 func _mm_send_hello(to: String = "") -> void :
 	var pkt = {"action": "mm_hello", "status": _mm_status(), "links": direct_peers.keys()}
+	if party_queued and _in_party():
+		pkt["party"] = party_id
+		pkt["psize"] = party_members.size()
 	if to != "":
 		pkt["to"] = to
 	send_p2p_packet(pkt)
@@ -1207,6 +1392,32 @@ func _mm_tick(delta: float) -> void :
 	if _get_self_trystero_id() == "":
 		return
 
+	# Queueing as a party: if someone in the party never shows up in the lobby
+	# (or leaves it), go back to the menu together instead of waiting forever.
+	if party_queued and _in_party():
+		var all_here = true
+		var left_after_joining = false
+		for pm in _party_ids():
+			if pm == mm_self_id:
+				continue
+			if mm_lobby_peers.has(pm):
+				if mm_lobby_peers[pm] != "unknown":
+					party_lobby_seen[pm] = true
+			else:
+				all_here = false
+				if party_lobby_seen.has(pm):
+					left_after_joining = true
+		# Someone who was here and left gets a short grace period (a dropped
+		# link); someone who hasn't arrived yet gets longer (slow connection).
+		var limit = 6000 if left_after_joining else PARTY_LOBBY_WAIT_MS
+		if all_here:
+			party_lobby_missing_since = 0
+		elif party_lobby_missing_since == 0:
+			party_lobby_missing_since = _now_ms()
+		elif _now_ms() - party_lobby_missing_since > limit:
+			_return_to_main_menu("Someone in your party left the queue (or never got into it), so your party went back to the menu.")
+			return
+
 	mm_hello_timer -= delta
 	if mm_hello_timer <= 0.0:
 		mm_hello_timer = MM_HELLO_INTERVAL
@@ -1241,14 +1452,115 @@ func _mm_tick(delta: float) -> void :
 
 	_mm_try_lead(delta)
 
+# Groups are built from "units": a party queueing together (only once all of
+# its members are in the lobby) or a solo player. Units are never split.
+func _mm_my_unit() -> Array:
+	if party_queued and _in_party():
+		var ids = _party_ids()
+		ids.sort()
+		return ids
+	return [mm_self_id]
+
+func _mm_units(pool: Array) -> Array:
+	var units: Array = []
+	var parties: Dictionary = {}
+	var psizes: Dictionary = {}
+	var everyone: Array = pool.duplicate()
+	everyone.append(mm_self_id)
+	for p in everyone:
+		var info = mm_lobby_party.get(p, ["", 1])
+		if p == mm_self_id:
+			info = [party_id, party_members.size()] if party_queued and _in_party() else ["", 1]
+		var pt = String(info[0])
+		if pt == "" or int(info[1]) <= 1:
+			units.append([p])
+		else:
+			if not parties.has(pt):
+				parties[pt] = []
+			parties[pt].append(p)
+			psizes[pt] = int(info[1])
+	for pt in parties:
+		if parties[pt].size() == psizes[pt]: # complete parties only
+			var u: Array = parties[pt]
+			u.sort()
+			units.append(u)
+	units.sort_custom(func(x, y): return String(x[0]) < String(y[0]))
+	return units
+
+func _mm_unit_sum(units: Array) -> int:
+	var n = 0
+	for u in units:
+		n += u.size()
+	return n
+
+# Can these unit sizes be split into two teams of exactly `team` players?
+func _mm_splittable(sizes: Array, team: int) -> bool:
+	var reach: Dictionary = {0: true}
+	for sz in sizes:
+		if sz > team:
+			return false
+		var next: Dictionary = reach.duplicate()
+		for r in reach:
+			if int(r) + sz <= team:
+				next[int(r) + sz] = true
+		reach = next
+	return reach.has(team)
+
+# Picks our group: our own unit plus other units (lowest IDs first), never
+# splitting a party. 2v2/3v3 need exactly 2 x team_size players that divide
+# into two full teams; 1v1/FFA take as many as fit (at least the minimum).
+func _mm_pick_group(units: Array, my_unit: Array, min_n: int, max_n: int) -> Array:
+	var team_mode = team_size > 1 and not is_ffa
+	var others: Array = []
+	for u in units:
+		if u != my_unit:
+			others.append(u)
+	var best: Array = []
+	var best_total = 0
+	var stack: Array = [[0, [my_unit], my_unit.size()]]
+	var steps = 0
+	while not stack.is_empty() and steps < 5000:
+		steps += 1
+		var st = stack.pop_back()
+		var idx: int = st[0]
+		var chosen: Array = st[1]
+		var total: int = st[2]
+		var usable = total >= min_n and total > best_total
+		if usable and team_mode:
+			var sizes: Array = []
+			for u in chosen:
+				sizes.append(u.size())
+			usable = total == max_n and _mm_splittable(sizes, team_size)
+		if usable:
+			best = chosen
+			best_total = total
+			if total == max_n:
+				break
+		if total == max_n:
+			continue
+		for i in range(others.size() - 1, idx - 1, -1):
+			var u2: Array = others[i]
+			if total + u2.size() <= max_n and (not team_mode or u2.size() <= team_size):
+				var nc = chosen.duplicate()
+				nc.append(u2)
+				stack.append([i + 1, nc, total + u2.size()])
+	var flat: Array = []
+	for u in best:
+		flat.append_array(u)
+	return flat
+
 func _mm_try_lead(delta: float) -> void :
 	var min_n = _mm_min_players()
 	var max_n = _mm_max_players()
 	var pool = _mm_searching_peers()
-	var count = pool.size() + 1
-	if count < min_n:
+	var units = _mm_units(pool)
+	var my_unit = _mm_my_unit()
+	var mine_ready = units.has(my_unit)
+	var count = _mm_unit_sum(units)
+	if count < min_n or not mine_ready:
 		mm_leader_wait_timer = 0.0
-		ffa_wait_timer = -1.0
+		if count < min_n:
+			ffa_wait_timer = -1.0
 		return
 	if count < max_n:
 		# Free For All: enough players to start, but wait up to 30s for more.
@@ -1259,16 +1571,16 @@ func _mm_try_lead(delta: float) -> void :
 		if ffa_wait_timer < FFA_WAIT_SECONDS:
 			mm_leader_wait_timer = 0.0
 			return
-	var n = min(count, max_n)
 
-	# The lowest-ID searching player leads, unless they were unresponsive when
-	# it was their turn (frozen tab etc.) - then the next one leads, and they
-	# can still be invited.
+	# The lowest-ID player among the ready units leads, unless they were
+	# unresponsive when it was their turn (frozen tab etc.) - then the next one
+	# leads, and they can still be invited.
 	var now = _now_ms()
 	var leaders: Array = [mm_self_id]
-	for p in pool:
-		if not (mm_no_lead_until.has(p) and now < int(mm_no_lead_until[p])):
-			leaders.append(p)
+	for u in units:
+		for p in u:
+			if p != mm_self_id and not (mm_no_lead_until.has(p) and now < int(mm_no_lead_until[p])):
+				leaders.append(p)
 	leaders.sort()
 	if leaders[0] != mm_self_id:
 		mm_leader_wait_timer += delta
@@ -1276,16 +1588,17 @@ func _mm_try_lead(delta: float) -> void :
 			mm_leader_wait_timer = 0.0
 			mm_no_lead_until[leaders[0]] = now + MM_LEADER_SKIP_MS
 		return
-
 	mm_leader_wait_timer = 0.0
-	var roster: Array = pool.slice(0, n - 1)
-	roster.append(mm_self_id)
+
+	var roster = _mm_pick_group(units, my_unit, min_n, max_n)
+	if roster.is_empty():
+		return
 	roster.sort()
 	mm_lead_roster = roster
 	mm_lead_room = "hussle_" + game_mode + "_" + mm_self_id + "_" + str(randi() % 1000000)
 	mm_lead_accepted = []
 	mm_lead_timer = MM_HANDSHAKE_TIMEOUT
-	log_console("[Matchmaking] Inviting " + str(n - 1) + " players into a group...")
+	log_console("[Matchmaking] Inviting " + str(roster.size() - 1) + " players into a group...")
 	for p in mm_lead_roster:
 		if p != mm_self_id:
 			send_p2p_packet({"action": "mm_invite", "to": p, "room": mm_lead_room, "roster": mm_lead_roster})
@@ -1298,11 +1611,17 @@ func _mm_handle_lobby_packet(action: String, sender: String, data: Dictionary) -
 	match action:
 		"mm_hello":
 			mm_lobby_peers[sender] = String(data.get("status", "unknown"))
+			mm_lobby_party[sender] = [String(data.get("party", "")), int(data.get("psize", 1))]
 		"mm_invite":
 			var roster: Array = []
 			for r in data.get("roster", []):
 				roster.append(String(r))
 			var valid = room != "" and roster.size() >= _mm_min_players() and roster.size() <= _mm_max_players() and roster.has(mm_self_id) and roster.has(sender)
+			if valid and party_queued and _in_party():
+				# Only join a group that takes our whole party.
+				for pmember in _party_ids():
+					if not roster.has(pmember):
+						valid = false
 			if valid and mm_lead_room != "" and sender < mm_self_id:
 				# Two leaders collided: the lower ID wins, so we step down.
 				_mm_abort_lead()
@@ -1363,6 +1682,10 @@ func _mm_enter_private_room(roster: Array, room: String) -> void :
 	ban_log.clear()
 	player_nicknames[local_peer_id] = local_nickname
 	player_elos[local_peer_id] = local_elo
+	player_colors.clear()
+	player_colors[local_peer_id] = local_color_hex
+	mm_peer_party.clear()
+	mm_peer_party[local_peer_id] = party_id if party_queued and _in_party() else ""
 	mm_private_join_timer = MM_PRIVATE_JOIN_TIMEOUT
 	_mm_clear_pending()
 	mm_lobby_peers.clear()
@@ -1827,6 +2150,7 @@ func _reset_match_state() -> void :
 	player_nicknames.clear()
 	player_elos.clear()
 	player_teams.clear()
+	player_colors.clear()
 	dead_peers.clear()
 	forfeited_peers.clear()
 	match_start_elos.clear()
@@ -1836,12 +2160,32 @@ func _reset_match_state() -> void :
 	mm_room_left.clear()
 	leave_room_timer = -1.0
 	local_peer_id = 1
+	mm_custom_match = false
 	ffa_places.clear()
 	ffa_wait_timer = -1.0
 
-func _on_find_match_pressed(mode: String = "1v1") -> void :
+func _on_find_match_pressed(mode: String = "1v1", from_party: bool = false) -> void :
 	_save_nickname_from_input()
 
+	if not from_party and _in_party():
+		var err = _party_queue_error(mode)
+		if err != "":
+			_social_status(err)
+			pending_error_message = err
+			_build_main_menu()
+			return
+		for m in party_members:
+			if String(m[0]) != mm_self_id:
+				send_p2p_packet({"action": "pt_queue", "to": String(m[0]), "pid": party_id, "mode": mode})
+		_social_status("Queueing your party for " + String(GAME_MODES[mode]["label"]) + "...")
+		# Stay a moment so the party hears it, then queue ourselves.
+		social_linger = {"kind": "queue", "mode": mode, "t": SOCIAL_LINGER}
+		return
+
+	_social_leave_menu()
+	party_queued = from_party and _in_party()
+	party_lobby_missing_since = 0
+	party_lobby_seen.clear()
 	game_mode = mode if GAME_MODES.has(mode) else "1v1"
 	team_size = int(GAME_MODES[game_mode]["team_size"])
 	is_ffa = game_mode == "ffa"
@@ -1894,6 +2238,7 @@ func _start_p2p_game() -> void :
 	forfeited_peers.clear()
 	player_nicknames[local_peer_id] = local_nickname
 	player_elos[local_peer_id] = local_elo
+	player_colors[local_peer_id] = local_color_hex
 	match_start_elos = player_elos.duplicate()
 
 	_build_3d_environment()
@@ -1934,10 +2279,33 @@ func get_team(pid: int) -> int:
 func is_teammate(a: int, b: int) -> bool:
 	return get_team(a) == get_team(b)
 
-func player_color(pid: int) -> Color:
+# Body color: the color the player picked (falls back to the old defaults).
+func player_body_color(pid: int) -> Color:
+	var hex = String(player_colors.get(pid, ""))
+	if Color.html_is_valid(hex):
+		var c = Color.html(hex)
+		c.a = 1.0
+		return c
 	if is_ffa:
 		return FFA_COLORS[(pid - 1) % FFA_COLORS.size()]
+	if team_size > 1:
+		return TEAM_COLORS[get_team(pid) % TEAM_COLORS.size()]
+	return Color(randf(), randf(), randf())
+
+# Text color for HUD lists: team color in team modes, the player's own color
+# in FFA (lightened if it's too dark to read, e.g. black).
+func player_color(pid: int) -> Color:
+	if is_ffa:
+		var c = player_body_color(pid)
+		if c.get_luminance() < 0.45:
+			c = c.lerp(Color.WHITE, 0.5)
+		return c
 	return TEAM_COLORS[get_team(pid) % TEAM_COLORS.size()]
+
+func ghosts_can_fly() -> bool:
+	if is_single_player:
+		return false
+	return team_size > 1 or (is_ffa and GHOSTS_FLY_IN_FFA)
 
 func _ordinal(n: int) -> String:
 	if n % 100 >= 11 and n % 100 <= 13:
@@ -2141,7 +2509,7 @@ func _show_ffa_dead_banner() -> void :
 	var n = all_player_ids().size()
 	var place = int(ffa_places.get(local_peer_id, n))
 	var change = _ffa_elo_change(local_peer_id)
-	dead_banner_label.text = "YOU PLACED " + _ordinal(place).to_upper() + " OF " + str(n) + "  (" + ("+" if change >= 0 else "") + str(change) + " ELO)\nYou're invisible - roam freely and watch the rest of the match.\nPress Esc twice to leave whenever you like - your placement is kept."
+	dead_banner_label.text = "YOU PLACED " + _ordinal(place).to_upper() + " OF " + str(n) + "  (" + ("+" if change >= 0 else "") + str(change) + " ELO)\nYou're an invisible ghost" + (": look where you want to go and hold W to fly (Shift = faster)." if ghosts_can_fly() else " - roam freely and watch the rest of the match.") + "\nPress Esc twice to leave whenever you like - your placement is kept."
 	dead_banner_label.visible = true
 
 func _process_ffa_outcome(places: Dictionary) -> void :
@@ -2441,10 +2809,10 @@ func _update_ability_hud() -> void :
 	var info = CRYSTAL_ABILITIES.get(local_ability, {"name": local_ability, "color": Color.WHITE})
 	var hint = ""
 	match local_ability:
-		"double_jump": hint = "Press Space again in mid-air"
+		"double_jump": hint = "Tap JUMP again in mid-air" if mobile_controls else "Press Space again in mid-air"
 		"double_damage": hint = "Next QTE hits for 50 (smaller target)"
 		"speed_boost": hint = "Move " + str(int(round((SPEED_BOOST_MULT - 1.0) * 100))) + "% faster"
-		"lunge": hint = "Press Q to lunge forward"
+		"lunge": hint = "Tap Q to lunge forward" if mobile_controls else "Press Q to lunge forward"
 	ability_label.text = "CRYSTAL: " + String(info["name"]) + "  (" + str(int(ceil(local_ability_timer))) + "s)\n" + hint
 	ability_label.add_theme_color_override("font_color", info["color"])
 	ability_label.visible = true
@@ -2474,41 +2842,34 @@ func get_rank_name(elo: int) -> String:
 	else: return "Heavenly Huss 3"
 
 func _init_sprite_sheet() -> void :
+	rank_tex_cache.clear()
 	if ResourceLoader.exists(SPRITE_SHEET_PATH_PNG):
 		loaded_sheet_texture = load(SPRITE_SHEET_PATH_PNG) as Texture2D
 	elif ResourceLoader.exists(SPRITE_SHEET_PATH_JPG):
 		loaded_sheet_texture = load(SPRITE_SHEET_PATH_JPG) as Texture2D
 
+func rank_index(elo: int) -> int:
+	return clamp(floori(elo / 100.0), 0, RANK_COUNT - 1)
+
+func rank_name_by_index(i: int) -> String:
+	return get_rank_name(clamp(i, 0, RANK_COUNT - 1) * 100)
+
+func rank_texture_by_index(i: int) -> Texture2D:
+	return load_rank_texture(clamp(i, 0, RANK_COUNT - 1) * 100)
+
 func load_rank_texture(elo: int) -> Texture2D:
-	var rank_idx = clamp(floori(elo / 100.0), 0, 20)
+	var rank_idx = rank_index(elo)
+	if rank_tex_cache.has(rank_idx):
+		return rank_tex_cache[rank_idx]
 
 	if loaded_sheet_texture:
-		var col_count: int = 7
-		var col = floori(rank_idx / 3.0)
-		var row = rank_idx % 3
-
-		var sheet_w = float(loaded_sheet_texture.get_width())
-		var sheet_h = float(loaded_sheet_texture.get_height())
-
-		var raw_cell_w = sheet_w / float(col_count)
-
-		var crop_h: float = sheet_h * 0.14
-		var crop_y: float = 0.0
-
-		if row == 0:
-			crop_y = sheet_h * 0.145
-		elif row == 1:
-			crop_y = sheet_h * 0.44
-		else:
-			crop_y = sheet_h * 0.705
-
-		var pad_side: float = raw_cell_w * 0.12
-		var crop_x = (col * raw_cell_w) + pad_side
-		var crop_w = raw_cell_w - (pad_side * 2.0)
-
+		var sheet = Vector2(loaded_sheet_texture.get_width(), loaded_sheet_texture.get_height())
+		var corner: Vector2 = RANK_ICON_CROPS[rank_idx]
 		var atlas = AtlasTexture.new()
 		atlas.atlas = loaded_sheet_texture
-		atlas.region = Rect2(crop_x, crop_y, crop_w, crop_h)
+		atlas.region = Rect2((corner * sheet).round(), (RANK_ICON_CROP_SIZE * sheet).round())
+		atlas.filter_clip = true # no bleeding from the neighbouring icons/text
+		rank_tex_cache[rank_idx] = atlas
 		return atlas
 
 	var fallback_path = "res://rank_icons/rank_" + str(rank_idx) + ".png"
@@ -2518,11 +2879,13 @@ func load_rank_texture(elo: int) -> Texture2D:
 	var img = Image.create(32, 32, false, Image.FORMAT_RGBA8)
 	var hue = (rank_idx * 17 % 100) / 100.0
 	img.fill(Color.from_hsv(hue, 0.85, 0.95))
-	return ImageTexture.create_from_image(img)
+	var fb = ImageTexture.create_from_image(img)
+	rank_tex_cache[rank_idx] = fb
+	return fb
 
 
 func _save_nickname_from_input() -> void:
-	if nickname_input and nickname_input.text.strip_edges() != "":
+	if is_instance_valid(nickname_input) and nickname_input.text.strip_edges() != "":
 		var changed = local_nickname != nickname_input.text.strip_edges()
 		local_nickname = nickname_input.text.strip_edges()
 		save_player_data()
@@ -2537,14 +2900,27 @@ func _load_player_data() -> void :
 			if json.parse(file.get_as_text()) == OK:
 				local_nickname = json.data.get("nickname", "Player")
 				local_elo = int(json.data.get("elo", 0))
+				local_color_hex = String(json.data.get("color", ""))
+				if json.data.has("controls"):
+					mobile_controls = String(json.data.get("controls", "pc")) == "mobile"
+				else:
+					mobile_controls = _looks_like_mobile()
 			file.close()
+	else:
+		mobile_controls = _looks_like_mobile()
+	if not Color.html_is_valid(local_color_hex):
+		# First launch: start with a random preset.
+		local_color_hex = String(COLOR_PRESETS[randi() % COLOR_PRESETS.size()][1])
+		save_player_data()
 
 func save_player_data() -> void :
 	var file = FileAccess.open(SAVE_PATH, FileAccess.WRITE)
 	if file:
 		var data = {
 			"nickname": local_nickname, 
-			"elo": local_elo
+			"elo": local_elo, 
+			"color": local_color_hex, 
+			"controls": "mobile" if mobile_controls else "pc"
 		}
 		file.store_string(JSON.stringify(data))
 		file.close()
@@ -2552,7 +2928,8 @@ func save_player_data() -> void :
 func export_data_to_obfuscated_string() -> String:
 	var raw_dict = {
 		"nickname": local_nickname,
-		"elo": local_elo
+		"elo": local_elo,
+		"color": local_color_hex
 	}
 	var json_str = JSON.stringify(raw_dict)
 	return Marshalls.utf8_to_base64(json_str)
@@ -2572,6 +2949,8 @@ func import_data_from_obfuscated_string(encoded_string: String) -> bool:
 		if dict.has("nickname") and dict.has("elo"):
 			local_nickname = String(dict["nickname"])
 			local_elo = int(dict["elo"])
+			if dict.has("color") and Color.html_is_valid(String(dict["color"])):
+				local_color_hex = String(dict["color"]).trim_prefix("#").to_lower()
 			save_player_data()
 			_lb_set(local_nickname, local_elo)
 			_save_leaderboard_cache()
@@ -2648,7 +3027,25 @@ func _wall_time() -> float:
 	return Time.get_unix_time_from_system()
 
 func _lb_set(nick: String, elo: int, t: float = -1.0) -> void :
-	leaderboard_data[nick] = {"elo": elo, "t": _wall_time() if t < 0.0 else t}
+	var old = leaderboard_data.get(nick, null)
+	var seen = float(old.get("seen", 0.0)) if old is Dictionary else 0.0
+	leaderboard_data[nick] = {"elo": elo, "t": _wall_time() if t < 0.0 else t, "seen": seen}
+
+# "seen" = the last time this player was online (in the menu or in a match).
+func _lb_mark_seen(nick: String) -> void :
+	var e = leaderboard_data.get(nick, null)
+	if e is Dictionary:
+		e["seen"] = _wall_time()
+
+func _ago(seconds: float) -> String:
+	var s = int(max(seconds, 0.0))
+	if s < 60:
+		return "just now"
+	if s < 3600:
+		return str(s / 60) + " min ago"
+	if s < 86400:
+		return str(s / 3600) + " h ago"
+	return str(s / 86400) + " d ago"
 
 # Merges another player's leaderboard into ours. Returns true if anything changed.
 func _lb_merge(incoming) -> bool:
@@ -2665,8 +3062,13 @@ func _lb_merge(incoming) -> bool:
 		var t_new = float(e.get("t", 0.0))
 		var have = leaderboard_data.get(n, null)
 		var t_have = float(have.get("t", -1.0)) if have is Dictionary else -2.0
+		var seen_have = float(have.get("seen", 0.0)) if have is Dictionary else 0.0
+		var seen_new = max(seen_have, float(e.get("seen", 0.0)))
 		if t_new > t_have:
-			leaderboard_data[n] = {"elo": int(e["elo"]), "t": t_new}
+			leaderboard_data[n] = {"elo": int(e["elo"]), "t": t_new, "seen": seen_new}
+			changed = true
+		elif seen_new > seen_have:
+			leaderboard_data[n]["seen"] = seen_new
 			changed = true
 	return changed
 
@@ -2710,6 +3112,8 @@ func _build_hud_console() -> void :
 	panel.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
 	panel.position = Vector2(10, -170)
 	hud_canvas.add_child(panel)
+	console_panel = panel
+	panel.visible = not mobile_controls # mobile: no console
 
 	var scroll = ScrollContainer.new()
 	scroll.custom_minimum_size = Vector2(350, 150)
@@ -2809,7 +3213,7 @@ func _build_hud_console() -> void :
 
 	# Shown while you're dead but your team is still fighting
 	dead_banner_label = Label.new()
-	dead_banner_label.text = "YOU WERE ELIMINATED\nYou're invisible - roam freely while your team fights on.\nStay until the end: if your team wins you still get half the ELO."
+	dead_banner_label.text = "YOU WERE ELIMINATED\nYou're an invisible ghost: look where you want to go and hold W to fly (Shift = faster).\nStay until the end: if your team wins you still get half the ELO."
 	dead_banner_label.set_anchors_preset(Control.PRESET_CENTER_TOP)
 	dead_banner_label.position = Vector2(-300, 48)
 	dead_banner_label.custom_minimum_size = Vector2(600, 70)
@@ -2841,6 +3245,12 @@ func _build_hud_console() -> void :
 	crosshair.set_anchors_preset(Control.PRESET_CENTER)
 	crosshair.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	hud_canvas.add_child(crosshair)
+
+	_mobile_reset_inputs()
+	mobile_sprint_on = false
+	if mobile_controls:
+		mobile_ui = MobileControls.new(self)
+		hud_canvas.add_child(mobile_ui)
 
 	log_console("[System] Network Console initialized.")
 
@@ -3002,6 +3412,37 @@ func _build_main_menu() -> void :
 	container.add_child(menu_online_label)
 	_lb_update_online_label()
 
+	var color_row = HBoxContainer.new()
+	color_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	container.add_child(color_row)
+	var color_btn = Button.new()
+	color_btn.text = "Change Character Color"
+	color_btn.custom_minimum_size = Vector2(270, 36)
+	color_btn.pressed.connect(_show_color_picker_ui)
+	color_row.add_child(color_btn)
+	var swatch = ColorRect.new()
+	swatch.color = _local_color()
+	swatch.custom_minimum_size = Vector2(36, 36)
+	color_row.add_child(swatch)
+
+	var controls_row = HBoxContainer.new()
+	controls_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	container.add_child(controls_row)
+	var controls_lbl = Label.new()
+	controls_lbl.text = "Controls: "
+	controls_row.add_child(controls_lbl)
+	var controls_group = ButtonGroup.new()
+	for opt in [["PC", false], ["Mobile", true]]:
+		var b = Button.new()
+		b.text = String(opt[0])
+		b.toggle_mode = true
+		b.button_group = controls_group
+		b.button_pressed = mobile_controls == bool(opt[1])
+		b.custom_minimum_size = Vector2(110, 34)
+		var is_mobile = bool(opt[1])
+		b.pressed.connect( func(): _set_controls(is_mobile))
+		controls_row.add_child(b)
+
 	var spacer = Control.new()
 	spacer.custom_minimum_size = Vector2(0, 10)
 	container.add_child(spacer)
@@ -3086,6 +3527,9 @@ func _build_main_menu() -> void :
 		container.add_child(msg_lbl)
 		pending_error_message = ""
 
+	_build_party_panel()
+	_build_rank_panel()
+
 	# Sit in the leaderboard room while on the menu, and (re)announce ourselves -
 	# our ELO or nickname may have just changed.
 	if mm_phase == "menu":
@@ -3101,11 +3545,14 @@ func _lb_enter_room() -> void :
 	mm_phase = "menu"
 	lb_online.clear()
 	lb_heartbeat_timer = 0.0
+	party_leader_heard_ms = _now_ms()
+	party_queued = false
 	_switch_room(LEADERBOARD_ROOM_CODE)
 
 func _lb_leave_room() -> void :
 	if mm_phase != "menu":
 		return
+	_social_leave_menu()
 	mm_phase = "idle"
 	lb_online.clear()
 	_leave_trystero_room()
@@ -3147,20 +3594,28 @@ func _lb_handle_packet(action: String, sender: String, data: Dictionary) -> void
 				if not (have is Dictionary) or int(have.get("elo", -1)) != elo:
 					_lb_set(nick, elo, max(float(data.get("t", 0.0)), float(have.get("t", 0.0)) if have is Dictionary else 0.0))
 					_save_leaderboard_cache()
+				_lb_mark_seen(nick)
 				lb_ui_dirty = true
 			_lb_update_online_label()
 		"lb_sync":
 			if _lb_merge(data.get("leaderboard", {})):
 				_save_leaderboard_cache()
 				lb_ui_dirty = true
+		"ch_req", "ch_reply", "ch_cancel", "pt_invite", "pt_reply", "pt_full", "pt_state", "pt_leave", "pt_queue", "pt_code_join":
+			_social_handle_packet(action, sender, data)
 		_:
-			pass # this room carries leaderboard data only - nothing else is played here
+			pass # leaderboard + social messages only - nothing is played in this room
 
 func _lb_tick(dt: float, now: int) -> void :
 	lb_heartbeat_timer -= dt
 	if lb_heartbeat_timer <= 0.0:
 		lb_heartbeat_timer = LB_HEARTBEAT
 		_lb_announce()
+		if _is_party_leader() and _in_party():
+			_party_send_state()
+	_social_tick(dt, now)
+	if mm_phase != "menu":
+		return # a challenge / party queue just took us out of the menu
 	for tid in lb_online.keys():
 		if not direct_peers.has(tid) and now - int(lb_online[tid]["ms"]) > LB_ONLINE_TIMEOUT_MS:
 			lb_online.erase(tid)
@@ -3185,6 +3640,1156 @@ func _lb_update_online_label() -> void :
 		menu_online_label.text = "Players online in the menu: " + str(n + 1) + (" (just you)" if n == 0 else "")
 
 
+# --- SOCIAL: CHALLENGES AND PARTIES (main menu / leaderboard room) ---
+# Challenge to 1v1: the other player gets a popup; if they accept, both move
+# into a fresh private room and play a 1v1 (it counts for ELO like ranked 1v1
+# - set CHALLENGE_IS_RANKED to false to make challenges friendly).
+# Parties: up to 5 players. Only the leader queues, for everyone; party members
+# always end up in the same match, and on the same team in 2v2/3v3.
+
+func _in_party() -> bool:
+	return party_members.size() > 1
+
+func _is_party_leader() -> bool:
+	return party_id != "" and party_leader == mm_self_id
+
+func _party_ids() -> Array:
+	var out: Array = []
+	for m in party_members:
+		out.append(String(m[0]))
+	return out
+
+func _party_nick(tid: String) -> String:
+	for m in party_members:
+		if String(m[0]) == tid:
+			return String(m[1])
+	return "a player"
+
+func _lb_tid_for_nick(nick: String) -> String:
+	for tid in lb_online:
+		if String(lb_online[tid]["nick"]) == nick:
+			return tid
+	return ""
+
+func _social_status(msg: String) -> void :
+	social_status = msg
+	social_dirty = true
+	lb_ui_dirty = true
+	log_console("[Social] " + msg)
+
+func _social_rand() -> String:
+	return str(randi() % 1000000)
+
+# ----- challenges -----
+
+func _challenge_player(tid: String, nick: String) -> void :
+	if mm_phase != "menu":
+		return
+	if not challenge_out.is_empty():
+		_social_status("You already have a challenge waiting for an answer.")
+		return
+	var cid = mm_self_id + ":" + _social_rand()
+	challenge_out = {"cid": cid, "to": tid, "nick": nick, "ms": _now_ms()}
+	send_p2p_packet({"action": "ch_req", "to": tid, "cid": cid, "nick": local_nickname})
+	_social_status("Challenge sent to " + nick + " - waiting for them to accept...")
+
+func _answer_challenge(cid: String, accept: bool) -> void :
+	var req = null
+	for c in challenge_in:
+		if String(c["cid"]) == cid:
+			req = c
+	if req == null:
+		return
+	challenge_in.erase(req)
+	social_dirty = true
+	if not accept:
+		send_p2p_packet({"action": "ch_reply", "to": req["from"], "cid": cid, "accept": false})
+		_social_status("You declined " + String(req["nick"]) + "'s challenge.")
+		return
+	for other in challenge_in:
+		send_p2p_packet({"action": "ch_reply", "to": other["from"], "cid": other["cid"], "accept": false})
+	challenge_in.clear()
+	var room = "hussle_challenge_" + mm_self_id + "_" + _social_rand()
+	send_p2p_packet({"action": "ch_reply", "to": req["from"], "cid": cid, "accept": true, "room": room})
+	_social_status("Starting your 1v1 against " + String(req["nick"]) + "...")
+	# Stay a moment so the answer gets delivered, then switch rooms.
+	social_linger = {"kind": "challenge", "room": room, "roster": [String(req["from"]), mm_self_id], "t": SOCIAL_LINGER}
+
+func _start_challenge_match(roster: Array, room: String) -> void :
+	_social_leave_menu()
+	_save_nickname_from_input()
+	game_mode = "1v1"
+	team_size = 1
+	is_ffa = false
+	is_single_player = false
+	is_host_peer = false
+	_reset_match_state()
+	mm_skip_until.clear()
+	party_queued = false
+	_clear_ui()
+	_build_hud_console()
+	mm_custom_match = true
+	log_console("[Challenge] Setting up your 1v1...")
+	_mm_enter_private_room(roster, room)
+	mm_private_join_timer = 20.0
+
+# ----- parties -----
+
+func _party_create_if_needed() -> void :
+	if party_id == "":
+		party_id = mm_self_id + ":" + _social_rand()
+		party_leader = mm_self_id
+		party_members = [[mm_self_id, local_nickname]]
+		party_ver = 0
+
+func _party_send_state(changed: bool = false) -> void :
+	if not _is_party_leader():
+		return
+	if changed:
+		party_ver += 1
+		social_dirty = true
+		lb_ui_dirty = true
+	for m in party_members:
+		if String(m[0]) != mm_self_id:
+			send_p2p_packet({"action": "pt_state", "to": String(m[0]), "pid": party_id, "leader": party_leader, "members": party_members, "ver": party_ver, "code": party_code})
+
+func _invite_to_party(tid: String, nick: String) -> void :
+	if mm_phase != "menu":
+		return
+	if _in_party() and not _is_party_leader():
+		_social_status("Only the party leader (" + _party_nick(party_leader) + ") can invite players.")
+		return
+	if party_members.size() >= PARTY_MAX:
+		_social_status("Your party is full (" + str(PARTY_MAX) + " players max).")
+		return
+	if _party_ids().has(tid):
+		_social_status(nick + " is already in your party.")
+		return
+	_party_create_if_needed()
+	party_invites_out[tid] = _now_ms()
+	send_p2p_packet({"action": "pt_invite", "to": tid, "pid": party_id, "nick": local_nickname, "size": party_members.size()})
+	_social_status("Party invite sent to " + nick + ".")
+
+func _answer_party_invite(pid: String, accept: bool) -> void :
+	var inv = null
+	for i in party_invites_in:
+		if String(i["pid"]) == pid:
+			inv = i
+	if inv == null:
+		return
+	party_invites_in.erase(inv)
+	social_dirty = true
+	if not accept:
+		send_p2p_packet({"action": "pt_reply", "to": inv["from"], "pid": pid, "accept": false, "nick": local_nickname})
+		_social_status("You declined " + String(inv["nick"]) + "'s party invite.")
+		return
+	if party_id != "" and party_id != pid:
+		_party_leave(true)
+	party_joining = pid
+	party_joining_ms = _now_ms()
+	send_p2p_packet({"action": "pt_reply", "to": inv["from"], "pid": pid, "accept": true, "nick": local_nickname})
+	_social_status("Joining " + String(inv["nick"]) + "'s party...")
+
+func _party_leave(quiet: bool = false) -> void :
+	if party_id == "":
+		return
+	if _is_party_leader():
+		var rest: Array = []
+		for m in party_members:
+			if String(m[0]) != mm_self_id:
+				rest.append(m)
+		if not rest.is_empty():
+			# Hand the party to the next player (lowest ID).
+			var ids: Array = []
+			for m in rest:
+				ids.append(String(m[0]))
+			ids.sort()
+			for m in rest:
+				send_p2p_packet({"action": "pt_state", "to": String(m[0]), "pid": party_id, "leader": ids[0], "members": rest, "ver": party_ver + 1, "code": party_code})
+	else:
+		send_p2p_packet({"action": "pt_leave", "to": party_leader, "pid": party_id})
+	party_id = ""
+	party_leader = ""
+	party_members = []
+	party_code = ""
+	party_queued = false
+	party_invites_out.clear()
+	if not quiet:
+		_social_status("You left the party.")
+	social_dirty = true
+	lb_ui_dirty = true
+
+func _party_new_code() -> String:
+	return "%06d" % (randi() % 1000000)
+
+func _is_party_code(t: String) -> bool:
+	if t.length() != 6:
+		return false
+	for ch in t:
+		if ch < "0" or ch > "9":
+			return false
+	return true
+
+# Leader (or someone not in a party yet): make / replace the party's code.
+func _create_party_code() -> void :
+	if mm_phase != "menu":
+		return
+	if _in_party() and not _is_party_leader():
+		_social_status("Only the party leader (" + _party_nick(party_leader) + ") can make a party code.")
+		return
+	_party_create_if_needed()
+	var old = party_code
+	party_code = _party_new_code()
+	while party_code == old:
+		party_code = _party_new_code()
+	_party_send_state(true)
+	_social_status("Your party code is " + party_code + " - share it so friends can join.")
+
+func _copy_party_code() -> void :
+	if party_code == "":
+		return
+	DisplayServer.clipboard_set(party_code)
+	_social_status("Party code " + party_code + " copied.")
+
+func _join_party_code(text: String) -> void :
+	if mm_phase != "menu":
+		return
+	var code = text.strip_edges()
+	if not _is_party_code(code):
+		_social_status("Party codes are 6 digits - check the code and try again.")
+		return
+	if party_code != "" and code == party_code:
+		_social_status("That's your own party's code.")
+		return
+	party_code_joining = code
+	party_code_join_ms = _now_ms()
+	send_p2p_packet({"action": "pt_code_join", "code": code, "nick": local_nickname})
+	_social_status("Looking for the party with code " + code + "...")
+
+func _on_party_code_typed(t: String) -> void :
+	var digits = ""
+	for ch in t:
+		if ch >= "0" and ch <= "9":
+			digits += ch
+	if digits != t and party_code_input:
+		var caret = party_code_input.caret_column
+		party_code_input.text = digits.substr(0, 6)
+		party_code_input.caret_column = min(caret, party_code_input.text.length())
+
+func _party_remove(tid: String) -> void :
+	if not _is_party_leader() or tid == mm_self_id:
+		return
+	var nick = _party_nick(tid)
+	for m in party_members.duplicate():
+		if String(m[0]) == tid:
+			party_members.erase(m)
+	_party_send_state(true)
+	# Tell them too (if they can still hear us).
+	send_p2p_packet({"action": "pt_state", "to": tid, "pid": party_id, "leader": party_leader, "members": party_members, "ver": party_ver, "code": party_code})
+	_social_status("You removed " + nick + " from the party.")
+
+func _party_queue_error(mode: String) -> String:
+	if not _is_party_leader():
+		return "Only the party leader (" + _party_nick(party_leader) + ") can start a queue."
+	var n = party_members.size()
+	match mode:
+		"1v1":
+			return "Parties can't queue for 1v1 - use 'Challenge to 1v1' on the Leaderboard instead."
+		"2v2":
+			if n > 2:
+				return "Your party is too large for 2v2 (max 2 players)."
+		"3v3":
+			if n > 3:
+				return "Your party is too large for 3v3 (max 3 players)."
+		"ffa":
+			if n > PARTY_MAX:
+				return "Your party is too large for Free For All (max " + str(PARTY_MAX) + " players)."
+	for m in party_members:
+		if String(m[0]) != mm_self_id and not lb_online.has(String(m[0])):
+			return String(m[1]) + " isn't on the main menu right now."
+	return ""
+
+# ----- social packets (leaderboard room) -----
+
+func _social_handle_packet(action: String, sender: String, data: Dictionary) -> void :
+	match action:
+		"ch_req":
+			var cid = String(data.get("cid", ""))
+			for c in challenge_in:
+				if String(c["cid"]) == cid:
+					return
+			challenge_in.append({"cid": cid, "from": sender, "nick": String(data.get("nick", "Player")), "ms": _now_ms()})
+			social_dirty = true
+			log_console("[Social] " + String(data.get("nick", "Player")) + " challenged you to a 1v1!")
+		"ch_reply":
+			var cid2 = String(data.get("cid", ""))
+			if challenge_out.is_empty() or String(challenge_out["cid"]) != cid2 or String(challenge_out["to"]) != sender:
+				return
+			var nick = String(challenge_out["nick"])
+			challenge_out = {}
+			if bool(data.get("accept", false)) and String(data.get("room", "")) != "":
+				_social_status(nick + " accepted! Starting your 1v1...")
+				_start_challenge_match([mm_self_id, sender], String(data.get("room", "")))
+			else:
+				_social_status(nick + " declined your challenge.")
+		"ch_cancel":
+			var cid3 = String(data.get("cid", ""))
+			for c in challenge_in.duplicate():
+				if String(c["cid"]) == cid3:
+					challenge_in.erase(c)
+					social_dirty = true
+		"pt_invite":
+			var pid = String(data.get("pid", ""))
+			if pid == "" or pid == party_id:
+				return
+			for i in party_invites_in:
+				if String(i["pid"]) == pid:
+					return
+			party_invites_in.append({"pid": pid, "from": sender, "nick": String(data.get("nick", "Player")), "size": int(data.get("size", 1)), "ms": _now_ms()})
+			social_dirty = true
+			log_console("[Social] " + String(data.get("nick", "Player")) + " invited you to their party.")
+		"pt_reply":
+			if not party_invites_out.has(sender):
+				return
+			party_invites_out.erase(sender)
+			var rnick = String(data.get("nick", "Player"))
+			if String(data.get("pid", "")) != party_id or not _is_party_leader():
+				send_p2p_packet({"action": "pt_full", "to": sender, "pid": String(data.get("pid", ""))})
+				return
+			if not bool(data.get("accept", false)):
+				_social_status(rnick + " declined your party invite.")
+				return
+			if party_members.size() >= PARTY_MAX:
+				send_p2p_packet({"action": "pt_full", "to": sender, "pid": party_id})
+				_social_status(rnick + " couldn't join - your party is full.")
+				return
+			if not _party_ids().has(sender):
+				party_members.append([sender, rnick])
+			_party_send_state(true)
+			_social_status(rnick + " joined your party.")
+		"pt_full":
+			if party_code_joining != "" and String(data.get("code", "")) == party_code_joining:
+				party_code_joining = ""
+				_social_status("That party is full (" + str(PARTY_MAX) + " players max).")
+			elif String(data.get("pid", "")) == party_joining:
+				party_joining = ""
+				_social_status("Couldn't join - that party is full or no longer exists.")
+		"pt_code_join":
+			# Someone typed in a party code - only that party's leader answers.
+			var jcode = String(data.get("code", ""))
+			if jcode == "" or jcode != party_code or not _is_party_leader():
+				return
+			var jnick = String(data.get("nick", "Player"))
+			if _party_ids().has(sender):
+				_party_send_state()
+				return
+			if party_members.size() >= PARTY_MAX:
+				send_p2p_packet({"action": "pt_full", "to": sender, "pid": party_id, "code": jcode})
+				_social_status(jnick + " tried your code, but the party is full.")
+				return
+			party_members.append([sender, jnick])
+			_party_send_state(true)
+			_social_status(jnick + " joined your party with the code.")
+		"pt_state":
+			var spid = String(data.get("pid", ""))
+			var members: Array = []
+			for m in data.get("members", []):
+				if typeof(m) == TYPE_ARRAY and m.size() >= 2:
+					members.append([String(m[0]), String(m[1])])
+			var ids: Array = []
+			for m in members:
+				ids.append(m[0])
+			var ver = int(data.get("ver", 0))
+			if spid != "" and spid == party_id and ver < party_ver:
+				return # an older update that arrived late
+			var scode = String(data.get("code", ""))
+			if ids.has(mm_self_id):
+				var via_code = party_code_joining != "" and scode == party_code_joining and spid != party_id
+				if spid == "" or (spid != party_id and spid != party_joining and not via_code):
+					if spid != "" and spid != party_id and party_code_joined != "" and scode == party_code_joined:
+						# Another party happened to have the same code - leave it.
+						send_p2p_packet({"action": "pt_leave", "to": sender, "pid": spid})
+					return # not our party (or one we just left), and we're not joining it
+				if via_code:
+					if party_id != "" and party_id != spid:
+						_party_leave(true)
+					party_code_joined = party_code_joining
+					party_code_joining = ""
+				var was_leader = _is_party_leader()
+				var was_in = party_id == spid
+				var new_leader = String(data.get("leader", sender))
+				var changed = not was_in or members != party_members or new_leader != party_leader or scode != party_code
+				party_id = spid
+				party_leader = new_leader
+				party_members = members
+				party_code = scode
+				party_ver = ver
+				party_joining = ""
+				party_leader_heard_ms = _now_ms()
+				if not was_in:
+					_social_status("You joined " + _party_nick(party_leader) + "'s party.")
+				if _is_party_leader() and not was_leader:
+					_social_status("You're now the party leader.")
+					_party_send_state(true)
+				if changed:
+					social_dirty = true
+					lb_ui_dirty = true
+			elif spid == party_id and party_id != "":
+				party_id = ""
+				party_leader = ""
+				party_members = []
+				party_code = ""
+				_social_status("You're no longer in that party.")
+		"pt_leave":
+			if String(data.get("pid", "")) != party_id or not _is_party_leader():
+				return
+			var lnick = _party_nick(sender)
+			for m in party_members.duplicate():
+				if String(m[0]) == sender:
+					party_members.erase(m)
+			_party_send_state(true)
+			_social_status(lnick + " left the party.")
+		"pt_queue":
+			if String(data.get("pid", "")) == party_id and sender == party_leader and mm_phase == "menu":
+				var mode = String(data.get("mode", "2v2"))
+				_social_status("Your party leader started a " + String(GAME_MODES.get(mode, {"label": mode})["label"]) + " queue.")
+				_on_find_match_pressed(mode, true)
+
+func _social_tick(dt: float, now: int) -> void :
+	if not social_linger.is_empty():
+		social_linger["t"] = float(social_linger["t"]) - dt
+		if float(social_linger["t"]) <= 0.0:
+			var L = social_linger
+			social_linger = {}
+			if String(L["kind"]) == "challenge":
+				_start_challenge_match(L["roster"], String(L["room"]))
+			else:
+				_on_find_match_pressed(String(L["mode"]), true)
+			return
+	if not challenge_out.is_empty() and now - int(challenge_out["ms"]) > SOCIAL_REQUEST_TIMEOUT_MS + 3000:
+		send_p2p_packet({"action": "ch_cancel", "to": challenge_out["to"], "cid": challenge_out["cid"]})
+		_social_status(String(challenge_out["nick"]) + " didn't answer your challenge.")
+		challenge_out = {}
+	for c in challenge_in.duplicate():
+		if now - int(c["ms"]) > SOCIAL_REQUEST_TIMEOUT_MS:
+			send_p2p_packet({"action": "ch_reply", "to": c["from"], "cid": c["cid"], "accept": false})
+			challenge_in.erase(c)
+			social_dirty = true
+	for i in party_invites_in.duplicate():
+		if now - int(i["ms"]) > SOCIAL_REQUEST_TIMEOUT_MS:
+			send_p2p_packet({"action": "pt_reply", "to": i["from"], "pid": i["pid"], "accept": false, "nick": local_nickname})
+			party_invites_in.erase(i)
+			social_dirty = true
+	if party_code_joining != "" and now - party_code_join_ms > PARTY_CODE_WAIT_MS:
+		_social_status("No party found with code " + party_code_joining + ". Check the code (its leader has to be on the main menu).")
+		party_code_joining = ""
+	if party_joining != "" and now - party_joining_ms > 10000:
+		party_joining = ""
+		_social_status("Couldn't join that party - the leader may have left the menu.")
+	for tid in party_invites_out.keys():
+		if now - int(party_invites_out[tid]) > SOCIAL_REQUEST_TIMEOUT_MS + 3000:
+			party_invites_out.erase(tid)
+			lb_ui_dirty = true
+	if _in_party():
+		if not _is_party_leader() and now - party_leader_heard_ms > PARTY_PRUNE_MS:
+			party_id = ""
+			party_leader = ""
+			party_members = []
+			party_code = ""
+			_social_status("Lost contact with your party leader - you've left the party.")
+		elif _is_party_leader():
+			var removed = false
+			for m in party_members.duplicate():
+				var tid2 = String(m[0])
+				if tid2 != mm_self_id and now - int(last_heard.get(tid2, now)) > PARTY_PRUNE_MS:
+					party_members.erase(m)
+					removed = true
+			if removed:
+				_party_send_state(true)
+				_social_status("A party member was away too long and was removed.")
+	social_ui_timer -= dt
+	if social_ui_timer <= 0.0 or social_dirty:
+		social_ui_timer = 1.0
+		social_dirty = false
+		_refresh_popup()
+		_fill_party_panel()
+
+# Leaving the menu (queueing, practice, a challenge): answer anything pending.
+func _social_leave_menu() -> void :
+	for c in challenge_in:
+		send_p2p_packet({"action": "ch_reply", "to": c["from"], "cid": c["cid"], "accept": false})
+	challenge_in.clear()
+	for i in party_invites_in:
+		send_p2p_packet({"action": "pt_reply", "to": i["from"], "pid": i["pid"], "accept": false, "nick": local_nickname})
+	party_invites_in.clear()
+	if not challenge_out.is_empty():
+		send_p2p_packet({"action": "ch_cancel", "to": challenge_out["to"], "cid": challenge_out["cid"]})
+		challenge_out = {}
+	party_invites_out.clear()
+	party_code_joining = ""
+	social_linger = {}
+	_hide_popup()
+
+# ----- popup (top of the screen on any menu page) -----
+
+func _hide_popup() -> void :
+	if popup_canvas:
+		popup_canvas.queue_free()
+		popup_canvas = null
+	popup_key = ""
+	popup_sub_label = null
+
+func _refresh_popup() -> void :
+	if mm_phase != "menu" or (challenge_in.is_empty() and party_invites_in.is_empty()):
+		_hide_popup()
+		return
+	var is_challenge = not challenge_in.is_empty()
+	var item = challenge_in[0] if is_challenge else party_invites_in[0]
+	var key = ("ch:" + String(item["cid"])) if is_challenge else ("pt:" + String(item["pid"]))
+	var left = int(ceil(max(SOCIAL_REQUEST_TIMEOUT_MS - (_now_ms() - int(item["ms"])), 0) / 1000.0))
+	var sub_text = ("Accept to start the match right away." if is_challenge else "You'll queue together when the leader picks a mode.") + "  (" + str(left) + "s)"
+	if popup_canvas and popup_key == key and is_instance_valid(popup_sub_label):
+		popup_sub_label.text = sub_text # same request: just tick the countdown
+		return
+	if not popup_canvas:
+		popup_canvas = CanvasLayer.new()
+		popup_canvas.layer = 110
+		add_child(popup_canvas)
+	for c in popup_canvas.get_children():
+		c.queue_free()
+	popup_key = key
+
+	var panel = PanelContainer.new()
+	panel.set_anchors_preset(Control.PRESET_CENTER_TOP)
+	panel.position = Vector2(-230, 60)
+	panel.custom_minimum_size = Vector2(460, 0)
+	var sb = StyleBoxFlat.new()
+	sb.bg_color = Color(0.12, 0.12, 0.16, 0.96)
+	sb.border_color = Color(1.0, 0.85, 0.2)
+	sb.set_border_width_all(2)
+	sb.set_corner_radius_all(10)
+	sb.set_content_margin_all(12)
+	panel.add_theme_stylebox_override("panel", sb)
+	popup_canvas.add_child(panel)
+	var vb = VBoxContainer.new()
+	vb.add_theme_constant_override("separation", 8)
+	panel.add_child(vb)
+	var msg = Label.new()
+	if is_challenge:
+		msg.text = String(item["nick"]) + " challenges you to a 1v1!"
+	else:
+		msg.text = String(item["nick"]) + " invited you to their party (" + str(int(item["size"])) + "/" + str(PARTY_MAX) + ")."
+	msg.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	msg.add_theme_font_size_override("font_size", 17)
+	msg.add_theme_color_override("font_color", Color(1.0, 0.9, 0.3))
+	vb.add_child(msg)
+	popup_sub_label = Label.new()
+	popup_sub_label.text = sub_text
+	popup_sub_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	popup_sub_label.add_theme_font_size_override("font_size", 12)
+	vb.add_child(popup_sub_label)
+	var row = HBoxContainer.new()
+	row.alignment = BoxContainer.ALIGNMENT_CENTER
+	row.add_theme_constant_override("separation", 16)
+	vb.add_child(row)
+	var acc = Button.new()
+	acc.text = "Accept"
+	acc.custom_minimum_size = Vector2(140, 40)
+	var dec = Button.new()
+	dec.text = "Decline"
+	dec.custom_minimum_size = Vector2(140, 40)
+	if is_challenge:
+		var cid = String(item["cid"])
+		acc.pressed.connect( func(): _answer_challenge(cid, true))
+		dec.pressed.connect( func(): _answer_challenge(cid, false))
+	else:
+		var pid = String(item["pid"])
+		acc.pressed.connect( func(): _answer_party_invite(pid, true))
+		dec.pressed.connect( func(): _answer_party_invite(pid, false))
+	row.add_child(acc)
+	row.add_child(dec)
+
+# ----- rank panel (middle-left of the main menu) -----
+# Previous rank on the left, your rank in the middle, next rank on the right,
+# and the same progress bar as the end-of-match screen.
+
+func _rank_color(i: int) -> Color:
+	return RANK_FAMILY_COLORS[clamp(i, 0, RANK_COUNT - 1) / 3]
+
+func _rank_progress(elo: int) -> float:
+	if elo >= MAX_ELO:
+		return 1.0
+	var base = rank_index(elo) * 100
+	var top = MAX_ELO if rank_index(elo) == RANK_COUNT - 1 else base + 100
+	return clamp(float(elo - base) / float(top - base), 0.0, 1.0)
+
+func _rank_slot(caption: String, idx: int, icon_size: float, is_current: bool, placeholder: String) -> VBoxContainer:
+	var w = icon_size + (18.0 if is_current else 8.0)
+	var box = VBoxContainer.new()
+	box.alignment = BoxContainer.ALIGNMENT_END
+	box.add_theme_constant_override("separation", 2)
+	box.custom_minimum_size = Vector2(w, 0)
+	var cap = Label.new()
+	cap.text = caption
+	cap.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	cap.add_theme_font_size_override("font_size", 10)
+	cap.add_theme_color_override("font_color", Color(0.65, 0.65, 0.7))
+	box.add_child(cap)
+	if placeholder != "":
+		var ph = Label.new()
+		ph.name = "Placeholder"
+		ph.text = placeholder
+		ph.custom_minimum_size = Vector2(w, icon_size)
+		ph.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		ph.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		ph.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		ph.add_theme_font_size_override("font_size", 12)
+		ph.add_theme_color_override("font_color", Color(0.7, 0.7, 0.75))
+		box.add_child(ph)
+		var blank = Label.new()
+		blank.text = " "
+		blank.add_theme_font_size_override("font_size", 10)
+		box.add_child(blank)
+		return box
+	var icon_holder = CenterContainer.new()
+	icon_holder.custom_minimum_size = Vector2(w, icon_size)
+	box.add_child(icon_holder)
+	var icon = TextureRect.new()
+	icon.name = "Icon"
+	icon.texture = rank_texture_by_index(idx)
+	icon.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	icon.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	icon.custom_minimum_size = Vector2(icon_size, icon_size)
+	if not is_current:
+		icon.modulate = Color(1, 1, 1, 0.7)
+	icon_holder.add_child(icon)
+	var nm = Label.new()
+	nm.name = "RankName"
+	nm.text = rank_name_by_index(idx)
+	nm.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	nm.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	nm.custom_minimum_size = Vector2(w, 0)
+	nm.add_theme_font_size_override("font_size", 13 if is_current else 10)
+	nm.add_theme_color_override("font_color", _rank_color(idx) if is_current else _rank_color(idx).darkened(0.15))
+	box.add_child(nm)
+	return box
+
+func _build_rank_panel() -> void :
+	# Full-height strip on the left that centers the panel vertically.
+	var strip = VBoxContainer.new()
+	strip.anchor_left = 0.0
+	strip.anchor_right = 0.0
+	strip.anchor_top = 0.0
+	strip.anchor_bottom = 1.0
+	strip.offset_left = 12.0
+	strip.offset_right = 12.0 + rank_panel_w
+	strip.offset_top = 8.0
+	strip.offset_bottom = -8.0
+	strip.alignment = BoxContainer.ALIGNMENT_CENTER
+	strip.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	menu_canvas.add_child(strip)
+
+	var panel = PanelContainer.new()
+	panel.custom_minimum_size = Vector2(rank_panel_w, 0)
+	# Same dark color as the sprite sheet's background, so the icons blend in.
+	var sb = StyleBoxFlat.new()
+	sb.bg_color = Color8(14, 17, 19, 250)
+	sb.border_color = Color(0.32, 0.32, 0.38)
+	sb.set_border_width_all(1)
+	sb.set_corner_radius_all(8)
+	sb.set_content_margin_all(8)
+	panel.add_theme_stylebox_override("panel", sb)
+	strip.add_child(panel)
+	rank_panel_box = VBoxContainer.new()
+	rank_panel_box.add_theme_constant_override("separation", 6)
+	panel.add_child(rank_panel_box)
+
+	var idx = rank_index(local_elo)
+	var inner = rank_panel_w - 18.0
+	var big = clamp(inner * 0.4, 40.0, 92.0)
+	var small = clamp(inner * 0.24, 26.0, 56.0)
+
+	var title = Label.new()
+	title.text = "YOUR RANK"
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.add_theme_font_size_override("font_size", 18)
+	title.add_theme_color_override("font_color", Color(1.0, 0.9, 0.2))
+	rank_panel_box.add_child(title)
+
+	var row = HBoxContainer.new()
+	row.name = "RankRow"
+	row.alignment = BoxContainer.ALIGNMENT_CENTER
+	row.add_theme_constant_override("separation", 2)
+	rank_panel_box.add_child(row)
+	var prev = _rank_slot("Previous", idx - 1, small, false, "Lowest Rank" if idx == 0 else "")
+	prev.name = "Prev"
+	row.add_child(prev)
+	var cur = _rank_slot("Current", idx, big, true, "")
+	cur.name = "Current"
+	row.add_child(cur)
+	var nxt = _rank_slot("Next", idx + 1, small, false, "Highest Rank" if idx == RANK_COUNT - 1 else "")
+	nxt.name = "Next"
+	row.add_child(nxt)
+
+	# Progress bar (same look as the one after a match)
+	var bar_w = inner
+	var frac = _rank_progress(local_elo)
+	var bar_bg = Panel.new()
+	bar_bg.name = "Bar"
+	bar_bg.custom_minimum_size = Vector2(bar_w, 20)
+	rank_panel_box.add_child(bar_bg)
+	var fill = ColorRect.new()
+	fill.name = "Fill"
+	fill.color = Color(0.2, 0.6, 0.9, 0.8)
+	fill.size = Vector2(bar_w * frac, 20)
+	bar_bg.add_child(fill)
+	var marker = ColorRect.new()
+	marker.color = Color(1.0, 0.9, 0.2, 1.0)
+	marker.size = Vector2(5, 20)
+	marker.position = Vector2(clamp(bar_w * frac - 2.5, 0.0, bar_w - 5.0), 0)
+	bar_bg.add_child(marker)
+
+	var ends = HBoxContainer.new()
+	rank_panel_box.add_child(ends)
+	var base = idx * 100
+	var top = MAX_ELO if idx == RANK_COUNT - 1 else base + 100
+	var l = Label.new()
+	l.text = str(base) + " ELO"
+	l.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	l.add_theme_font_size_override("font_size", 10)
+	ends.add_child(l)
+	var r = Label.new()
+	r.text = ("Max: " if idx == RANK_COUNT - 1 else "Next: ") + str(top) + " ELO"
+	r.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	r.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	r.add_theme_font_size_override("font_size", 10)
+	ends.add_child(r)
+
+	var info = Label.new()
+	info.name = "Info"
+	info.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	info.custom_minimum_size = Vector2(inner, 0)
+	info.add_theme_font_size_override("font_size", 12)
+	info.add_theme_color_override("font_color", Color(0.75, 0.9, 1.0))
+	if local_elo >= MAX_ELO:
+		info.text = "MAX RANK REACHED"
+		info.add_theme_color_override("font_color", Color(1.0, 0.85, 0.2))
+	elif idx == RANK_COUNT - 1:
+		info.text = str(local_elo) + " ELO - " + str(MAX_ELO - local_elo) + " to the max ELO"
+	else:
+		info.text = str(local_elo) + " ELO - " + str(top - local_elo) + " to " + rank_name_by_index(idx + 1)
+	rank_panel_box.add_child(info)
+
+# ----- party panel (middle-right of the main menu) -----
+
+func _build_party_panel() -> void :
+	# Rank panel on the left, party panel on the right. On narrow (phone)
+	# screens both get narrower and the menu sits between them.
+	var vp = get_viewport().get_visible_rect().size
+	party_panel_w = 265.0
+	rank_panel_w = 240.0
+	if (vp.x - 380.0) / 2.0 - 24.0 < party_panel_w:
+		# The party panel has more in it, so it gets the bigger share.
+		var avail = vp.x - 380.0 - 32.0
+		party_panel_w = clamp(avail * 0.58, 150.0, 265.0)
+		rank_panel_w = clamp(avail - party_panel_w, 120.0, 240.0)
+		var menu_center = menu_canvas.get_child(0) if menu_canvas.get_child_count() > 0 else null
+		if menu_center is Control:
+			menu_center.offset_left = rank_panel_w + 16.0
+			menu_center.offset_right = -(party_panel_w + 16.0)
+	var panel = PanelContainer.new()
+	panel.set_anchors_preset(Control.PRESET_CENTER_RIGHT)
+	panel.position = Vector2(-(party_panel_w + 12.0), -min(200.0, vp.y * 0.5 - 8.0))
+	panel.custom_minimum_size = Vector2(party_panel_w, 0)
+	menu_canvas.add_child(panel)
+	var outer = VBoxContainer.new()
+	outer.add_theme_constant_override("separation", 6)
+	if vp.y < 600.0:
+		# Short screen: the panel scrolls instead of running off the bottom.
+		var sc = ScrollContainer.new()
+		sc.custom_minimum_size = Vector2(party_panel_w, vp.y - 16.0)
+		sc.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+		panel.add_child(sc)
+		outer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		sc.add_child(outer)
+	else:
+		panel.add_child(outer)
+	party_panel_box = VBoxContainer.new()
+	party_panel_box.add_theme_constant_override("separation", 6)
+	outer.add_child(party_panel_box)
+	party_panel_sig = ""
+	_fill_party_panel()
+
+	# Join with a code (kept outside the refreshing part so typing isn't interrupted)
+	outer.add_child(HSeparator.new())
+	var jl = Label.new()
+	jl.text = "Have a party code?"
+	jl.add_theme_font_size_override("font_size", 12)
+	outer.add_child(jl)
+	var jrow = HBoxContainer.new()
+	outer.add_child(jrow)
+	party_code_input = LineEdit.new()
+	party_code_input.placeholder_text = "6-digit code"
+	party_code_input.max_length = 6
+	party_code_input.alignment = HORIZONTAL_ALIGNMENT_CENTER
+	party_code_input.virtual_keyboard_type = LineEdit.KEYBOARD_TYPE_NUMBER
+	party_code_input.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	party_code_input.text_changed.connect(_on_party_code_typed)
+	party_code_input.text_submitted.connect( func(t): _join_party_code(t))
+	jrow.add_child(party_code_input)
+	var jb = Button.new()
+	jb.text = "Join"
+	jb.custom_minimum_size = Vector2(64, 0)
+	jb.pressed.connect( func(): _join_party_code(party_code_input.text if party_code_input else ""))
+	jrow.add_child(jb)
+
+func _fill_party_panel() -> void :
+	if not party_panel_box:
+		return
+	# Only rebuild when something shown here changed (a rebuild under the
+	# cursor would eat a click).
+	var online_flags: Array = []
+	for m in party_members:
+		online_flags.append(lb_online.has(String(m[0])))
+	var inv_ids: Array = []
+	for inv in party_invites_in:
+		inv_ids.append(String(inv["pid"]))
+	var sig = str([party_members, party_leader, party_code, inv_ids, social_status, online_flags, mm_self_id])
+	if sig == party_panel_sig and party_panel_box.get_child_count() > 0:
+		return
+	party_panel_sig = sig
+	for c in party_panel_box.get_children():
+		c.queue_free()
+	var title = Label.new()
+	title.text = "PARTY" + ("  (" + str(party_members.size()) + "/" + str(PARTY_MAX) + ")" if _in_party() or party_code != "" else "")
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.add_theme_font_size_override("font_size", 18)
+	title.add_theme_color_override("font_color", Color(1.0, 0.9, 0.2))
+	party_panel_box.add_child(title)
+
+	if _in_party():
+		for m in party_members:
+			var mrow = HBoxContainer.new()
+			party_panel_box.add_child(mrow)
+			var l = Label.new()
+			var tid = String(m[0])
+			var here = lb_online.has(tid) or tid == mm_self_id
+			l.text = ("* " if tid == party_leader else "   ") + String(m[1]) + (" (you)" if tid == mm_self_id else "") + ("  - leader" if tid == party_leader else "") + ("" if here else "  (not on menu)")
+			l.add_theme_color_override("font_color", Color(0.6, 1.0, 0.7) if here else Color(0.65, 0.65, 0.65))
+			l.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			mrow.add_child(l)
+			if _is_party_leader() and not here:
+				# e.g. they closed the game - so they don't block queueing.
+				var rm = Button.new()
+				rm.text = "Remove"
+				rm.add_theme_font_size_override("font_size", 11)
+				rm.pressed.connect( func(): _party_remove(tid))
+				mrow.add_child(rm)
+		var hint = Label.new()
+		hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		hint.custom_minimum_size = Vector2(party_panel_w - 20.0, 0)
+		hint.add_theme_font_size_override("font_size", 11)
+		hint.add_theme_color_override("font_color", Color(0.8, 0.8, 0.8))
+		if _is_party_leader():
+			hint.text = "You lead: pick a mode to queue your whole party (2v2 max 2, 3v3 max 3, FFA max 5)."
+		else:
+			hint.text = "Waiting for " + _party_nick(party_leader) + " to pick a mode."
+		party_panel_box.add_child(hint)
+	elif party_code != "":
+		var solo = Label.new()
+		solo.text = "Just you so far - share your code, or invite online players from the Leaderboard."
+		solo.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		solo.custom_minimum_size = Vector2(party_panel_w - 20.0, 0)
+		solo.add_theme_font_size_override("font_size", 12)
+		party_panel_box.add_child(solo)
+	else:
+		var none = Label.new()
+		none.text = "You're not in a party.\nInvite online players from the Leaderboard."
+		none.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		none.custom_minimum_size = Vector2(party_panel_w - 20.0, 0)
+		none.add_theme_font_size_override("font_size", 12)
+		party_panel_box.add_child(none)
+
+	# Party code
+	if party_code != "":
+		var code_row = HBoxContainer.new()
+		party_panel_box.add_child(code_row)
+		var cl = Label.new()
+		cl.text = "Code: " + party_code
+		cl.add_theme_font_size_override("font_size", 18 if party_panel_w >= 240.0 else 15)
+		cl.add_theme_color_override("font_color", Color(0.45, 0.9, 1.0))
+		cl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		code_row.add_child(cl)
+		var cp = Button.new()
+		cp.text = "Copy"
+		cp.add_theme_font_size_override("font_size", 12)
+		cp.pressed.connect(_copy_party_code)
+		code_row.add_child(cp)
+		if _is_party_leader():
+			var nb = Button.new()
+			nb.text = "New"
+			nb.tooltip_text = "Make a new code (the old one stops working)"
+			nb.add_theme_font_size_override("font_size", 12)
+			nb.pressed.connect(_create_party_code)
+			code_row.add_child(nb)
+	elif not _in_party() or _is_party_leader():
+		var mkc = Button.new()
+		mkc.text = "Create Party Code"
+		mkc.custom_minimum_size = Vector2(0, 32)
+		mkc.pressed.connect(_create_party_code)
+		party_panel_box.add_child(mkc)
+
+	if not party_invites_in.is_empty():
+		var inv_title = Label.new()
+		inv_title.text = "Invitations:"
+		inv_title.add_theme_color_override("font_color", Color(1.0, 0.85, 0.4))
+		party_panel_box.add_child(inv_title)
+		for inv in party_invites_in:
+			var row = HBoxContainer.new()
+			party_panel_box.add_child(row)
+			var nl = Label.new()
+			nl.text = String(inv["nick"])
+			nl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			row.add_child(nl)
+			var pid = String(inv["pid"])
+			var a = Button.new()
+			a.text = "Accept"
+			a.pressed.connect( func(): _answer_party_invite(pid, true))
+			row.add_child(a)
+			var d = Button.new()
+			d.text = "Decline"
+			d.pressed.connect( func(): _answer_party_invite(pid, false))
+			row.add_child(d)
+
+	if _in_party():
+		var leave = Button.new()
+		leave.text = "Leave Party"
+		leave.custom_minimum_size = Vector2(0, 34)
+		leave.pressed.connect( func(): _party_leave())
+		party_panel_box.add_child(leave)
+
+	if social_status != "":
+		var st = Label.new()
+		st.text = social_status
+		st.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		st.custom_minimum_size = Vector2(party_panel_w - 20.0, 0)
+		st.add_theme_font_size_override("font_size", 11)
+		st.add_theme_color_override("font_color", Color(0.75, 0.9, 1.0))
+		party_panel_box.add_child(st)
+
+
+# --- CONTROLS ---
+
+func _looks_like_mobile() -> bool:
+	return OS.has_feature("web_android") or OS.has_feature("web_ios") or OS.has_feature("mobile")
+
+func _set_controls(mobile: bool) -> void :
+	mobile_controls = mobile
+	save_player_data()
+
+func _mobile_reset_inputs() -> void :
+	mobile_move = Vector2.ZERO
+	mobile_jump_held = false
+	mobile_e_held = false
+	mobile_q_held = false
+
+func mobile_look_active() -> bool:
+	return mobile_ui != null and mobile_ui.has_method("is_looking") and mobile_ui.is_looking()
+
+func mobile_look(rel: Vector2) -> void :
+	var me = get_local_player()
+	if me:
+		me.apply_look(rel, MOBILE_LOOK_SENSITIVITY)
+
+# --- CHARACTER COLOR SCREEN ---
+
+func _color_name(hex: String) -> String:
+	for preset in COLOR_PRESETS:
+		if String(preset[1]) == hex:
+			return String(preset[0])
+	return "Custom"
+
+func _swatch_style(c: Color, border: Color = Color(0, 0, 0, 0), border_w: int = 0) -> StyleBoxFlat:
+	var sb = StyleBoxFlat.new()
+	sb.bg_color = c
+	sb.set_corner_radius_all(6)
+	sb.border_color = border
+	sb.set_border_width_all(border_w)
+	return sb
+
+func _show_color_picker_ui() -> void :
+	_save_nickname_from_input()
+	_clear_ui()
+	color_canvas = CanvasLayer.new()
+	add_child(color_canvas)
+
+	var center = CenterContainer.new()
+	center.set_anchors_preset(Control.PRESET_FULL_RECT)
+	color_canvas.add_child(center)
+
+	var panel = PanelContainer.new()
+	var vp = get_viewport().get_visible_rect().size
+	if vp.y < 480.0:
+		# Short (phone) screen: let the page scroll.
+		var page = ScrollContainer.new()
+		page.custom_minimum_size = Vector2(min(vp.x - 8.0, 660.0), vp.y - 8.0)
+		page.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+		center.add_child(page)
+		panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		page.add_child(panel)
+	else:
+		center.add_child(panel)
+
+	var outer = VBoxContainer.new()
+	outer.add_theme_constant_override("separation", 8)
+	panel.add_child(outer)
+
+	var title = Label.new()
+	title.text = "CHARACTER COLOR"
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.add_theme_font_size_override("font_size", 22)
+	title.add_theme_color_override("font_color", Color(1.0, 0.9, 0.2))
+	outer.add_child(title)
+
+	var columns = HBoxContainer.new()
+	columns.add_theme_constant_override("separation", 18)
+	outer.add_child(columns)
+
+	# Left: preview, presets, hex code
+	var vbox = VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", 8)
+	columns.add_child(vbox)
+
+	# A capsule-shaped preview of how other players will see you
+	var preview_row = CenterContainer.new()
+	vbox.add_child(preview_row)
+	color_preview = Panel.new()
+	color_preview.custom_minimum_size = Vector2(56, 104)
+	preview_row.add_child(color_preview)
+
+	color_current_label = Label.new()
+	color_current_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	color_current_label.add_theme_font_size_override("font_size", 13)
+	vbox.add_child(color_current_label)
+
+	var grid_center = CenterContainer.new()
+	vbox.add_child(grid_center)
+	var grid = GridContainer.new()
+	grid.columns = 3
+	grid.add_theme_constant_override("h_separation", 8)
+	grid.add_theme_constant_override("v_separation", 8)
+	grid_center.add_child(grid)
+	for preset in COLOR_PRESETS:
+		var hex = String(preset[1])
+		var c = Color.html(hex)
+		var b = Button.new()
+		b.text = String(preset[0])
+		b.custom_minimum_size = Vector2(110, 38)
+		b.add_theme_stylebox_override("normal", _swatch_style(c))
+		b.add_theme_stylebox_override("hover", _swatch_style(c.lightened(0.15), Color.WHITE, 2))
+		b.add_theme_stylebox_override("pressed", _swatch_style(c.darkened(0.15), Color.WHITE, 2))
+		b.add_theme_stylebox_override("focus", _swatch_style(c, Color(1.0, 0.9, 0.2), 3))
+		var text_col = Color.BLACK if c.get_luminance() > 0.55 else Color.WHITE
+		for state in ["font_color", "font_hover_color", "font_pressed_color", "font_focus_color"]:
+			b.add_theme_color_override(state, text_col)
+		b.pressed.connect( func(): _set_character_color(hex))
+		grid.add_child(b)
+
+	var hex_lbl = Label.new()
+	hex_lbl.text = "Or enter a hex code:"
+	hex_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	vbox.add_child(hex_lbl)
+
+	var hex_row = HBoxContainer.new()
+	hex_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	vbox.add_child(hex_row)
+	color_hex_input = LineEdit.new()
+	color_hex_input.placeholder_text = "#FF8800"
+	color_hex_input.custom_minimum_size = Vector2(150, 36)
+	color_hex_input.alignment = HORIZONTAL_ALIGNMENT_CENTER
+	color_hex_input.text_submitted.connect( func(t): _apply_hex_color(t))
+	hex_row.add_child(color_hex_input)
+	var apply_btn = Button.new()
+	apply_btn.text = "Use This Color"
+	apply_btn.custom_minimum_size = Vector2(130, 36)
+	apply_btn.pressed.connect( func(): _apply_hex_color(color_hex_input.text))
+	hex_row.add_child(apply_btn)
+
+	# Right: pick any exact color (drag the square for the shade, the bar for the hue)
+	var right = VBoxContainer.new()
+	right.add_theme_constant_override("separation", 6)
+	columns.add_child(right)
+	var field_lbl = Label.new()
+	field_lbl.text = "Or pick any color:"
+	field_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	right.add_child(field_lbl)
+	color_field = ColorField.new()
+	color_field.set_color(_local_color())
+	color_field.picked.connect(_on_color_field_picked)
+	right.add_child(color_field)
+
+	color_status_label = Label.new()
+	color_status_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	color_status_label.add_theme_font_size_override("font_size", 12)
+	outer.add_child(color_status_label)
+
+	var back_row = CenterContainer.new()
+	outer.add_child(back_row)
+	var back_btn = Button.new()
+	back_btn.text = "Back to Menu"
+	back_btn.custom_minimum_size = Vector2(240, 38)
+	back_btn.pressed.connect(_build_main_menu)
+	back_row.add_child(back_btn)
+
+	_refresh_color_preview()
+
+# Dragging updates the preview live; letting go saves the color.
+func _on_color_field_picked(c: Color, done: bool) -> void :
+	var hex = c.to_html(false).to_lower()
+	if done:
+		_set_character_color(hex, false)
+	else:
+		local_color_hex = hex
+		_refresh_color_preview()
+
+func _local_color() -> Color:
+	return Color.html(local_color_hex) if Color.html_is_valid(local_color_hex) else Color(0.5, 0.5, 0.5)
+
+func _refresh_color_preview() -> void :
+	var c = _local_color()
+	if color_preview:
+		var sb = _swatch_style(c, Color(1, 1, 1, 0.6), 2)
+		sb.set_corner_radius_all(35) # capsule
+		color_preview.add_theme_stylebox_override("panel", sb)
+	if color_current_label:
+		color_current_label.text = "Your color: " + _color_name(local_color_hex) + "  (#" + local_color_hex.to_upper() + ")"
+
+func _set_character_color(hex: String, move_field: bool = true) -> void :
+	local_color_hex = hex.trim_prefix("#").to_lower()
+	save_player_data()
+	_refresh_color_preview()
+	if move_field and color_field:
+		color_field.set_color(_local_color())
+	if color_status_label:
+		color_status_label.text = "Saved! Other players will see you in this color."
+		color_status_label.add_theme_color_override("font_color", Color(0.5, 1.0, 0.6))
+
+# Accepts "#RRGGBB", "RRGGBB", "#RGB" or "RGB".
+func _apply_hex_color(text: String) -> bool:
+	var t = text.strip_edges().trim_prefix("#")
+	var valid = (t.length() == 6 or t.length() == 3) and Color.html_is_valid(t)
+	if not valid:
+		if color_status_label:
+			color_status_label.text = "That's not a valid hex color - try something like #FF8800."
+			color_status_label.add_theme_color_override("font_color", Color(1.0, 0.45, 0.4))
+		return false
+	if t.length() == 3:
+		t = t[0] + t[0] + t[1] + t[1] + t[2] + t[2]
+	_set_character_color(t)
+	return true
+
 func _on_clear_leaderboard_pressed() -> void :
 	clear_leaderboard_data()
 	pending_error_message = "Leaderboard data successfully cleared!"
@@ -3200,8 +4805,12 @@ func _show_leaderboard_ui() -> void :
 	center_panel.set_anchors_preset(Control.PRESET_FULL_RECT)
 	leaderboard_canvas.add_child(center_panel)
 
+	# Fits small (phone) screens too.
+	var vp_size = get_viewport().get_visible_rect().size
+	var lb_w = clamp(vp_size.x - 24.0, 360.0, 760.0)
+	var lb_h = clamp(vp_size.y - 130.0, 180.0, 330.0)
 	var panel = PanelContainer.new()
-	panel.custom_minimum_size = Vector2(380, 320)
+	panel.custom_minimum_size = Vector2(lb_w, 0)
 	center_panel.add_child(panel)
 
 	var container = VBoxContainer.new()
@@ -3212,11 +4821,19 @@ func _show_leaderboard_ui() -> void :
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	container.add_child(title)
 
+	lb_status_label = Label.new()
+	lb_status_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	lb_status_label.add_theme_font_size_override("font_size", 12)
+	lb_status_label.add_theme_color_override("font_color", Color(0.75, 0.9, 1.0))
+	container.add_child(lb_status_label)
+
 	var scroll = ScrollContainer.new()
-	scroll.custom_minimum_size = Vector2(360, 220)
+	scroll.custom_minimum_size = Vector2(lb_w - 20.0, lb_h)
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
 	container.add_child(scroll)
 
 	leaderboard_list = VBoxContainer.new()
+	leaderboard_list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	scroll.add_child(leaderboard_list)
 	_fill_leaderboard_list()
 
@@ -3230,8 +4847,6 @@ func _show_leaderboard_ui() -> void :
 func _fill_leaderboard_list() -> void :
 	if not leaderboard_list:
 		return
-	for c in leaderboard_list.get_children():
-		c.queue_free()
 	var list = leaderboard_list
 	_lb_set(local_nickname, local_elo, float(leaderboard_data.get(local_nickname, {}).get("t", _wall_time())))
 	var online = _lb_online_nicks()
@@ -3241,6 +4856,23 @@ func _fill_leaderboard_list() -> void :
 		var ea = int(leaderboard_data[a].get("elo", 0)) if leaderboard_data[a] is Dictionary else 0
 		var eb = int(leaderboard_data[b].get("elo", 0)) if leaderboard_data[b] is Dictionary else 0
 		return ea > eb if ea != eb else String(a) < String(b))
+	# Skip the rebuild when nothing shown would change (keeps clicks reliable).
+	var sig_rows: Array = []
+	for n in names:
+		var e = leaderboard_data[n]
+		var sn = String(n)
+		var seen_txt = ""
+		if e is Dictionary and float(e.get("seen", 0.0)) > 0.0:
+			seen_txt = _ago(_wall_time() - float(e.get("seen", 0.0)))
+		sig_rows.append([sn, int(e.get("elo", 0)) if e is Dictionary else 0, online.has(sn), _lb_tid_for_nick(sn), seen_txt])
+	var sig = str([sig_rows, local_nickname, challenge_out.get("to", ""), challenge_out.is_empty(), party_invites_out.keys(), _party_ids(), party_leader, mm_self_id])
+	if lb_status_label:
+		lb_status_label.text = social_status
+	if sig == lb_list_sig and leaderboard_list.get_child_count() > 0:
+		return
+	lb_list_sig = sig
+	for c in leaderboard_list.get_children():
+		c.queue_free()
 
 	for player_key in names:
 		var entry = leaderboard_data[player_key]
@@ -3260,14 +4892,60 @@ func _fill_leaderboard_list() -> void :
 
 		var label = Label.new()
 		label.text = " " + str(player_key) + ": " + str(elo) + " ELO (" + get_rank_name(elo) + ")"
+		label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+		label.tooltip_text = label.text
+		label.mouse_filter = Control.MOUSE_FILTER_PASS
 		row.add_child(label)
 
-		if online.has(String(player_key)):
-			var on_lbl = Label.new()
-			on_lbl.text = "  online" if String(player_key) != local_nickname else "  you"
-			on_lbl.add_theme_font_size_override("font_size", 11)
-			on_lbl.add_theme_color_override("font_color", Color(0.5, 1.0, 0.6))
-			row.add_child(on_lbl)
+		var nick = String(player_key)
+		var st_lbl = Label.new()
+		st_lbl.add_theme_font_size_override("font_size", 11)
+		st_lbl.custom_minimum_size = Vector2(175, 0)
+		if nick == local_nickname:
+			st_lbl.text = "you"
+			st_lbl.add_theme_color_override("font_color", Color(0.5, 1.0, 0.6))
+		elif online.has(nick):
+			st_lbl.text = "online"
+			st_lbl.add_theme_color_override("font_color", Color(0.5, 1.0, 0.6))
+		else:
+			# Offline: their ELO is from the last time they were online.
+			var seen = float(entry.get("seen", 0.0)) if entry is Dictionary else 0.0
+			st_lbl.text = "offline" + ("  -  last online " + _ago(_wall_time() - seen) if seen > 0.0 else "")
+			st_lbl.add_theme_color_override("font_color", Color(0.6, 0.6, 0.6))
+		row.add_child(st_lbl)
+
+		# Buttons only for other players who are online (on the main menu) now.
+		var btn_box = HBoxContainer.new()
+		btn_box.custom_minimum_size = Vector2(276, 0)
+		row.add_child(btn_box)
+		var tid = _lb_tid_for_nick(nick) if nick != local_nickname else ""
+		if tid != "":
+			var ch = Button.new()
+			ch.custom_minimum_size = Vector2(140, 30)
+			if not challenge_out.is_empty() and String(challenge_out["to"]) == tid:
+				ch.text = "Challenged..."
+				ch.disabled = true
+			else:
+				ch.text = "Challenge to 1v1"
+				ch.disabled = not challenge_out.is_empty()
+				ch.pressed.connect( func(): _challenge_player(tid, nick))
+			btn_box.add_child(ch)
+			var iv = Button.new()
+			iv.custom_minimum_size = Vector2(130, 30)
+			if _party_ids().has(tid):
+				iv.text = "In your party"
+				iv.disabled = true
+			elif party_invites_out.has(tid):
+				iv.text = "Invited..."
+				iv.disabled = true
+			else:
+				iv.text = "Invite to party"
+				iv.disabled = (_in_party() and not _is_party_leader()) or party_members.size() >= PARTY_MAX
+				iv.pressed.connect( func(): _invite_to_party(tid, nick))
+			btn_box.add_child(iv)
+	if lb_status_label:
+		lb_status_label.text = social_status
 
 
 func calculate_elo_change(player_elo: int, opponent_elo: int, score: float, k_factor: float = 32.0) -> int:
@@ -3294,6 +4972,10 @@ func _process_match_outcome(winning_team: int, dead_list = null) -> void :
 
 	var my_team = get_team(local_peer_id)
 	var is_winner = my_team == winning_team and not forfeited_peers.has(local_peer_id)
+	if mm_custom_match and not CHALLENGE_IS_RANKED:
+		_schedule_room_leave()
+		_show_match_results_screen("You won the challenge!" if is_winner else "You lost the challenge", is_winner, 0, local_elo, local_elo, false, "Friendly challenge - no ELO change.")
+		return
 	var avg = [_team_avg_elo(0), _team_avg_elo(1)]
 	var start_elo = local_elo
 	var my_change = 0
@@ -3334,6 +5016,8 @@ func _process_match_outcome(winning_team: int, dead_list = null) -> void :
 	_schedule_room_leave()
 
 	var banner_text = "You won the 1v1" if is_winner else "You lost the 1v1"
+	if mm_custom_match:
+		banner_text = "You won the challenge!" if is_winner else "You lost the challenge"
 	if team_size > 1:
 		banner_text = ("Your team won the " if is_winner else "Your team lost the ") + game_mode
 	var note = "Half ELO - you were eliminated before your team won." if my_halved else ""
@@ -3539,8 +5223,23 @@ func _clear_ui() -> void :
 		team_hud_label = null
 		dead_banner_label = null
 		leave_confirm_label = null
+		mobile_ui = null
+		console_panel = null
+		_mobile_reset_inputs()
 	menu_online_label = null
 	leaderboard_list = null
+	party_panel_box = null
+	rank_panel_box = null
+	party_code_input = null
+	lb_status_label = null
+	if color_canvas:
+		color_canvas.queue_free()
+		color_canvas = null
+		color_preview = null
+		color_hex_input = null
+		color_status_label = null
+		color_current_label = null
+		color_field = null
 	if results_canvas:
 		results_canvas.queue_free()
 		results_canvas = null
@@ -3929,6 +5628,258 @@ func _spawn_test_dummy(peer_id: int) -> void :
 	player_elos[peer_id] = 0
 
 
+class ColorField extends Control:
+	# Pick any exact color: drag on the square for saturation (left-right) and
+	# brightness (top-bottom), drag on the bar for the hue.
+	signal picked(color: Color, done: bool)
+	const BAR_W: float = 18.0
+	const GAP: float = 8.0
+	var hue: float = 0.0
+	var sat: float = 1.0
+	var val: float = 1.0
+	var dragging: String = ""
+	var sv_tex: ImageTexture = null
+	var hue_tex: ImageTexture = null
+	var tex_hue: float = -1.0
+
+	func _init() -> void:
+		custom_minimum_size = Vector2(250, 250)
+		mouse_filter = Control.MOUSE_FILTER_STOP
+		var img = Image.create(1, 180, false, Image.FORMAT_RGB8)
+		for y in range(180):
+			img.set_pixel(0, y, Color.from_hsv(1.0 - float(y) / 179.0, 1.0, 1.0))
+		hue_tex = ImageTexture.create_from_image(img)
+
+	func set_color(c: Color) -> void:
+		if c.s > 0.01 and c.v > 0.01:
+			hue = c.h
+		sat = c.s
+		val = c.v
+		queue_redraw()
+
+	func get_color() -> Color:
+		return Color.from_hsv(hue, sat, val)
+
+	func _sv_rect() -> Rect2:
+		return Rect2(Vector2.ZERO, Vector2(size.x - BAR_W - GAP, size.y))
+
+	func _hue_rect() -> Rect2:
+		return Rect2(Vector2(size.x - BAR_W, 0), Vector2(BAR_W, size.y))
+
+	func _rebuild_sv() -> void:
+		if sv_tex and is_equal_approx(tex_hue, hue):
+			return
+		tex_hue = hue
+		var n = 64
+		var img = Image.create(n, n, false, Image.FORMAT_RGB8)
+		for y in range(n):
+			for x in range(n):
+				img.set_pixel(x, y, Color.from_hsv(hue, float(x) / float(n - 1), 1.0 - float(y) / float(n - 1)))
+		sv_tex = ImageTexture.create_from_image(img)
+
+	func _draw() -> void:
+		_rebuild_sv()
+		var r = _sv_rect()
+		var hr = _hue_rect()
+		draw_texture_rect(sv_tex, r, false)
+		draw_texture_rect(hue_tex, hr, false)
+		var p = r.position + Vector2(sat * r.size.x, (1.0 - val) * r.size.y)
+		draw_circle(p, 8.0, Color(1, 1, 1, 0.25))
+		draw_arc(p, 8.0, 0.0, TAU, 24, Color.WHITE, 2.0, true)
+		draw_arc(p, 9.5, 0.0, TAU, 24, Color(0, 0, 0, 0.6), 1.0, true)
+		var hy = hr.position.y + (1.0 - hue) * hr.size.y
+		draw_rect(Rect2(hr.position.x - 3, hy - 3, hr.size.x + 6, 6), Color.WHITE, false, 2.0)
+
+	func _gui_input(event: InputEvent) -> void:
+		if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
+			if event.pressed:
+				dragging = "hue" if event.position.x >= _hue_rect().position.x - GAP * 0.5 else "sv"
+				_apply(event.position, false)
+			elif dragging != "":
+				_apply(event.position, true)
+				dragging = ""
+			accept_event()
+		elif event is InputEventMouseMotion and dragging != "":
+			_apply(event.position, false)
+			accept_event()
+
+	func _apply(pos: Vector2, done: bool) -> void:
+		if dragging == "sv":
+			var r = _sv_rect()
+			sat = clamp((pos.x - r.position.x) / r.size.x, 0.0, 1.0)
+			val = clamp(1.0 - (pos.y - r.position.y) / r.size.y, 0.0, 1.0)
+		else:
+			var hr = _hue_rect()
+			hue = clamp(1.0 - (pos.y - hr.position.y) / hr.size.y, 0.0, 0.9999)
+		queue_redraw()
+		picked.emit(get_color(), done)
+
+
+class MobileControls extends Control:
+	# On-screen touch controls, laid out like this:
+	#   top-left: SPRINT (toggle)                 top-right: Q (only with lunge)
+	#   bottom-left: movement joystick            right: HUSS (= E), JUMP below it
+	#   top: LEAVE
+	# Any finger that lands somewhere else drags the camera. Multi-touch:
+	# e.g. one thumb on the joystick while the other looks around.
+	const STICK_R: float = 70.0
+	var mm: Node
+	var touches: Dictionary = {} # touch index -> zone name
+	var stick_vec: Vector2 = Vector2.ZERO
+
+	func _init(manager: Node) -> void:
+		mm = manager
+		mouse_filter = Control.MOUSE_FILTER_IGNORE
+		set_anchors_preset(Control.PRESET_FULL_RECT)
+
+	func is_looking() -> bool:
+		return touches.values().has("look")
+
+	# Sizes are designed for a 620px-tall screen and scale with the screen
+	# height, so the layout keeps its proportions on small phones and on
+	# high-resolution screens alike.
+	func _k() -> float:
+		return clamp(get_viewport_rect().size.y / 620.0, 0.6, 3.0)
+
+	func _layout() -> Dictionary:
+		var s = get_viewport_rect().size
+		var k = _k()
+		var q_y = 125.0 * k
+		if mm.team_hud_label and mm.team_hud_label.visible:
+			q_y = max(q_y, mm.team_hud_label.get_global_rect().end.y + 10.0)
+		return {
+			"k": k,
+			"stick_r": STICK_R * k,
+			"stick_center": Vector2(150 * k, s.y - 200 * k),
+			"sprint": Rect2(115 * k, max(105 * k, 100.0), 140 * k, 64 * k),
+			"q": Rect2(s.x - 225 * k, q_y, 80 * k, 52 * k),
+			"huss": Rect2(s.x - 250 * k, s.y - 250 * k, 120 * k, 76 * k),
+			"jump": Rect2(s.x - 240 * k, s.y - 145 * k, 110 * k, 100 * k),
+			"leave": Rect2(200, 10, 90 * min(k, 1.0), 40 * min(k, 1.0)), # beside the fixed-size HP box
+		}
+
+	func _zone_visible(zone: String) -> bool:
+		var me = mm.get_local_player()
+		var alive = me != null and not me.is_dead
+		match zone:
+			"huss", "jump":
+				return alive
+			"q":
+				return alive and mm.local_ability == "lunge"
+		return true
+
+	func _zone_at(pos: Vector2) -> String:
+		var L = _layout()
+		for z in ["q", "huss", "jump", "sprint", "leave"]:
+			if _zone_visible(z) and (L[z] as Rect2).grow(6).has_point(pos):
+				return z
+		if pos.distance_to(L["stick_center"]) <= float(L["stick_r"]) * 1.8:
+			return "stick"
+		return "look"
+
+	func _held(zone: String) -> bool:
+		return touches.values().has(zone)
+
+	func _sync_buttons() -> void:
+		mm.mobile_jump_held = _held("jump")
+		mm.mobile_e_held = _held("huss")
+		mm.mobile_q_held = _held("q")
+
+	func release_all() -> void:
+		touches.clear()
+		stick_vec = Vector2.ZERO
+		mm._mobile_reset_inputs()
+
+	func _update_stick(pos: Vector2) -> void:
+		var L = _layout()
+		var v = (pos - L["stick_center"]) / float(L["stick_r"])
+		if v.length() > 1.0:
+			v = v.normalized()
+		stick_vec = v
+		mm.mobile_move = v
+
+	func _input(event: InputEvent) -> void:
+		if not visible:
+			return
+		if event is InputEventScreenTouch:
+			if event.pressed:
+				var z = _zone_at(event.position)
+				touches[event.index] = z
+				get_viewport().set_input_as_handled()
+				match z:
+					"stick":
+						_update_stick(event.position)
+					"sprint":
+						mm.mobile_sprint_on = not mm.mobile_sprint_on
+					"leave":
+						touches.erase(event.index)
+						mm._on_leave_requested() # may end the match and free this
+						return
+				_sync_buttons()
+			else:
+				var z2 = touches.get(event.index, "")
+				touches.erase(event.index)
+				if z2 == "stick":
+					stick_vec = Vector2.ZERO
+					mm.mobile_move = Vector2.ZERO
+				_sync_buttons()
+				if z2 != "":
+					get_viewport().set_input_as_handled()
+		elif event is InputEventScreenDrag:
+			var z3 = touches.get(event.index, "")
+			if z3 == "stick":
+				_update_stick(event.position)
+			elif z3 == "look":
+				mm.mobile_look(event.relative)
+			if z3 != "":
+				get_viewport().set_input_as_handled()
+
+	func _process(_delta: float) -> void:
+		var show = mm.mobile_controls and mm.is_match_active and not mm.is_game_over and mm.get_local_player() != null
+		if visible != show:
+			visible = show
+			if not show:
+				release_all()
+		if visible:
+			queue_redraw()
+
+	func _btn(r: Rect2, title: String, sub: String, lit: bool, held: bool, accent: Color = Color(1, 1, 1)) -> void:
+		var sb = StyleBoxFlat.new()
+		var a = 0.6 if held else (0.45 if lit else 0.28)
+		sb.bg_color = Color(accent.r * 0.35, accent.g * 0.35, accent.b * 0.35, a) if not lit else Color(accent.r, accent.g, accent.b, a)
+		sb.set_corner_radius_all(14)
+		sb.border_color = Color(1, 1, 1, 0.75 if lit or held else 0.45)
+		sb.set_border_width_all(3 if held else 2)
+		draw_style_box(sb, r)
+		var font = ThemeDB.fallback_font
+		var k = _k()
+		var big = min(int((22 if r.size.y >= 60 * k else 18) * k), int(r.size.y * 0.45))
+		var y = r.position.y + r.size.y * 0.5 + big * 0.35 - (8 * k if sub != "" else 0.0)
+		draw_string(font, Vector2(r.position.x, y), title, HORIZONTAL_ALIGNMENT_CENTER, r.size.x, big, Color(1, 1, 1, 0.95))
+		if sub != "":
+			draw_string(font, Vector2(r.position.x, y + 20 * k), sub, HORIZONTAL_ALIGNMENT_CENTER, r.size.x, int(13 * k), Color(1, 1, 1, 0.85))
+
+	func _draw() -> void:
+		var L = _layout()
+		var me = mm.get_local_player()
+		# joystick
+		var c: Vector2 = L["stick_center"]
+		var r: float = L["stick_r"]
+		draw_circle(c, r, Color(1, 1, 1, 0.10))
+		draw_arc(c, r, 0.0, TAU, 48, Color(1, 1, 1, 0.55), 3.0, true)
+		draw_circle(c + stick_vec * r, r * 0.42, Color(1, 1, 1, 0.5 if _held("stick") else 0.32))
+		# buttons
+		_btn(L["sprint"], "SPRINT", "ON" if mm.mobile_sprint_on else "OFF", mm.mobile_sprint_on, false, Color(0.3, 0.9, 0.4))
+		if _zone_visible("huss"):
+			var can_huss = me != null and (me.targeted_opponent != null or me.qte_active)
+			_btn(L["huss"], "HUSS", "", can_huss, mm.mobile_e_held, Color(1.0, 0.85, 0.2))
+		if _zone_visible("jump"):
+			_btn(L["jump"], "JUMP", "", false, mm.mobile_jump_held)
+		if _zone_visible("q"):
+			_btn(L["q"], "Q", "LUNGE", true, mm.mobile_q_held, Color(1.0, 0.75, 0.15))
+		_btn(L["leave"], "LEAVE", "", false, false, Color(1.0, 0.4, 0.4))
+
+
 class Crosshair extends Control:
 	# Plus-shaped crosshair drawn around this control's origin (screen center).
 	const ARM: float = 9.0
@@ -4274,6 +6225,23 @@ class NetworkPlayer extends CharacterBody3D:
 	var outline_material: StandardMaterial3D
 
 	var is_dummy: bool = false
+	var team_ring: MeshInstance3D = null
+	# Mannequin body (replaces the old capsule). mesh_inst is the root: hiding
+	# it hides the whole body; every part shares base_material (color + outline).
+	var body_parts: Array = []
+	var hip_l: Node3D = null
+	var hip_r: Node3D = null
+	var knee_l: Node3D = null
+	var knee_r: Node3D = null
+	var shoulder_l: Node3D = null
+	var shoulder_r: Node3D = null
+	var anim_phase: float = 0.0
+	var anim_amount: float = 0.0
+	var anim_last_pos: Vector3 = Vector3.ZERO
+	var anim_window: float = 0.0
+	var anim_speed: float = 0.0
+	var anim_vspeed: float = 0.0
+	const ARM_TILT: float = 0.95 # radians out from the sides (the A-pose in the sketch)
 	var is_movement_locked: bool = false
 	var lock_sources: Dictionary = {} # attacker peer_id -> true while their QTE holds us
 	var team: int = 0
@@ -4301,6 +6269,8 @@ class NetworkPlayer extends CharacterBody3D:
 
 	var qte_elapsed: float = 0.0
 	const QTE_MAX_DURATION: float = 4.0
+	# How fast the QTE marker sweeps the bar (bar widths per second). Was 1.5.
+	const QTE_SPEED: float = 1.0
 	var lock_failsafe_timer: float = 0.0
 	const MOVEMENT_LOCK_FAILSAFE: float = 6.0
 
@@ -4398,6 +6368,8 @@ class NetworkPlayer extends CharacterBody3D:
 			targeted_opponent = null
 		if mesh_inst:
 			mesh_inst.visible = false
+		if team_ring:
+			team_ring.visible = false
 		for lbl in [name_label, hussing_label, ability_tag, get_node_or_null("HPLabel")]:
 			if lbl:
 				lbl.visible = false
@@ -4441,26 +6413,32 @@ class NetworkPlayer extends CharacterBody3D:
 			elif mech == "ice_physics":
 				friction = 0.1
 
-		mesh_inst = MeshInstance3D.new()
-		var cap = CapsuleMesh.new()
-		cap.height = 1.8
-		cap.radius = 0.4
-		mesh_inst.mesh = cap
-		mesh_inst.position.y = 0.9
-
 		base_material = StandardMaterial3D.new()
+		base_material.roughness = 0.55
 		if is_dummy:
 			base_material.albedo_color = Color(0.6, 0.6, 0.6)
-		elif main_manager.is_ffa:
-			base_material.albedo_color = main_manager.player_color(peer_id)
-		elif main_manager.team_size > 1 and not main_manager.is_single_player:
-			var team_col: Color = main_manager.TEAM_COLORS[team]
-			base_material.albedo_color = team_col.lerp(Color(randf(), randf(), randf()), 0.15)
 		else:
-			base_material.albedo_color = Color(randf(), randf(), randf())
+			base_material.albedo_color = main_manager.player_body_color(peer_id)
+		_build_body()
 
-		mesh_inst.material_override = base_material
-		add_child(mesh_inst)
+		# Team modes: everyone wears their own color, so a glowing team-colored
+		# ring around the waist shows which side they're on.
+		if not is_dummy and main_manager.team_size > 1 and not main_manager.is_single_player:
+			team_ring = MeshInstance3D.new()
+			var torus = TorusMesh.new()
+			torus.inner_radius = 0.31 # a glowing belt around the mannequin's waist
+			torus.outer_radius = 0.4
+			team_ring.mesh = torus
+			team_ring.position.y = 1.03
+			var ring_mat = StandardMaterial3D.new()
+			ring_mat.albedo_color = main_manager.TEAM_COLORS[team]
+			ring_mat.emission_enabled = true
+			ring_mat.emission = main_manager.TEAM_COLORS[team]
+			ring_mat.emission_energy_multiplier = 1.5
+			team_ring.material_override = ring_mat
+			# Other players see your ring; you don't see your own.
+			team_ring.visible = not is_local_player()
+			add_child(team_ring)
 
 		outline_material = StandardMaterial3D.new()
 		outline_material.cull_mode = BaseMaterial3D.CULL_FRONT
@@ -4522,7 +6500,131 @@ class NetworkPlayer extends CharacterBody3D:
 			camera = Camera3D.new()
 			camera.position = Vector3(0, 1.5, 0)
 			add_child(camera)
-			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+			if not main_manager.mobile_controls:
+				Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+		if main_manager and main_manager.mobile_controls and hussing_label:
+			hussing_label.text = "You're in Hussing range, tap HUSS"
+
+	# ---- mannequin body ----
+	# Feet at y=0, top of the head at ~1.8 (same as the collision capsule).
+	# Separate pieces with small gaps, like the sketch: dome head, block
+	# torso, upper arm / elbow / forearm, thigh / knee / shin.
+	func _body_part(mesh: Mesh, parent: Node3D, pos: Vector3, rot: Vector3 = Vector3.ZERO) -> MeshInstance3D:
+		var mi = MeshInstance3D.new()
+		mi.mesh = mesh
+		mi.position = pos
+		mi.rotation = rot
+		mi.material_override = base_material
+		parent.add_child(mi)
+		body_parts.append(mi)
+		return mi
+
+	func _capsule(r: float, h: float) -> CapsuleMesh:
+		var m = CapsuleMesh.new()
+		m.radius = r
+		m.height = h
+		m.radial_segments = 16
+		m.rings = 4
+		return m
+
+	func _sphere(r: float, h: float) -> SphereMesh:
+		var m = SphereMesh.new()
+		m.radius = r
+		m.height = h
+		m.radial_segments = 16
+		m.rings = 8
+		return m
+
+	func _build_body() -> void :
+		mesh_inst = MeshInstance3D.new() # root, no mesh of its own
+		mesh_inst.name = "Body"
+		add_child(mesh_inst)
+
+		# Torso: a plain block, like the sketch.
+		var torso = BoxMesh.new()
+		torso.size = Vector3(0.52, 0.52, 0.28)
+		_body_part(torso, mesh_inst, Vector3(0, 1.22, 0))
+		# Neck + dome-shaped head
+		var neck = CylinderMesh.new()
+		neck.top_radius = 0.06
+		neck.bottom_radius = 0.075
+		neck.height = 0.08
+		_body_part(neck, mesh_inst, Vector3(0, 1.51, 0))
+		var head = _sphere(0.15, 0.27)
+		_body_part(head, mesh_inst, Vector3(0, 1.665, 0))
+
+		# Arms: shoulder pivots so they can swing; pieces run down the pivot's -Y.
+		for side in [-1, 1]:
+			var sh = Node3D.new()
+			sh.position = Vector3(0.34 * side, 1.42, 0)
+			sh.rotation = Vector3(0, 0, ARM_TILT * side)
+			mesh_inst.add_child(sh)
+			_body_part(_capsule(0.068, 0.3), sh, Vector3(0, -0.17, 0))
+			_body_part(_sphere(0.055, 0.11), sh, Vector3(0, -0.365, 0))
+			_body_part(_capsule(0.072, 0.3), sh, Vector3(0, -0.56, 0))
+			if side < 0:
+				shoulder_l = sh
+			else:
+				shoulder_r = sh
+
+		# Legs: hip pivot (thigh) -> knee pivot (knee joint + shin).
+		for side in [-1, 1]:
+			var hip = Node3D.new()
+			hip.position = Vector3(0.13 * side, 0.95, 0)
+			mesh_inst.add_child(hip)
+			_body_part(_capsule(0.095, 0.4), hip, Vector3(0, -0.2, 0))
+			var knee = Node3D.new()
+			knee.position = Vector3(0, -0.47, 0)
+			hip.add_child(knee)
+			_body_part(_sphere(0.07, 0.13), knee, Vector3.ZERO)
+			_body_part(_capsule(0.092, 0.42), knee, Vector3(0, -0.27, 0))
+			if side < 0:
+				hip_l = hip
+				knee_l = knee
+			else:
+				hip_r = hip
+				knee_r = knee
+
+		# Your own body: you only see its shadow (the camera sits inside the
+		# chest, so the arms/legs would otherwise be in your face).
+		if is_local_player():
+			for part in body_parts:
+				part.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_SHADOWS_ONLY
+		anim_last_pos = global_position if is_inside_tree() else Vector3.ZERO
+
+	# Simple walk cycle driven by how fast the body is actually moving (works
+	# the same for remote players, whose positions come over the network).
+	func _process(delta: float) -> void :
+		if not mesh_inst or not hip_l or delta <= 0.0:
+			return
+		# Speed measured over ~0.15s, not per frame: positions only change on
+		# physics ticks / when network updates arrive, which can be less often
+		# than frames are drawn.
+		anim_window += delta
+		if anim_window >= 0.15:
+			var moved = global_position - anim_last_pos
+			anim_last_pos = global_position
+			anim_vspeed = abs(moved.y) / anim_window
+			moved.y = 0.0
+			anim_speed = moved.length() / anim_window
+			if anim_speed > 40.0:
+				anim_speed = 0.0 # a teleport / respawn, not walking
+			anim_window = 0.0
+		var speed = anim_speed
+		var target = clamp(speed / 8.0, 0.0, 1.0)
+		if anim_vspeed > 2.0:
+			target *= 0.3 # jumping / falling / climbing: legs mostly still
+		anim_amount = lerp(anim_amount, target, clamp(delta * 10.0, 0.0, 1.0))
+		anim_phase = fmod(anim_phase + delta * (4.0 + speed * 0.9), TAU)
+		var swing = sin(anim_phase) * 0.6 * anim_amount
+		hip_l.rotation.x = swing
+		hip_r.rotation.x = -swing
+		knee_l.rotation.x = -max(0.0, -sin(anim_phase)) * 0.8 * anim_amount
+		knee_r.rotation.x = -max(0.0, sin(anim_phase)) * 0.8 * anim_amount
+		# Arms swing opposite to the legs and drop a little closer to the body.
+		var tilt = ARM_TILT - 0.25 * anim_amount
+		shoulder_l.rotation = Vector3(-swing * 0.7, 0, -tilt)
+		shoulder_r.rotation = Vector3(swing * 0.7, 0, tilt)
 
 	func update_nametag(nickname: String, elo: int) -> void :
 		if name_label and main_manager and not is_dummy:
@@ -4642,27 +6744,30 @@ class NetworkPlayer extends CharacterBody3D:
 				is_launching = false
 			return
 
-		if Input.is_key_pressed(KEY_TAB):
-			Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
-		elif Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
-			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+		if is_dead and main_manager.ghosts_can_fly():
+			_process_ghost_flight(delta)
+			return
+
+		_update_mouse_capture()
 
 		if not is_dead:
+			if main_manager.mobile_controls:
+				_apply_aim_assist(delta)
 			_detect_and_highlight_opponents()
 
-			if Input.is_key_pressed(KEY_E) and targeted_opponent and not main_manager.combat_cooldown_active and not main_manager.is_qte_in_progress:
+			if _e_down() and targeted_opponent and not main_manager.combat_cooldown_active and not main_manager.is_qte_in_progress:
 				_start_qte()
 
 		if not is_on_floor():
 			velocity.y -= 20.0 * gravity_mult * delta
 
-		var is_sprinting: bool = Input.is_key_pressed(KEY_SHIFT) or Input.is_physical_key_pressed(KEY_SHIFT)
+		var is_sprinting: bool = Input.is_key_pressed(KEY_SHIFT) or Input.is_physical_key_pressed(KEY_SHIFT) or main_manager.mobile_sprint_on
 		var current_speed: float = sprint_speed if is_sprinting else walk_speed
 		var ability: String = main_manager.local_ability
 		if ability == "speed_boost":
 			current_speed *= main_manager.SPEED_BOOST_MULT
 
-		var jump_pressed: bool = Input.is_key_pressed(KEY_SPACE) or Input.is_physical_key_pressed(KEY_SPACE) or Input.is_action_just_pressed("ui_accept")
+		var jump_pressed: bool = Input.is_key_pressed(KEY_SPACE) or Input.is_physical_key_pressed(KEY_SPACE) or Input.is_action_just_pressed("ui_accept") or main_manager.mobile_jump_held
 		var jump_just_pressed = jump_pressed and not jump_held_last
 		jump_held_last = jump_pressed
 		if jump_pressed and is_on_floor():
@@ -4672,7 +6777,7 @@ class NetworkPlayer extends CharacterBody3D:
 			velocity.y = jump_velocity * 1.1
 			main_manager.consume_local_ability("used")
 
-		var q_pressed = Input.is_key_pressed(KEY_Q) or Input.is_physical_key_pressed(KEY_Q)
+		var q_pressed = Input.is_key_pressed(KEY_Q) or Input.is_physical_key_pressed(KEY_Q) or main_manager.mobile_q_held
 		var q_just_pressed = q_pressed and not q_held_last
 		q_held_last = q_pressed
 		if q_just_pressed and ability == "lunge":
@@ -4684,6 +6789,7 @@ class NetworkPlayer extends CharacterBody3D:
 		if Input.is_key_pressed(KEY_S) or Input.is_key_pressed(KEY_DOWN): input_dir.z += 1
 		if Input.is_key_pressed(KEY_A) or Input.is_key_pressed(KEY_LEFT): input_dir.x -= 1
 		if Input.is_key_pressed(KEY_D) or Input.is_key_pressed(KEY_RIGHT): input_dir.x += 1
+		input_dir += _mobile_move_dir()
 
 		var direction = (transform.basis * input_dir).normalized()
 		if direction != Vector3.ZERO:
@@ -4699,6 +6805,101 @@ class NetworkPlayer extends CharacterBody3D:
 
 		move_and_slide()
 		_send_p2p_position()
+
+	# Ghosts fly where they look: look up and hold W to rise, look down to sink,
+	# A/D strafe, Shift = faster. No gravity; let go of the keys to hover.
+	func _process_ghost_flight(delta: float) -> void :
+		_update_mouse_capture()
+
+		var input_dir: Vector3 = Vector3.ZERO
+		if Input.is_key_pressed(KEY_W) or Input.is_key_pressed(KEY_UP): input_dir.z -= 1
+		if Input.is_key_pressed(KEY_S) or Input.is_key_pressed(KEY_DOWN): input_dir.z += 1
+		if Input.is_key_pressed(KEY_A) or Input.is_key_pressed(KEY_LEFT): input_dir.x -= 1
+		if Input.is_key_pressed(KEY_D) or Input.is_key_pressed(KEY_RIGHT): input_dir.x += 1
+		input_dir += _mobile_move_dir()
+		if input_dir.length() > 1.0:
+			input_dir = input_dir.normalized()
+
+		var look: Basis = camera.global_transform.basis if camera else global_transform.basis
+		var dir: Vector3 = -look.z * -input_dir.z + look.x * input_dir.x
+		if dir.length() > 0.001:
+			dir = dir.normalized()
+		var fast: bool = Input.is_key_pressed(KEY_SHIFT) or Input.is_physical_key_pressed(KEY_SHIFT) or main_manager.mobile_sprint_on
+		var speed: float = sprint_speed * main_manager.GHOST_FAST_MULT if fast else walk_speed
+		velocity = velocity.lerp(dir * speed, min(1.0, 10.0 * delta))
+		move_and_slide()
+		if global_position.y > main_manager.GHOST_FLY_MAX_HEIGHT:
+			global_position.y = main_manager.GHOST_FLY_MAX_HEIGHT
+			velocity.y = min(velocity.y, 0.0)
+		_send_p2p_position()
+
+	# --- INPUT HELPERS (keyboard/mouse on PC, touch on mobile) ---
+	func _e_down() -> bool:
+		return Input.is_key_pressed(KEY_E) or main_manager.mobile_e_held
+
+	func _mobile_move_dir() -> Vector3:
+		var v: Vector2 = main_manager.mobile_move
+		if v.length() < 0.15:
+			return Vector3.ZERO
+		return Vector3(v.x, 0.0, v.y) # stick up = forward
+
+	func _update_mouse_capture() -> void :
+		if main_manager.mobile_controls:
+			if Input.mouse_mode != Input.MOUSE_MODE_VISIBLE:
+				Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+			return
+		if Input.is_key_pressed(KEY_TAB):
+			Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+		elif Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
+			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+
+	# Turning the view from a touch drag (mobile).
+	func apply_look(rel: Vector2, sens: float) -> void :
+		if is_movement_locked:
+			return
+		rotate_y(-rel.x * sens)
+		if camera:
+			camera.rotate_x(-rel.y * sens)
+			camera.rotation.x = clamp(camera.rotation.x, deg_to_rad(-89), deg_to_rad(89))
+
+	# Mobile aim assist: if an opponent is close, roughly in front of you and in
+	# plain sight, the camera is pulled toward them (gently while you're
+	# dragging the view yourself, so you can still look away).
+	func _apply_aim_assist(delta: float) -> void :
+		if not camera or is_movement_locked:
+			return
+		var cam_pos = camera.global_position
+		var fwd = -camera.global_transform.basis.z
+		var best: NetworkPlayer = null
+		var best_angle = deg_to_rad(main_manager.AIM_ASSIST_CONE_DEG)
+		var space = get_world_3d().direct_space_state
+		for child in get_parent().get_children():
+			if not (child is NetworkPlayer) or child == self or child.is_dead or main_manager.is_teammate(child.peer_id, peer_id):
+				continue
+			var tp = child.global_position + Vector3(0, 0.9, 0)
+			var to = tp - cam_pos
+			var dist = to.length()
+			if dist < 0.5 or dist > main_manager.AIM_ASSIST_RANGE:
+				continue
+			var ang = fwd.angle_to(to)
+			if ang > best_angle:
+				continue
+			var q = PhysicsRayQueryParameters3D.create(cam_pos, tp)
+			q.exclude = [get_rid()]
+			q.collision_mask = 1
+			if space.intersect_ray(q).get("collider") != child:
+				continue
+			best_angle = ang
+			best = child
+		if best == null:
+			return
+		var to_t = best.global_position + Vector3(0, 0.9, 0) - cam_pos
+		var desired_yaw = atan2(-to_t.x, -to_t.z)
+		var desired_pitch = atan2(to_t.y, Vector2(to_t.x, to_t.z).length())
+		var k = main_manager.AIM_ASSIST_STRENGTH * (0.3 if main_manager.mobile_look_active() else 1.0)
+		var t = 1.0 - exp(-k * delta)
+		rotation.y += wrapf(desired_yaw - rotation.y, -PI, PI) * t
+		camera.rotation.x = clamp(lerp(camera.rotation.x, desired_pitch, t), deg_to_rad(-89), deg_to_rad(89))
 
 	# --- LADDERS ---
 	func enter_ladder(ladder: Node) -> void :
@@ -5122,7 +7323,7 @@ class NetworkPlayer extends CharacterBody3D:
 		bg.add_child(qte_indicator)
 
 	func _process_qte(delta: float) -> void :
-		if not Input.is_key_pressed(KEY_E):
+		if not _e_down():
 			qte_e_released = true
 
 		# Don't let an unanswered QTE hold the opponent frozen forever.
@@ -5136,7 +7337,7 @@ class NetworkPlayer extends CharacterBody3D:
 			qte_delay_timer -= delta
 			return
 
-		qte_progress += delta * 1.5 * qte_direction
+		qte_progress += delta * QTE_SPEED * qte_direction
 		if qte_progress >= 1.0:
 			qte_progress = 1.0
 			qte_direction = -1.0
@@ -5147,7 +7348,7 @@ class NetworkPlayer extends CharacterBody3D:
 		if qte_indicator:
 			qte_indicator.position.x = qte_progress * (400 - 8)
 
-		if qte_e_released and Input.is_key_pressed(KEY_E):
+		if qte_e_released and _e_down():
 			_evaluate_qte()
 
 	func _evaluate_qte() -> void :
