@@ -4,7 +4,7 @@
 // Incrementing CACHE_VERSION will kick off the install event and force
 // previously cached resources to be updated from the network.
 /** @type {string} */
-const CACHE_VERSION = '1792903116|89014869';
+const CACHE_VERSION = '1792945974|67920393';
 /** @type {string} */
 const CACHE_PREFIX = 'Huss Ranked-sw-cache-';
 const CACHE_NAME = CACHE_PREFIX + CACHE_VERSION;
