@@ -11,7 +11,15 @@ const GAME_MODES: Dictionary = {
 	"1v1": {"team_size": 1, "label": "Ranked 1v1"},
 	"2v2": {"team_size": 2, "label": "Ranked 2v2"},
 	"3v3": {"team_size": 3, "label": "Ranked 3v3"},
+	# Free For All: 3-5 players, everyone for themselves.
+	"ffa": {"team_size": 1, "label": "Free For All", "min": 3, "max": 5},
 }
+# Free For All: once 3 players are queued, wait this long for more (a 5th
+# player starts it right away), then start with whoever is there.
+const FFA_WAIT_SECONDS: float = 30.0
+const FFA_COLORS: Array = [Color(1.0, 0.85, 0.2), Color(0.3, 0.9, 1.0), Color(1.0, 0.45, 0.9), Color(0.5, 1.0, 0.4), Color(1.0, 0.6, 0.25)]
+# Spawns around the arena, everyone facing the middle.
+const FFA_SPAWNS: Array = [Vector3(-15, 1, 0), Vector3(15, 1, 0), Vector3(0, 1, -15), Vector3(0, 1, 15), Vector3(-15, 1, -15)]
 const TEAM_NAMES: Array = ["BLUE", "RED"]
 const TEAM_COLORS: Array = [Color(0.25, 0.55, 1.0), Color(1.0, 0.3, 0.3)]
 # Spawn spread along Z for each team size (team 0 at x = -15, team 1 at x = 15).
@@ -19,6 +27,9 @@ const TEAM_SPAWN_Z: Dictionary = {1: [0.0], 2: [-3.5, 3.5], 3: [-7.0, 0.0, 7.0]}
 
 var game_mode: String = "1v1"
 var team_size: int = 1
+var is_ffa: bool = false
+var ffa_wait_timer: float = -1.0 # counts up once enough players are queued
+var ffa_places: Dictionary = {} # peer_id -> final placement (1 = winner)
 # Everyone in a match gets a peer ID 1..N from the sorted room roster; 1 = host.
 var local_peer_id: int = 1
 var player_teams: Dictionary = {} # peer_id -> 0 (Blue) / 1 (Red)
@@ -50,7 +61,22 @@ const MM_LEADER_SKIP_MS: int = 10000
 # actually delivered before leaving the room tears down the connection.
 const MM_CONFIRM_LINGER: float = 1.5
 
-var mm_phase: String = "idle" # "idle", "lobby", "match"
+var mm_phase: String = "idle" # "idle", "menu", "lobby", "match"
+
+# --- LEADERBOARD ROOM (main menu only) ---
+# Everyone on the main menu (or the leaderboard screen) sits in this room. It
+# carries no gameplay at all - only nicknames and ELO, so leaderboards stay in
+# sync between everyone who's online. Leaving the menu (queueing, practice)
+# leaves the room.
+const LEADERBOARD_ROOM_CODE: String = "hussle_leaderboard_room"
+const LB_HEARTBEAT: float = 4.0
+const LB_ONLINE_TIMEOUT_MS: int = 12000
+var lb_online: Dictionary = {} # trystero id -> {"nick", "elo", "ms"} for players in the room
+var lb_heartbeat_timer: float = 0.0
+var lb_ui_dirty: bool = false
+var lb_ui_timer: float = 0.0
+var menu_online_label: Label = null
+var leaderboard_list: VBoxContainer = null
 var mm_self_id: String = ""
 var mm_lobby_peers: Dictionary = {} # trystero id -> "searching" / "busy" / "unknown"
 var mm_skip_until: Dictionary = {} # trystero id -> ticks_msec until we can invite them again
@@ -224,6 +250,18 @@ const MAP_BAN_TURN_TIME: float = 20.0
 var map_ban_timer: float = 0.0
 var map_ban_timer_label: Label = null
 
+# --- PRACTICE DUMMY DIFFICULTY ---
+# Picked after the map bans in practice mode. (There is no level 5 yet.)
+const DUMMY_LEVELS: Array = [
+	{"name": "Level 1 - Wanderer", "desc": "Just walks around and runs away from you."},
+	{"name": "Level 2 - Hopper", "desc": "Jumps around and moves a bit faster."},
+	{"name": "Level 3 - Fighter", "desc": "Hunts you with smarter pathfinding and attacks - misses 50% of the time."},
+	{"name": "Level 4 - Hunter", "desc": "Misses only 30% of the time and moves at sprint speed."},
+]
+var dummy_level: int = 1
+var dummy_level_canvas: CanvasLayer = null
+var sp_fell_off: bool = false
+
 # --- PRACTICE DUMMY PATHFINDING ---
 # The arena interior is covered by a 1m grid (49x49 cells, x/z from -24 to 24).
 const NAV_HALF_EXTENT: int = 24
@@ -394,7 +432,7 @@ func _unhandled_input(_event: InputEvent) -> void :
 		if is_match_active and not is_game_over:
 			# In 2v2/3v3 leaving hurts your team and is easy to do by accident
 			# (browsers use Esc to release the mouse), so it takes two presses.
-			if team_size > 1 and not is_single_player and _now_ms() - leave_confirm_ms > LEAVE_CONFIRM_MS:
+			if (team_size > 1 or is_ffa) and not is_single_player and _now_ms() - leave_confirm_ms > LEAVE_CONFIRM_MS:
 				leave_confirm_ms = _now_ms()
 				if leave_confirm_label:
 					leave_confirm_label.visible = true
@@ -488,6 +526,10 @@ func _on_trystero_peer_joined(args: Array) -> void :
 	last_heard[peer_id_str] = _now_ms()
 	relay_cache.clear()
 
+	if mm_phase == "menu":
+		_lb_on_peer_joined(peer_id_str)
+		return
+
 	if mm_phase == "lobby":
 		if not mm_lobby_peers.has(peer_id_str):
 			mm_lobby_peers[peer_id_str] = "unknown"
@@ -545,6 +587,9 @@ func _host_try_setup() -> void :
 	var teams: Dictionary = {}
 	for i in range(n):
 		teams[order[i]] = pattern[i]
+	if is_ffa:
+		for pid in range(1, n + 1):
+			teams[pid] = pid - 1
 
 	var indices: Array = range(map_pool.size())
 	indices.shuffle()
@@ -593,6 +638,8 @@ func _apply_match_setup(data: Dictionary) -> void :
 			if pid != local_peer_id and get_team(pid) == my_team:
 				mates.append(String(player_nicknames.get(pid, "Player")))
 		log_console("[Match] You're on " + TEAM_NAMES[my_team] + " team with " + ", ".join(PackedStringArray(mates)) + ".")
+	elif is_ffa:
+		log_console("[Match] Free For All with " + str(all_player_ids().size()) + " players - last one standing wins!")
 	else:
 		log_console("[Match] Opponent: " + String(player_nicknames.get(_first_enemy_id(), "Opponent")))
 
@@ -603,11 +650,22 @@ func _on_trystero_peer_left(args: Array) -> void :
 	direct_peers.erase(peer_id_str)
 	relay_cache.clear()
 
+	if mm_phase == "menu":
+		# Most likely they left the menu (queued / started practice). If they're
+		# still around through a relay, their next heartbeat brings them back.
+		lb_online.erase(peer_id_str)
+		_lb_update_online_label()
+		return
+
 	# Losing the direct link doesn't mean they left: they may still reach us
 	# through another player. They count as gone once nobody has heard from
 	# them for a while (_mm_expire_lobby_peers / _room_tick). In a 1v1 there's
 	# nobody to relay, so it's immediate.
 	if mm_phase == "lobby":
+		# Most likely they left the lobby (e.g. into a match). Stop counting them
+		# as searching; if they're still here, their next relayed hello says so.
+		if mm_lobby_peers.has(peer_id_str):
+			mm_lobby_peers[peer_id_str] = "unknown"
 		_update_waiting_label()
 	elif mm_phase == "match" and mm_roster.size() <= 2 and mm_roster.has(peer_id_str):
 		_on_room_member_gone(peer_id_str)
@@ -662,6 +720,10 @@ func _handle_incoming_p2p_packet(data: Dictionary) -> void :
 	var action = String(data.get("action", ""))
 	var sender = String(data.get("from", ""))
 
+	if mm_phase == "menu":
+		_lb_handle_packet(action, sender, data)
+		return
+
 	if mm_phase == "lobby":
 		var to = String(data.get("to", ""))
 		if to != "" and to != _get_self_trystero_id():
@@ -687,13 +749,8 @@ func _handle_incoming_p2p_packet(data: Dictionary) -> void :
 			player_nicknames[sender_pid] = nick
 			player_elos[sender_pid] = elo
 
-			var incoming_lb = data.get("leaderboard", {})
-			for p_nick in incoming_lb:
-				if p_nick == local_nickname or leaderboard_data.has(p_nick):
-					continue
-				leaderboard_data[p_nick] = incoming_lb[p_nick]
-
-			leaderboard_data[nick] = {"elo": elo}
+			_lb_merge(data.get("leaderboard", {}))
+			_lb_set(nick, elo)
 			_save_leaderboard_cache()
 
 			if is_host_peer:
@@ -716,11 +773,7 @@ func _handle_incoming_p2p_packet(data: Dictionary) -> void :
 			var incoming_elos = data.get("elos", {})
 			for k in incoming_elos:
 				player_elos[int(k)] = int(incoming_elos[k])
-			var incoming_lb = data.get("leaderboard", {})
-			for p_nick in incoming_lb:
-				if p_nick == local_nickname:
-					continue
-				leaderboard_data[p_nick] = incoming_lb[p_nick]
+			_lb_merge(data.get("leaderboard", {}))
 			_save_leaderboard_cache()
 		"match_setup":
 			if sender_pid == 1:
@@ -783,8 +836,16 @@ func _handle_incoming_p2p_packet(data: Dictionary) -> void :
 			var hurt = get_player(int(data.get("peer_id", -1)))
 			if hurt:
 				hurt.apply_damage(int(data.get("amount", 25)))
+		"ffa_place":
+			var placed = int(data.get("peer", -1))
+			if placed > 0:
+				ffa_places[placed] = int(data.get("place", all_player_ids().size()))
+				if placed == local_peer_id:
+					_show_ffa_dead_banner()
 		"match_outcome":
-			if data.has("winning_team"):
+			if data.has("ffa_places"):
+				_process_ffa_outcome(data.get("ffa_places", {}))
+			elif data.has("winning_team"):
 				var dead_list: Array = []
 				for d in data.get("dead", []):
 					dead_list.append(int(d))
@@ -848,7 +909,9 @@ func _net_tick() -> void :
 	net_last_tick_ms = now
 	dt = min(dt, 5.0)
 
-	if mm_phase == "lobby":
+	if mm_phase == "menu":
+		_lb_tick(dt, now)
+	elif mm_phase == "lobby":
 		_mm_expire_lobby_peers(now)
 		if mm_phase == "lobby":
 			_mm_tick(dt)
@@ -906,23 +969,38 @@ func _are_linked(a: String, b: String) -> bool:
 		return direct_peers.has(a)
 	return (link_map.get(a, []) as Array).has(b) or (link_map.get(b, []) as Array).has(a)
 
-# Relay `orig`'s packets if someone we're connected to can't hear `orig`
-# directly and we're the lowest-ID player connected to both of them (so exactly
-# one player relays each missing link).
+# Multi-hop relaying: everyone builds the same shortest-path tree from the
+# sender over the shared connection map (ties go to the lowest ID), and a
+# player re-broadcasts a packet only if it's the designated next hop for
+# someone. Players with a direct link to the sender just get it directly;
+# players further away get it through one or more relays.
 func _should_relay(orig: String) -> bool:
 	if relay_cache.has(orig):
 		return relay_cache[orig]
+	var nodes: Dictionary = {mm_self_id: true, orig: true}
+	for d in direct_peers:
+		nodes[d] = true
+	for k in link_map:
+		nodes[k] = true
+		for v in link_map[k]:
+			nodes[String(v)] = true
+	var all_nodes: Array = nodes.keys()
+	all_nodes.sort()
+	var dist: Dictionary = {orig: 0}
+	var frontier: Array = [orig]
 	var result = false
-	for r in direct_peers:
-		if r == orig or _are_linked(orig, r):
-			continue
-		var best = mm_self_id
-		for c in link_map:
-			if c < best and c != orig and c != r and _are_linked(c, orig) and _are_linked(c, r):
-				best = c
-		if best == mm_self_id:
-			result = true
-			break
+	while not frontier.is_empty() and not result:
+		frontier.sort()
+		var next: Array = []
+		for u in frontier:
+			for v in all_nodes:
+				if dist.has(v) or not _are_linked(u, v):
+					continue
+				dist[v] = int(dist[u]) + 1
+				next.append(v)
+				if u == mm_self_id:
+					result = true # we're the first-found (lowest-ID) hop to v
+		frontier = next
 	relay_cache[orig] = result
 	return result
 
@@ -945,8 +1023,8 @@ func _receive_packet(data: Dictionary, raw: String) -> void :
 			link_map[orig] = links
 			relay_cache.clear()
 
-	# Pass it on to anyone we're connected to who can't hear the sender directly.
-	if mid != "" and direct_peers.has(orig) and _should_relay(orig):
+	# Pass it on if we're the next hop towards anyone who can't hear the sender directly.
+	if mid != "" and _should_relay(orig):
 		_transport_send(raw)
 
 	if mm_phase == "match" and mm_roster.has(orig):
@@ -970,7 +1048,10 @@ func _room_tick(dt: float, now: int) -> void :
 	if net_heartbeat_timer <= 0.0:
 		net_heartbeat_timer = NET_HEARTBEAT
 		var hb = {"action": "net_links", "links": direct_peers.keys()}
-		if map_ban_canvas and not ban_log.is_empty():
+		# Keep sharing the bans through the match too: whoever banned last has
+		# already left the ban screen, so this is how a player who missed that
+		# message catches up.
+		if not ban_log.is_empty() and not is_game_over:
 			var bans: Array = []
 			for turn in ban_log:
 				bans.append([turn, ban_log[turn]["idx"], ban_log[turn]["by"]])
@@ -1027,6 +1108,12 @@ func _merge_ban_heartbeat(bans) -> void :
 func _mm_group_size() -> int:
 	return team_size * 2
 
+func _mm_min_players() -> int:
+	return int(GAME_MODES[game_mode].get("min", team_size * 2))
+
+func _mm_max_players() -> int:
+	return int(GAME_MODES[game_mode].get("max", team_size * 2))
+
 func _mm_lobby_code() -> String:
 	return "public_" + game_mode + "_lobby"
 
@@ -1039,6 +1126,7 @@ func _mm_enter_lobby() -> void :
 	match_setup_done = false
 	mm_hello_timer = 0.0
 	mm_leader_wait_timer = 0.0
+	ffa_wait_timer = -1.0
 	_mm_clear_pending()
 	_update_waiting_label()
 	_switch_room(_mm_lobby_code())
@@ -1051,7 +1139,15 @@ func _update_waiting_label() -> void :
 		if mm_linger_room != "":
 			waiting_opponent_label.text = "Match found! Connecting..."
 		else:
-			waiting_opponent_label.text = "Searching for " + mode_label + "... (" + str(mm_lobby_peers.size() + 1) + " in queue, " + str(_mm_group_size()) + " needed)"
+			var queued = 1
+			for lp in mm_lobby_peers:
+				if mm_lobby_peers[lp] != "unknown":
+					queued += 1
+			if is_ffa and ffa_wait_timer >= 0.0:
+				var left = int(ceil(max(FFA_WAIT_SECONDS - ffa_wait_timer, 0.0)))
+				waiting_opponent_label.text = "Free For All: " + str(_mm_searching_peers().size() + 1) + " players queued - starting in " + str(left) + "s (or as soon as " + str(_mm_max_players()) + " are in)"
+			else:
+				waiting_opponent_label.text = "Searching for " + mode_label + "... (" + str(queued) + " in queue, " + str(_mm_min_players()) + " needed)"
 		waiting_opponent_label.visible = true
 	elif mm_phase == "match" and not match_setup_done:
 		waiting_opponent_label.text = "Match found! Connecting players (" + str(mm_room_joined.size() + 1) + "/" + str(mm_roster.size()) + ")..."
@@ -1146,11 +1242,24 @@ func _mm_tick(delta: float) -> void :
 	_mm_try_lead(delta)
 
 func _mm_try_lead(delta: float) -> void :
-	var n = _mm_group_size()
+	var min_n = _mm_min_players()
+	var max_n = _mm_max_players()
 	var pool = _mm_searching_peers()
-	if pool.size() + 1 < n:
+	var count = pool.size() + 1
+	if count < min_n:
 		mm_leader_wait_timer = 0.0
+		ffa_wait_timer = -1.0
 		return
+	if count < max_n:
+		# Free For All: enough players to start, but wait up to 30s for more.
+		if ffa_wait_timer < 0.0:
+			ffa_wait_timer = 0.0
+			log_console("[Matchmaking] " + str(count) + " players queued - starting in " + str(int(FFA_WAIT_SECONDS)) + "s unless more join.")
+		ffa_wait_timer += delta
+		if ffa_wait_timer < FFA_WAIT_SECONDS:
+			mm_leader_wait_timer = 0.0
+			return
+	var n = min(count, max_n)
 
 	# The lowest-ID searching player leads, unless they were unresponsive when
 	# it was their turn (frozen tab etc.) - then the next one leads, and they
@@ -1193,7 +1302,7 @@ func _mm_handle_lobby_packet(action: String, sender: String, data: Dictionary) -
 			var roster: Array = []
 			for r in data.get("roster", []):
 				roster.append(String(r))
-			var valid = room != "" and roster.size() == _mm_group_size() and roster.has(mm_self_id) and roster.has(sender)
+			var valid = room != "" and roster.size() >= _mm_min_players() and roster.size() <= _mm_max_players() and roster.has(mm_self_id) and roster.has(sender)
 			if valid and mm_lead_room != "" and sender < mm_self_id:
 				# Two leaders collided: the lower ID wins, so we step down.
 				_mm_abort_lead()
@@ -1337,6 +1446,8 @@ func _team_captain(team: int) -> int:
 func _ban_order() -> Array:
 	if is_single_player:
 		return [local_peer_id, local_peer_id]
+	if is_ffa:
+		return all_player_ids()
 	var blue: Array = []
 	var red: Array = []
 	for pid in all_player_ids():
@@ -1377,7 +1488,7 @@ func _ban_header_text() -> String:
 	var banner = _current_banner()
 	if banner <= 0:
 		return "MAP BAN PHASE"
-	if team_size > 1:
+	if team_size > 1 or is_ffa:
 		return _ban_who(banner).to_upper() + " IS BANNING..."
 	return "OPPONENT IS BANNING A MAP..."
 
@@ -1411,6 +1522,8 @@ func _build_map_ban_ui() -> void :
 	var sub_header = Label.new()
 	if is_single_player:
 		sub_header.text = "Single Player Mode: You get 2 Bans"
+	elif is_ffa:
+		sub_header.text = "Free For All: " + str(all_player_ids().size()) + " players, " + str(current_3_maps.size()) + " maps, every player bans 1"
 	elif team_size > 1:
 		sub_header.text = String(GAME_MODES[game_mode]["label"]) + ": " + str(current_3_maps.size()) + " maps, every player bans 1  -  You are " + TEAM_NAMES[get_team(local_peer_id)] + " team"
 	else:
@@ -1432,7 +1545,7 @@ func _build_map_ban_ui() -> void :
 	ban_order_label.scroll_active = false
 	ban_order_label.custom_minimum_size = Vector2(660 if many else 580, 0)
 	ban_order_label.add_theme_font_size_override("normal_font_size", 12)
-	ban_order_label.visible = team_size > 1 and not is_single_player
+	ban_order_label.visible = (team_size > 1 or is_ffa) and not is_single_player
 	main_vbox.add_child(ban_order_label)
 
 	var spacer = Control.new()
@@ -1440,7 +1553,8 @@ func _build_map_ban_ui() -> void :
 	main_vbox.add_child(spacer)
 
 	# 3 maps on one row, 5 as 3 + 2, 7 as 4 + 3 (rows centered).
-	var cols = 4 if current_3_maps.size() > 5 else 3
+	# 4 maps: one row; 5: 3 + 2; 6: 3 + 3; 7: 4 + 3
+	var cols = {3: 3, 4: 4, 5: 3, 6: 3}.get(current_3_maps.size(), 4)
 	var card_w = 150 if many else 180
 	var grid_center = CenterContainer.new()
 	main_vbox.add_child(grid_center)
@@ -1473,7 +1587,7 @@ func _refresh_map_ban_ui() -> void :
 		var cur = banned_map_indices.size()
 		for t in range(order.size()):
 			var pid = order[t]
-			var col = (TEAM_COLORS[get_team(pid)] as Color).lerp(Color.WHITE, 0.35).to_html(false)
+			var col = player_color(pid).lerp(Color.WHITE, 0.35).to_html(false)
 			var txt = _ban_who(pid).replace("[", "(")
 			if t < cur:
 				parts.append("[color=#777777][s]" + txt + "[/s][/color]")
@@ -1592,7 +1706,7 @@ func _update_map_ban_timer_label() -> void :
 	var who = "Your turn"
 	if not local_ban_turn:
 		var banner = _current_banner()
-		if team_size > 1 and banner > 0:
+		if (team_size > 1 or is_ffa) and banner > 0:
 			who = _ban_who(banner) + "'s turn"
 		else:
 			who = "Opponent's turn"
@@ -1648,7 +1762,59 @@ func _check_map_ban_completion() -> void :
 			map_ban_timer_label = null
 			ban_order_label = null
 
-		_start_p2p_game()
+		if is_single_player:
+			_show_dummy_level_picker()
+		else:
+			_start_p2p_game()
+
+func _show_dummy_level_picker() -> void :
+	if dummy_level_canvas:
+		dummy_level_canvas.queue_free()
+	dummy_level_canvas = CanvasLayer.new()
+	dummy_level_canvas.layer = 100
+	add_child(dummy_level_canvas)
+
+	var center = CenterContainer.new()
+	center.set_anchors_preset(Control.PRESET_FULL_RECT)
+	dummy_level_canvas.add_child(center)
+
+	var panel = PanelContainer.new()
+	panel.custom_minimum_size = Vector2(520, 0)
+	center.add_child(panel)
+
+	var vbox = VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", 8)
+	panel.add_child(vbox)
+
+	var title = Label.new()
+	title.text = "CHOOSE DUMMY DIFFICULTY"
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.add_theme_font_size_override("font_size", 22)
+	title.add_theme_color_override("font_color", Color(1.0, 0.9, 0.2))
+	vbox.add_child(title)
+
+	var map_lbl = Label.new()
+	map_lbl.text = "Map: " + String(selected_map_data.get("name", "?"))
+	map_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	map_lbl.add_theme_font_size_override("font_size", 13)
+	map_lbl.add_theme_color_override("font_color", Color(0.8, 0.8, 0.8))
+	vbox.add_child(map_lbl)
+
+	for i in range(DUMMY_LEVELS.size()):
+		var lvl = i + 1
+		var btn = Button.new()
+		btn.text = String(DUMMY_LEVELS[i]["name"]) + "\n" + String(DUMMY_LEVELS[i]["desc"])
+		btn.custom_minimum_size = Vector2(480, 54)
+		btn.pressed.connect( func(): _on_dummy_level_chosen(lvl))
+		vbox.add_child(btn)
+
+func _on_dummy_level_chosen(level: int) -> void :
+	dummy_level = clampi(level, 1, DUMMY_LEVELS.size())
+	if dummy_level_canvas:
+		dummy_level_canvas.queue_free()
+		dummy_level_canvas = null
+	log_console("[Practice] " + String(DUMMY_LEVELS[dummy_level - 1]["name"]) + ": " + String(DUMMY_LEVELS[dummy_level - 1]["desc"]))
+	_start_p2p_game()
 
 
 func _reset_match_state() -> void :
@@ -1670,12 +1836,15 @@ func _reset_match_state() -> void :
 	mm_room_left.clear()
 	leave_room_timer = -1.0
 	local_peer_id = 1
+	ffa_places.clear()
+	ffa_wait_timer = -1.0
 
 func _on_find_match_pressed(mode: String = "1v1") -> void :
 	_save_nickname_from_input()
 
 	game_mode = mode if GAME_MODES.has(mode) else "1v1"
 	team_size = int(GAME_MODES[game_mode]["team_size"])
+	is_ffa = game_mode == "ffa"
 	is_single_player = false
 	is_host_peer = false
 	_reset_match_state()
@@ -1690,9 +1859,12 @@ func _on_find_match_pressed(mode: String = "1v1") -> void :
 func _on_single_player_pressed() -> void :
 	_save_nickname_from_input()
 
+	_lb_leave_room()
 	game_mode = "1v1"
 	team_size = 1
+	is_ffa = false
 	_reset_match_state()
+	sp_fell_off = false
 	is_single_player = true
 	is_host_peer = true
 	is_match_active = true
@@ -1734,6 +1906,8 @@ func _start_p2p_game() -> void :
 			_spawn_player(pid)
 		if team_size > 1:
 			log_console("[Match] Eliminate the whole enemy team to win. If you die, you turn invisible and can roam until the match ends.")
+		elif is_ffa:
+			log_console("[Match] Everyone is your enemy - be the last one standing. If you die you turn invisible and can watch.")
 
 	crystals_enabled = bool(selected_map_data.get("crystals", false))
 	crystal_high_ground = bool(selected_map_data.get("crystal_high_ground", false))
@@ -1759,6 +1933,23 @@ func get_team(pid: int) -> int:
 
 func is_teammate(a: int, b: int) -> bool:
 	return get_team(a) == get_team(b)
+
+func player_color(pid: int) -> Color:
+	if is_ffa:
+		return FFA_COLORS[(pid - 1) % FFA_COLORS.size()]
+	return TEAM_COLORS[get_team(pid) % TEAM_COLORS.size()]
+
+func _ordinal(n: int) -> String:
+	if n % 100 >= 11 and n % 100 <= 13:
+		return str(n) + "th"
+	match n % 10:
+		1:
+			return str(n) + "st"
+		2:
+			return str(n) + "nd"
+		3:
+			return str(n) + "rd"
+	return str(n) + "th"
 
 func get_player(pid: int) -> NetworkPlayer:
 	if not players_container or not is_instance_valid(players_container):
@@ -1788,6 +1979,8 @@ func _team_avg_elo(team: int) -> int:
 	return int(round(float(total) / float(max(count, 1))))
 
 func _spawn_point(pid: int) -> Vector3:
+	if is_ffa:
+		return FFA_SPAWNS[(pid - 1) % FFA_SPAWNS.size()]
 	var team = get_team(pid)
 	var mates: Array = []
 	for p in all_player_ids():
@@ -1807,7 +2000,10 @@ func on_player_killed(p: NetworkPlayer) -> void :
 		if p.is_dummy:
 			_process_match_outcome(0)
 		else:
-			_forfeit_match()
+			# Knocked out by the dummy (levels 3-4) or fell off the map.
+			is_game_over = true
+			var title = "You fell off the map" if sp_fell_off else "Defeated by the Level " + str(dummy_level) + " Dummy"
+			_show_match_results_screen(title, false, 0, local_elo, local_elo, false)
 		return
 
 	if p.is_local_player():
@@ -1820,6 +2016,9 @@ func on_player_killed(p: NetworkPlayer) -> void :
 		log_console("[Match] " + String(player_nicknames.get(p.peer_id, "Player")) + side + " was eliminated!")
 
 	p.set_dead_state()
+	if is_ffa:
+		_ffa_on_eliminated(p.peer_id)
+		return
 	if p.is_local_player() and team_size > 1 and _team_alive_count(p.team) > 0:
 		_show_dead_banner(true)
 	_host_check_team_wipe()
@@ -1830,8 +2029,10 @@ func _mark_player_forfeited(pid: int) -> void :
 		return
 	forfeited_peers[pid] = true
 	log_console("[Match] " + String(player_nicknames.get(pid, "A player")) + " left the match.")
+	var newly_out = false
 	if not dead_peers.has(pid):
 		dead_peers[pid] = true
+		newly_out = true
 		var node = get_player(pid)
 		if node:
 			node.set_dead_state()
@@ -1839,6 +2040,8 @@ func _mark_player_forfeited(pid: int) -> void :
 	if me:
 		me.remove_movement_lock(pid)
 	_recompute_host()
+	if is_ffa and newly_out:
+		_ffa_on_eliminated(pid)
 	_host_check_team_wipe()
 
 # The host is the lowest peer ID still in the match; if it leaves, the next one
@@ -1861,6 +2064,9 @@ func _recompute_host() -> void :
 func _host_check_team_wipe() -> void :
 	if not is_host_peer or is_game_over or not is_match_active or is_single_player:
 		return
+	if is_ffa:
+		_host_check_ffa_end()
+		return
 	for team in [0, 1]:
 		if _team_alive_count(team) == 0:
 			var winner = 1 - team
@@ -1869,10 +2075,132 @@ func _host_check_team_wipe() -> void :
 			_process_match_outcome(winner, dead_list)
 			return
 
+# --- FREE FOR ALL ---
+# Placement = how many players were still in when you went out (5 players:
+# first out is 5th, last one standing is 1st). Everyone guesses placements
+# locally, but the host's call wins, so near-simultaneous eliminations end up
+# the same on every screen.
+# ELO compares you with every other player: beating someone counts as a win
+# against them, finishing below them as a loss, scaled so a 5-player match
+# moves about as much ELO as a 1v1.
+
+func _alive_count() -> int:
+	var c = 0
+	for pid in all_player_ids():
+		if not dead_peers.has(pid):
+			c += 1
+	return c
+
+func _ffa_on_eliminated(pid: int) -> void :
+	if not ffa_places.has(pid):
+		ffa_places[pid] = _alive_count() + 1
+	if pid == local_peer_id:
+		_show_ffa_dead_banner()
+	if is_host_peer and not is_game_over:
+		send_p2p_packet({"action": "ffa_place", "peer": pid, "place": ffa_places[pid]})
+	_host_check_team_wipe()
+
+func _host_check_ffa_end() -> void :
+	var alive: Array = []
+	for pid in all_player_ids():
+		if not dead_peers.has(pid):
+			alive.append(pid)
+	if alive.size() > 1:
+		return
+	if alive.size() == 1:
+		ffa_places[alive[0]] = 1
+	send_p2p_packet({"action": "match_outcome", "ffa_places": ffa_places})
+	_process_ffa_outcome(ffa_places)
+
+# ELO change for one player from the placements known so far. A player without
+# a placement is still in the match, i.e. ahead of everyone who's out.
+func _ffa_elo_change(pid: int) -> int:
+	var ids = all_player_ids()
+	if ids.size() < 2:
+		return 0
+	var my_rank = int(ffa_places.get(pid, 0))
+	var my_elo = local_elo if pid == local_peer_id else int(match_start_elos.get(pid, player_elos.get(pid, 1000)))
+	var total = 0.0
+	for other in ids:
+		if other == pid:
+			continue
+		var their_rank = int(ffa_places.get(other, 0))
+		var score = 0.5
+		if my_rank < their_rank:
+			score = 1.0
+		elif my_rank > their_rank:
+			score = 0.0
+		var their_elo = int(match_start_elos.get(other, player_elos.get(other, 1000)))
+		var expected = 1.0 / (1.0 + pow(10.0, float(their_elo - my_elo) / 400.0))
+		total += score - expected
+	return int(round(32.0 / float(ids.size() - 1) * total))
+
+func _show_ffa_dead_banner() -> void :
+	if not dead_banner_label or is_game_over:
+		return
+	var n = all_player_ids().size()
+	var place = int(ffa_places.get(local_peer_id, n))
+	var change = _ffa_elo_change(local_peer_id)
+	dead_banner_label.text = "YOU PLACED " + _ordinal(place).to_upper() + " OF " + str(n) + "  (" + ("+" if change >= 0 else "") + str(change) + " ELO)\nYou're invisible - roam freely and watch the rest of the match.\nPress Esc twice to leave whenever you like - your placement is kept."
+	dead_banner_label.visible = true
+
+func _process_ffa_outcome(places: Dictionary) -> void :
+	if is_game_over:
+		return
+	is_game_over = true
+	_show_dead_banner(false)
+	for k in places:
+		ffa_places[int(k)] = int(places[k])
+
+	var n = all_player_ids().size()
+	var start_elo = local_elo
+	var my_change = 0
+	var updated: Dictionary = {}
+	for pid in all_player_ids():
+		var change = _ffa_elo_change(pid)
+		var before = local_elo if pid == local_peer_id else int(match_start_elos.get(pid, player_elos.get(pid, 1000)))
+		updated[pid] = int(clamp(before + change, 0, MAX_ELO))
+		var nick = local_nickname if pid == local_peer_id else String(player_nicknames.get(pid, "Player " + str(pid)))
+		_lb_set(nick, int(updated[pid]))
+		if pid == local_peer_id:
+			my_change = change
+	local_elo = int(updated[local_peer_id])
+	_save_leaderboard_cache()
+	save_player_data()
+	send_p2p_packet({
+		"action": "sync_state", 
+		"nicknames": player_nicknames, 
+		"elos": updated, 
+		"leaderboard": leaderboard_data
+	})
+	_schedule_room_leave()
+
+	var place = int(ffa_places.get(local_peer_id, n))
+	var title = "You won the Free For All!" if place == 1 else "You placed " + _ordinal(place) + " of " + str(n)
+	_show_match_results_screen(title, place == 1, my_change, start_elo, local_elo, local_elo >= MAX_ELO)
+
+# Leaving: if you're still alive you're out now (and placed accordingly); if you
+# were already out, you keep the placement you earned.
+func _process_ffa_leave() -> void :
+	if is_game_over:
+		return
+	is_game_over = true
+	var n = all_player_ids().size()
+	var change = _ffa_elo_change(local_peer_id)
+	var start_elo = local_elo
+	local_elo = int(clamp(local_elo + change, 0, MAX_ELO))
+	_lb_set(local_nickname, local_elo)
+	_save_leaderboard_cache()
+	save_player_data()
+	_schedule_room_leave()
+	var place = int(ffa_places.get(local_peer_id, n))
+	_show_match_results_screen("You left - placed " + _ordinal(place) + " of " + str(n), false, change, start_elo, local_elo, local_elo >= MAX_ELO)
+
 func kill_local_player_from_fall() -> void :
 	var me = get_local_player()
 	if not me or me.is_dead:
 		return
+	sp_fell_off = is_single_player
 	var amount = me.health
 	send_p2p_packet({"action": "take_damage", "peer_id": str(local_peer_id), "amount": amount})
 	me.apply_damage(amount)
@@ -1884,8 +2212,26 @@ func _show_dead_banner(show: bool) -> void :
 func _update_team_hud() -> void :
 	if not team_hud_label:
 		return
-	if not is_match_active or is_game_over or is_single_player or team_size <= 1 or players_container == null:
+	if not is_match_active or is_game_over or is_single_player or (team_size <= 1 and not is_ffa) or players_container == null:
 		team_hud_label.visible = false
+		return
+	if is_ffa:
+		var ftext = "[b]FREE FOR ALL[/b] - " + str(_alive_count()) + " left\n"
+		for pid in all_player_ids():
+			var fcol = player_color(pid).lerp(Color.WHITE, 0.3).to_html(false)
+			var fstatus = ""
+			if dead_peers.has(pid):
+				var placed = int(ffa_places.get(pid, 0))
+				fstatus = "[color=#ff5555]OUT" + (" (" + _ordinal(placed) + ")" if placed > 0 else "") + "[/color]"
+				if forfeited_peers.has(pid):
+					fstatus = "[color=#888888]LEFT" + (" (" + _ordinal(placed) + ")" if placed > 0 else "") + "[/color]"
+			else:
+				var fnode = get_player(pid)
+				fstatus = str(fnode.health if fnode else 100) + " HP"
+			var fnick = String(player_nicknames.get(pid, "Player")).replace("[", "(")
+			ftext += "  [color=#" + fcol + "]" + ("> " if pid == local_peer_id else "") + fnick + "[/color]  " + fstatus + "\n"
+		team_hud_label.text = ftext
+		team_hud_label.visible = true
 		return
 	var my_team = get_team(local_peer_id)
 	var text = ""
@@ -2050,6 +2396,8 @@ func _apply_crystal_taken(id: int, by_peer: int, ability_type: String) -> void :
 		var who = "Opponent"
 		if team_size > 1:
 			who = ("Teammate " if is_teammate(by_peer, local_peer_id) else "Enemy ") + String(player_nicknames.get(by_peer, "player"))
+		elif is_ffa:
+			who = String(player_nicknames.get(by_peer, "A player"))
 		log_console("[Crystals] " + who + " grabbed " + String(info["name"]) + "!")
 
 func _give_local_ability(ability_type: String) -> void :
@@ -2175,8 +2523,11 @@ func load_rank_texture(elo: int) -> Texture2D:
 
 func _save_nickname_from_input() -> void:
 	if nickname_input and nickname_input.text.strip_edges() != "":
+		var changed = local_nickname != nickname_input.text.strip_edges()
 		local_nickname = nickname_input.text.strip_edges()
 		save_player_data()
+		if changed:
+			_lb_announce()
 
 func _load_player_data() -> void :
 	if FileAccess.file_exists(SAVE_PATH):
@@ -2222,7 +2573,7 @@ func import_data_from_obfuscated_string(encoded_string: String) -> bool:
 			local_nickname = String(dict["nickname"])
 			local_elo = int(dict["elo"])
 			save_player_data()
-			leaderboard_data[local_nickname] = {"elo": local_elo}
+			_lb_set(local_nickname, local_elo)
 			_save_leaderboard_cache()
 			return true
 	return false
@@ -2290,6 +2641,34 @@ func _save_leaderboard_cache() -> void :
 	if file:
 		file.store_string(JSON.stringify(leaderboard_data))
 		file.close()
+
+# Each entry is {"elo": int, "t": unix time it was last changed}. When two
+# copies disagree, the newer one wins, so an old cache can't undo a new result.
+func _wall_time() -> float:
+	return Time.get_unix_time_from_system()
+
+func _lb_set(nick: String, elo: int, t: float = -1.0) -> void :
+	leaderboard_data[nick] = {"elo": elo, "t": _wall_time() if t < 0.0 else t}
+
+# Merges another player's leaderboard into ours. Returns true if anything changed.
+func _lb_merge(incoming) -> bool:
+	if not (incoming is Dictionary):
+		return false
+	var changed = false
+	for nick in incoming:
+		var n = String(nick)
+		if n == local_nickname:
+			continue # we're the authority on our own ELO
+		var e = incoming[nick]
+		if not (e is Dictionary) or not e.has("elo"):
+			continue
+		var t_new = float(e.get("t", 0.0))
+		var have = leaderboard_data.get(n, null)
+		var t_have = float(have.get("t", -1.0)) if have is Dictionary else -2.0
+		if t_new > t_have:
+			leaderboard_data[n] = {"elo": int(e["elo"]), "t": t_new}
+			changed = true
+	return changed
 
 func clear_leaderboard_data() -> void :
 	leaderboard_data.clear()
@@ -2499,7 +2878,7 @@ func _update_opponent_pointer() -> void :
 			var height = opp.global_position.y - me.global_position.y
 			show_pointer = true
 			_aim_pointer(opponent_pointer, cam, center, opp.global_position + Vector3(0, 0.9, 0))
-			opponent_height_label.text = ("ENEMY ABOVE: " if team_size > 1 else "OPPONENT ABOVE: ") + str(int(round(height))) + "m"
+			opponent_height_label.text = ("ENEMY ABOVE: " if team_size > 1 or is_ffa else "OPPONENT ABOVE: ") + str(int(round(height))) + "m"
 			opponent_height_label.position = center + Vector2(-110, POINTER_RADIUS + 30)
 
 		if crystal_pointer and crystal_node and is_instance_valid(crystal_node) and not me.is_dead:
@@ -2541,14 +2920,16 @@ func update_local_hud_hp(hp: int) -> void :
 
 func _build_main_menu() -> void :
 	_clear_ui()
-	mm_phase = "idle"
-	mm_lobby_peers.clear()
-	_mm_clear_pending()
+	if mm_phase != "menu":
+		mm_phase = "idle"
+		mm_lobby_peers.clear()
+		_mm_clear_pending()
+		_leave_trystero_room()
+		_net_reset()
 	_reset_match_state()
-	_leave_trystero_room()
-	_net_reset()
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 	is_single_player = false
+	_lb_set(local_nickname, local_elo)
 
 	menu_canvas = CanvasLayer.new()
 	add_child(menu_canvas)
@@ -2614,6 +2995,13 @@ func _build_main_menu() -> void :
 	elo_lbl.add_theme_color_override("font_color", Color(0.4, 0.8, 1.0))
 	elo_row.add_child(elo_lbl)
 
+	menu_online_label = Label.new()
+	menu_online_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	menu_online_label.add_theme_font_size_override("font_size", 12)
+	menu_online_label.add_theme_color_override("font_color", Color(0.5, 1.0, 0.6))
+	container.add_child(menu_online_label)
+	_lb_update_online_label()
+
 	var spacer = Control.new()
 	spacer.custom_minimum_size = Vector2(0, 10)
 	container.add_child(spacer)
@@ -2635,6 +3023,12 @@ func _build_main_menu() -> void :
 	trio_btn.custom_minimum_size = Vector2(320, 40)
 	trio_btn.pressed.connect( func(): _on_find_match_pressed("3v3"))
 	container.add_child(trio_btn)
+
+	var ffa_btn = Button.new()
+	ffa_btn.text = "Find Free For All (3-5 players)"
+	ffa_btn.custom_minimum_size = Vector2(320, 40)
+	ffa_btn.pressed.connect( func(): _on_find_match_pressed("ffa"))
+	container.add_child(ffa_btn)
 
 	var sp_btn = Button.new()
 	sp_btn.text = "Single Player Practice (No ELO)"
@@ -2692,6 +3086,105 @@ func _build_main_menu() -> void :
 		container.add_child(msg_lbl)
 		pending_error_message = ""
 
+	# Sit in the leaderboard room while on the menu, and (re)announce ourselves -
+	# our ELO or nickname may have just changed.
+	if mm_phase == "menu":
+		_lb_announce()
+	else:
+		_lb_enter_room()
+
+# --- LEADERBOARD ROOM ---
+
+func _lb_enter_room() -> void :
+	if mm_phase == "menu":
+		return
+	mm_phase = "menu"
+	lb_online.clear()
+	lb_heartbeat_timer = 0.0
+	_switch_room(LEADERBOARD_ROOM_CODE)
+
+func _lb_leave_room() -> void :
+	if mm_phase != "menu":
+		return
+	mm_phase = "idle"
+	lb_online.clear()
+	_leave_trystero_room()
+	_net_reset()
+
+# Our own entry: everyone in the room hears our nickname and ELO.
+func _lb_announce(to: String = "") -> void :
+	if mm_phase != "menu":
+		return
+	_lb_set(local_nickname, local_elo)
+	var pkt = {"action": "lb_presence", "nick": local_nickname, "elo": local_elo, "t": leaderboard_data[local_nickname]["t"], "links": direct_peers.keys()}
+	if to != "":
+		pkt["to"] = to
+	send_p2p_packet(pkt)
+
+func _lb_on_peer_joined(tid: String) -> void :
+	# Tell the newcomer who we are, and hand them everything we know.
+	_lb_announce(tid)
+	send_p2p_packet({"action": "lb_sync", "to": tid, "leaderboard": leaderboard_data})
+
+func _lb_handle_packet(action: String, sender: String, data: Dictionary) -> void :
+	var to = String(data.get("to", ""))
+	if to != "" and to != _get_self_trystero_id():
+		return # addressed to someone else (we may still have relayed it)
+	match action:
+		"lb_presence":
+			var nick = String(data.get("nick", ""))
+			if nick == "":
+				return
+			var elo = int(data.get("elo", 0))
+			if not lb_online.has(sender) and not direct_peers.has(sender):
+				# First time we hear from someone we can only reach through a
+				# relay - swap leaderboards with them too.
+				send_p2p_packet({"action": "lb_sync", "to": sender, "leaderboard": leaderboard_data})
+			lb_online[sender] = {"nick": nick, "elo": elo, "ms": _now_ms()}
+			if nick != local_nickname:
+				# The player themself is the authority on their own ELO.
+				var have = leaderboard_data.get(nick, null)
+				if not (have is Dictionary) or int(have.get("elo", -1)) != elo:
+					_lb_set(nick, elo, max(float(data.get("t", 0.0)), float(have.get("t", 0.0)) if have is Dictionary else 0.0))
+					_save_leaderboard_cache()
+				lb_ui_dirty = true
+			_lb_update_online_label()
+		"lb_sync":
+			if _lb_merge(data.get("leaderboard", {})):
+				_save_leaderboard_cache()
+				lb_ui_dirty = true
+		_:
+			pass # this room carries leaderboard data only - nothing else is played here
+
+func _lb_tick(dt: float, now: int) -> void :
+	lb_heartbeat_timer -= dt
+	if lb_heartbeat_timer <= 0.0:
+		lb_heartbeat_timer = LB_HEARTBEAT
+		_lb_announce()
+	for tid in lb_online.keys():
+		if not direct_peers.has(tid) and now - int(lb_online[tid]["ms"]) > LB_ONLINE_TIMEOUT_MS:
+			lb_online.erase(tid)
+			lb_ui_dirty = true
+	lb_ui_timer -= dt
+	if lb_ui_timer <= 0.0:
+		lb_ui_timer = 1.0
+		_lb_update_online_label()
+		if lb_ui_dirty and leaderboard_list:
+			_fill_leaderboard_list()
+		lb_ui_dirty = false
+
+func _lb_online_nicks() -> Dictionary:
+	var out: Dictionary = {}
+	for tid in lb_online:
+		out[String(lb_online[tid]["nick"])] = true
+	return out
+
+func _lb_update_online_label() -> void :
+	if menu_online_label:
+		var n = _lb_online_nicks().size()
+		menu_online_label.text = "Players online in the menu: " + str(n + 1) + (" (just you)" if n == 0 else "")
+
+
 func _on_clear_leaderboard_pressed() -> void :
 	clear_leaderboard_data()
 	pending_error_message = "Leaderboard data successfully cleared!"
@@ -2723,15 +3216,34 @@ func _show_leaderboard_ui() -> void :
 	scroll.custom_minimum_size = Vector2(360, 220)
 	container.add_child(scroll)
 
-	var list = VBoxContainer.new()
-	scroll.add_child(list)
+	leaderboard_list = VBoxContainer.new()
+	scroll.add_child(leaderboard_list)
+	_fill_leaderboard_list()
 
-	var display_data = leaderboard_data.duplicate()
-	if display_data.is_empty():
-		display_data[local_nickname] = {"elo": local_elo}
+	var back_btn = Button.new()
+	back_btn.text = "Back to Menu"
+	back_btn.pressed.connect(_build_main_menu)
+	container.add_child(back_btn)
 
-	for player_key in display_data:
-		var entry = display_data[player_key]
+# Sorted by ELO; players currently online in the menu are marked. Refreshes
+# by itself while open when new data comes in from the leaderboard room.
+func _fill_leaderboard_list() -> void :
+	if not leaderboard_list:
+		return
+	for c in leaderboard_list.get_children():
+		c.queue_free()
+	var list = leaderboard_list
+	_lb_set(local_nickname, local_elo, float(leaderboard_data.get(local_nickname, {}).get("t", _wall_time())))
+	var online = _lb_online_nicks()
+	online[local_nickname] = true
+	var names: Array = leaderboard_data.keys()
+	names.sort_custom(func(a, b):
+		var ea = int(leaderboard_data[a].get("elo", 0)) if leaderboard_data[a] is Dictionary else 0
+		var eb = int(leaderboard_data[b].get("elo", 0)) if leaderboard_data[b] is Dictionary else 0
+		return ea > eb if ea != eb else String(a) < String(b))
+
+	for player_key in names:
+		var entry = leaderboard_data[player_key]
 		var elo = int(entry.get("elo", 0)) if entry is Dictionary else 0
 
 		var row = HBoxContainer.new()
@@ -2750,10 +3262,12 @@ func _show_leaderboard_ui() -> void :
 		label.text = " " + str(player_key) + ": " + str(elo) + " ELO (" + get_rank_name(elo) + ")"
 		row.add_child(label)
 
-	var back_btn = Button.new()
-	back_btn.text = "Back to Menu"
-	back_btn.pressed.connect(_build_main_menu)
-	container.add_child(back_btn)
+		if online.has(String(player_key)):
+			var on_lbl = Label.new()
+			on_lbl.text = "  online" if String(player_key) != local_nickname else "  you"
+			on_lbl.add_theme_font_size_override("font_size", 11)
+			on_lbl.add_theme_color_override("font_color", Color(0.5, 1.0, 0.6))
+			row.add_child(on_lbl)
 
 
 func calculate_elo_change(player_elo: int, opponent_elo: int, score: float, k_factor: float = 32.0) -> int:
@@ -2775,7 +3289,7 @@ func _process_match_outcome(winning_team: int, dead_list = null) -> void :
 	_show_dead_banner(false)
 
 	if is_single_player:
-		_show_match_results_screen("Practice Dummy Defeated", true, 0, local_elo, local_elo, false)
+		_show_match_results_screen("Level " + str(dummy_level) + " Dummy Defeated!", true, 0, local_elo, local_elo, false)
 		return
 
 	var my_team = get_team(local_peer_id)
@@ -2803,7 +3317,7 @@ func _process_match_outcome(winning_team: int, dead_list = null) -> void :
 		var before = local_elo if pid == local_peer_id else int(match_start_elos.get(pid, player_elos.get(pid, 1000)))
 		updated[pid] = int(clamp(before + change, 0, MAX_ELO))
 		var nick = local_nickname if pid == local_peer_id else String(player_nicknames.get(pid, "Player " + str(pid)))
-		leaderboard_data[nick] = {"elo": updated[pid]}
+		_lb_set(nick, int(updated[pid]))
 		if pid == local_peer_id:
 			my_change = change
 
@@ -2835,7 +3349,7 @@ func _process_forfeit_result() -> void :
 	var change = calculate_elo_change(_team_avg_elo(my_team), _team_avg_elo(1 - my_team), 0.0)
 	var start_elo = local_elo
 	local_elo = int(clamp(local_elo + change, 0, MAX_ELO))
-	leaderboard_data[local_nickname] = {"elo": local_elo}
+	_lb_set(local_nickname, local_elo)
 	_save_leaderboard_cache()
 	save_player_data()
 	_schedule_room_leave()
@@ -2992,6 +3506,9 @@ func _update_elo_animation_ui() -> void :
 		anim_marker_rect.position = Vector2(clamp(380 * current_step_progress - 3, 0, 374), 0)
 
 func _clear_ui() -> void :
+	if dummy_level_canvas:
+		dummy_level_canvas.queue_free()
+		dummy_level_canvas = null
 	if map_ban_canvas:
 		map_ban_canvas.queue_free()
 		map_ban_canvas = null
@@ -3022,6 +3539,8 @@ func _clear_ui() -> void :
 		team_hud_label = null
 		dead_banner_label = null
 		leave_confirm_label = null
+	menu_online_label = null
+	leaderboard_list = null
 	if results_canvas:
 		results_canvas.queue_free()
 		results_canvas = null
@@ -3039,6 +3558,12 @@ func _forfeit_match() -> void :
 
 	send_p2p_packet({"action": "player_forfeit"})
 	forfeited_peers[local_peer_id] = true
+	if is_ffa:
+		if not dead_peers.has(local_peer_id):
+			ffa_places[local_peer_id] = _alive_count()
+			dead_peers[local_peer_id] = true
+		_process_ffa_leave()
+		return
 	if team_size == 1:
 		# 1v1: leaving hands the win straight to the opponent.
 		_process_match_outcome(1 - get_team(local_peer_id))
@@ -3323,6 +3848,42 @@ func get_nav_path(from: Vector3, to: Vector3) -> PackedVector3Array:
 		out.append(wp)
 	return out
 
+# True if a body can walk straight from a to b: every grid cell under the line
+# (and under lines offset by the body's radius) is open and hazard-free.
+func nav_line_clear(a: Vector3, b: Vector3) -> bool:
+	if nav_grid == null:
+		return false
+	var d = Vector2(b.x - a.x, b.z - a.z)
+	var length = d.length()
+	if length < 0.01:
+		return true
+	var dir = d / length
+	var perp = Vector2(-dir.y, dir.x) * 0.45
+	var steps = int(ceil(length / 0.25))
+	for i in range(steps + 1):
+		var pt = Vector2(a.x, a.z) + dir * (length * float(i) / float(steps))
+		for off in [Vector2.ZERO, perp, -perp]:
+			var q = pt + off
+			var c = nav_world_to_cell(Vector3(q.x, 0.0, q.y))
+			if nav_grid.is_point_solid(c) or nav_grid.get_point_weight_scale(c) > 1.0:
+				return false
+	return true
+
+# Drops grid waypoints that can be skipped in a straight line, so the bot runs
+# direct lines instead of zig-zagging cell to cell.
+func smooth_nav_path(path: PackedVector3Array) -> PackedVector3Array:
+	if path.size() <= 2 or nav_grid == null:
+		return path
+	var out = PackedVector3Array([path[0]])
+	var i = 0
+	while i < path.size() - 1:
+		var j = path.size() - 1
+		while j > i + 1 and not nav_line_clear(path[i], path[j]):
+			j -= 1
+		out.append(path[j])
+		i = j
+	return out
+
 func get_random_nav_point() -> Vector3:
 	var size = NAV_HALF_EXTENT * 2 + 1
 	for _i in range(40):
@@ -3350,6 +3911,8 @@ func _spawn_player(peer_id: int) -> void :
 	# Blue team on the west side facing east, Red team on the east facing west.
 	player.position = _spawn_point(peer_id)
 	player.rotation_degrees.y = -90 if get_team(peer_id) == 0 else 90
+	if is_ffa:
+		player.rotation.y = atan2(player.position.x, player.position.z) # face the middle
 	player.spawn_position = player.position
 
 	players_container.add_child(player)
@@ -3758,8 +4321,25 @@ class NetworkPlayer extends CharacterBody3D:
 	var qte_double_damage: bool = false
 
 	# Practice dummy AI
+	#  Level 1: wanders and runs away from you.
+	#  Level 2: + hops around and moves a bit faster.
+	#  Level 3: + hunts you (smoothed paths, re-planned as you move) and attacks
+	#           like a player would - it holds you for a moment, then hits for
+	#           25 or misses (50% miss).
+	#  Level 4: + only misses 30% of the time, moves at sprint speed.
 	const DUMMY_SPEED: float = 4.5
 	const DUMMY_FLEE_RANGE: float = 9.0
+	const BOT_ATTACK_RANGE: float = 4.5
+	const BOT_WINDUP: float = 0.9
+	const BOT_ATTACK_COOLDOWN: float = 3.0
+	var bot_attack_cd: float = 2.5
+	var bot_windup: float = 0.0
+	var bot_target: NetworkPlayer = null
+	var bot_jump_timer: float = 2.0
+	var bot_hits: int = 0
+	var bot_misses: int = 0
+	var bot_jumps: int = 0
+	var bot_status_label: Label3D = null
 	var nav_path: PackedVector3Array = PackedVector3Array()
 	var nav_path_index: int = 0
 	var dummy_repath_timer: float = 0.0
@@ -3871,6 +4451,8 @@ class NetworkPlayer extends CharacterBody3D:
 		base_material = StandardMaterial3D.new()
 		if is_dummy:
 			base_material.albedo_color = Color(0.6, 0.6, 0.6)
+		elif main_manager.is_ffa:
+			base_material.albedo_color = main_manager.player_color(peer_id)
 		elif main_manager.team_size > 1 and not main_manager.is_single_player:
 			var team_col: Color = main_manager.TEAM_COLORS[team]
 			base_material.albedo_color = team_col.lerp(Color(randf(), randf(), randf()), 0.15)
@@ -3903,7 +4485,14 @@ class NetworkPlayer extends CharacterBody3D:
 		add_child(name_label)
 
 		if is_dummy:
-			name_label.text = "[Practice Dummy] Target"
+			name_label.text = "[Practice Dummy] Level " + str(_bot_level())
+			bot_status_label = Label3D.new()
+			bot_status_label.position = Vector3(0, 3.0, 0)
+			bot_status_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+			bot_status_label.font_size = 20
+			bot_status_label.outline_size = 5
+			bot_status_label.visible = false
+			add_child(bot_status_label)
 		else:
 			var nick = main_manager.player_nicknames.get(peer_id, "Player " + str(peer_id)) if main_manager else "Player"
 			var elo = main_manager.player_elos.get(peer_id, 0) if main_manager else 0
@@ -3939,7 +4528,9 @@ class NetworkPlayer extends CharacterBody3D:
 		if name_label and main_manager and not is_dummy:
 			var rank_title = main_manager.get_rank_name(elo)
 			var prefix = ""
-			if main_manager.team_size > 1 and not main_manager.is_single_player:
+			if main_manager.is_ffa:
+				name_label.modulate = main_manager.player_color(peer_id).lerp(Color.WHITE, 0.35)
+			elif main_manager.team_size > 1 and not main_manager.is_single_player:
 				prefix = "[" + main_manager.TEAM_NAMES[team] + "] "
 				name_label.modulate = (main_manager.TEAM_COLORS[team] as Color).lerp(Color.WHITE, 0.35)
 			name_label.text = prefix + "[" + rank_title + "] " + nickname
@@ -4004,7 +4595,7 @@ class NetworkPlayer extends CharacterBody3D:
 				else:
 					main_manager.log_console("[Match] You fell off the map!")
 					main_manager.kill_local_player_from_fall()
-					if is_dead and main_manager.team_size > 1:
+					if is_dead and (main_manager.team_size > 1 or main_manager.is_ffa):
 						# 2v2/3v3: you're out but your team plays on - roam
 						# invisibly from your spawn.
 						global_position = spawn_position
@@ -4167,6 +4758,101 @@ class NetworkPlayer extends CharacterBody3D:
 		main_manager.consume_local_ability("used")
 		_send_p2p_position()
 
+	func _bot_level() -> int:
+		return int(main_manager.dummy_level) if main_manager else 1
+
+	func _dummy_speed() -> float:
+		match _bot_level():
+			1:
+				return DUMMY_SPEED
+			2, 3:
+				return 5.5
+			_:
+				return sprint_speed # level 4: as fast as a player holding Shift
+
+	func bot_miss_chance() -> float:
+		match _bot_level():
+			3:
+				return 0.5
+			4:
+				return 0.3
+			_:
+				return 1.0 # levels 1-2 never attack
+
+	func _bot_roll_hit() -> bool:
+		return randf() >= bot_miss_chance()
+
+	func _bot_face(target: Vector3, delta: float) -> void :
+		var to = target - global_position
+		if Vector2(to.x, to.z).length() > 0.05:
+			rotation.y = lerp_angle(rotation.y, atan2(-to.x, -to.z), 12.0 * delta)
+
+	func _set_bot_status(text: String, color: Color = Color.WHITE) -> void :
+		if bot_status_label:
+			bot_status_label.text = text
+			bot_status_label.modulate = color
+			bot_status_label.visible = text != ""
+
+	# In range, roughly level, and nothing in the way.
+	func _bot_can_hit(target: NetworkPlayer) -> bool:
+		if target == null or target.is_dead:
+			return false
+		if global_position.distance_to(target.global_position) > BOT_ATTACK_RANGE:
+			return false
+		if abs(target.global_position.y - global_position.y) > 2.5:
+			return false
+		var q = PhysicsRayQueryParameters3D.create(global_position + Vector3(0, 1.5, 0), target.global_position + Vector3(0, 0.9, 0))
+		q.exclude = [get_rid()]
+		q.collision_mask = 1
+		var hit = get_world_3d().direct_space_state.intersect_ray(q)
+		return hit.get("collider") == target
+
+	# Like a player's QTE: the target is held while the bot "times" its hit.
+	func _bot_start_attack(target: NetworkPlayer) -> void :
+		bot_target = target
+		bot_windup = BOT_WINDUP
+		qte_active = true
+		qte_target_peer = target.peer_id
+		target.add_movement_lock(peer_id)
+		velocity.x = 0.0
+		velocity.z = 0.0
+		_set_bot_status("ATTACKING!", Color(1.0, 0.35, 0.25))
+
+	func _bot_process_windup(delta: float) -> void :
+		velocity.x = move_toward(velocity.x, 0.0, 30.0 * delta)
+		velocity.z = move_toward(velocity.z, 0.0, 30.0 * delta)
+		var t = bot_target
+		if t == null or not is_instance_valid(t) or t.is_dead or not qte_active:
+			_bot_end_attack(false, true) # cancelled (e.g. clash)
+			return
+		_bot_face(t.global_position, delta)
+		bot_windup -= delta
+		if bot_windup <= 0.0:
+			_bot_end_attack(_bot_roll_hit(), false)
+
+	func _bot_end_attack(hit: bool, cancelled: bool) -> void :
+		var t = bot_target
+		bot_windup = 0.0
+		bot_target = null
+		qte_active = false
+		qte_target_peer = -1
+		bot_attack_cd = BOT_ATTACK_COOLDOWN
+		_set_bot_status("")
+		if t and is_instance_valid(t):
+			t.remove_movement_lock(peer_id)
+		if cancelled or t == null or not is_instance_valid(t):
+			return
+		if hit:
+			bot_hits += 1
+			is_launching = true
+			launch_timer = 0.45
+			launch_target_pos = t.global_position
+			main_manager.log_console("[Practice] The dummy hit you for 25!")
+			t.apply_damage(25) # may end the match - nothing after this
+		else:
+			bot_misses += 1
+			main_manager.log_console("[Practice] The dummy missed!")
+
 	func _process_dummy_ai(delta: float) -> void :
 		if not is_on_floor():
 			velocity.y -= 20.0 * gravity_mult * delta
@@ -4181,10 +4867,36 @@ class NetworkPlayer extends CharacterBody3D:
 			move_and_slide()
 			return
 
+		var level = _bot_level()
+		var speed = _dummy_speed()
+
+		# Flung by a clash, or dashing into you after landing a hit.
+		if is_launching:
+			launch_timer -= delta
+			var launch_dir = (launch_target_pos - global_position).normalized()
+			velocity = launch_dir * 32.0 + Vector3(0, 3, 0)
+			move_and_slide()
+			if launch_timer <= 0.0:
+				is_launching = false
+			return
+
+		if bot_windup > 0.0:
+			_bot_process_windup(delta)
+			move_and_slide()
+			return
+
 		# Stand still while being hit by a QTE (or once defeated).
 		if is_movement_locked or health <= 0:
-			velocity.x = move_toward(velocity.x, 0.0, DUMMY_SPEED * friction)
-			velocity.z = move_toward(velocity.z, 0.0, DUMMY_SPEED * friction)
+			velocity.x = move_toward(velocity.x, 0.0, speed * friction)
+			velocity.z = move_toward(velocity.z, 0.0, speed * friction)
+			move_and_slide()
+			return
+
+		var player = main_manager.get_local_player()
+		var hunting = level >= 3 and player != null and not player.is_dead
+		bot_attack_cd -= delta
+		if hunting and bot_attack_cd <= 0.0 and not main_manager.is_game_over and _bot_can_hit(player):
+			_bot_start_attack(player)
 			move_and_slide()
 			return
 
@@ -4193,25 +4905,40 @@ class NetworkPlayer extends CharacterBody3D:
 			_dummy_pick_new_path()
 
 		var desired = Vector3.ZERO
-		if nav_path_index < nav_path.size():
+		if hunting and global_position.distance_to(player.global_position) < 2.2:
+			# Close enough to strike: hold position and face the player.
+			_bot_face(player.global_position, delta)
+		elif nav_path_index < nav_path.size():
 			var wp = nav_path[nav_path_index]
 			var to_wp = Vector3(wp.x - global_position.x, 0.0, wp.z - global_position.z)
-			if to_wp.length() < 0.35:
+			if to_wp.length() < (0.35 if speed < 8.0 else 0.7):
 				nav_path_index += 1
 			else:
-				desired = to_wp.normalized() * DUMMY_SPEED
+				desired = to_wp.normalized() * speed
 
 		velocity.x = lerp(velocity.x, desired.x, friction)
 		velocity.z = lerp(velocity.z, desired.z, friction)
 		if desired.length() > 0.1:
 			rotation.y = lerp_angle(rotation.y, atan2(-desired.x, -desired.z), 10.0 * delta)
 
+		# Level 2+: hop every now and then while moving.
+		if level >= 2 and is_on_floor():
+			bot_jump_timer -= delta
+			if bot_jump_timer <= 0.0 and desired.length() > 0.1:
+				velocity.y = jump_velocity
+				bot_jumps += 1
+				bot_jump_timer = randf_range(1.5, 4.0)
+
 		move_and_slide()
 
-		# If we've barely moved for a second while trying to, pick a new path.
+		# If we've barely moved for a second while trying to, pick a new path
+		# (jumping first on level 2+, in case something low is in the way).
 		dummy_stuck_timer += delta
 		if dummy_stuck_timer >= 1.0:
 			if nav_path_index < nav_path.size() and global_position.distance_to(dummy_last_pos) < 0.3:
+				if level >= 2 and is_on_floor():
+					velocity.y = jump_velocity
+					bot_jumps += 1
 				_dummy_pick_new_path()
 			dummy_last_pos = global_position
 			dummy_stuck_timer = 0.0
@@ -4219,7 +4946,12 @@ class NetworkPlayer extends CharacterBody3D:
 	func _dummy_pick_new_path() -> void :
 		var target: Vector3
 		var player = main_manager.get_local_player()
-		if player and global_position.distance_to(player.global_position) < DUMMY_FLEE_RANGE:
+		var level = _bot_level()
+		if level >= 3 and player and not player.is_dead:
+			# Hunt: head for the player, re-planning often as they move.
+			target = player.global_position
+			dummy_repath_timer = 0.4
+		elif player and global_position.distance_to(player.global_position) < DUMMY_FLEE_RANGE:
 			# Player is close: run away, re-evaluating often.
 			target = main_manager.get_nav_point_away_from(player.global_position, global_position)
 			dummy_repath_timer = 1.5
@@ -4228,6 +4960,8 @@ class NetworkPlayer extends CharacterBody3D:
 			dummy_repath_timer = randf_range(4.0, 7.0)
 
 		nav_path = main_manager.get_nav_path(global_position, target)
+		if level >= 3:
+			nav_path = main_manager.smooth_nav_path(nav_path)
 		# Index 0 is the cell we're standing in; head for the next one.
 		nav_path_index = 1 if nav_path.size() > 1 else nav_path.size()
 
