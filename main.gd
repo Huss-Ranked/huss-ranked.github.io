@@ -752,6 +752,9 @@ var dc_status_label: Label = null
 var dc_dyn_box: VBoxContainer = null
 var dc_party_label: Label = null
 var dc_paste_to_input: bool = false
+var dc_my_local: int = -1 # network addresses in our join code
+var dc_my_pub: int = -1
+var dc_code_info: Label = null
 const DC_MODES: Array = [["1v1", "1v1", "2 players"], ["2v2", "2v2", "4 players"], ["3v3", "3v3", "6 players"], ["ffa", "Free For All", "3-5 players"], ["royale", "Huss Royale", "2-15 + bots"]]
 
 # ---- the browser side (overridden by the tests) ----
@@ -844,6 +847,8 @@ func _dc_event(d: Dictionary) -> void:
 		"code":
 			dc_my_code = String(d.get("code", ""))
 			dc_my_tok = int(d.get("tok", -1))
+			dc_my_local = int(d.get("local", -1))
+			dc_my_pub = int(d.get("pub", -1))
 			dc_making = false
 		"used":
 			# A friend's reply used up our code: make a fresh one for anyone else.
@@ -854,6 +859,7 @@ func _dc_event(d: Dictionary) -> void:
 		"reply":
 			var ea = _dc_entry("answer", String(d.get("key", "")))
 			ea["code"] = String(d.get("code", ""))
+			ea["addrs"] = int(d.get("local", 1)) + int(d.get("pub", 0))
 			if String(ea["state"]) != "connected":
 				ea["state"] = "waiting"
 			if dc_input and is_instance_valid(dc_input):
@@ -875,7 +881,14 @@ func _dc_event(d: Dictionary) -> void:
 				if String(d.get("n", "")) != "":
 					es["nick"] = String(d.get("n", ""))
 				if String(es["state"]) == "failed":
-					_dc_status("A connection didn't go through. Swap new codes and try again (you both need to be in the game while you do).", true)
+					es["why"] = String(d.get("why", ""))
+					_dc_status("A connection didn't go through: " + _dc_fail_text(String(es["why"])), true)
+					log_console("[Direct] A connection didn't go through (" + String(es["why"]) + ", network " + String(d.get("net", "?")) + ", connection " + String(d.get("conn", "?")) + ").")
+		"stage":
+			var gk = String(d.get("kind", ""))
+			if gk == "answer" or gk == "offer":
+				var eg = _dc_entry(gk, String(d.get("key", "")) if gk == "answer" else str(int(d.get("tok", -1))))
+				eg["stage"] = String(d.get("st", ""))
 		"link":
 			var nick = String(d.get("n", "Player"))
 			var lk = String(d.get("kind", ""))
@@ -926,6 +939,7 @@ func _free_direct_panel() -> void:
 		dc_canvas.queue_free()
 	dc_canvas = null
 	dc_code_label = null
+	dc_code_info = null
 	dc_input = null
 	dc_status_label = null
 	dc_dyn_box = null
@@ -1012,6 +1026,8 @@ func _build_direct_panel() -> void:
 	box.add_child(_dc_label("1. YOUR JOIN CODE", 15, yellow, dc_inner_w))
 	dc_code_label = _dc_label("", 15, Color(0.45, 0.9, 1.0), dc_inner_w)
 	box.add_child(dc_code_label)
+	dc_code_info = _dc_label("", 11, grey, dc_inner_w)
+	box.add_child(dc_code_info)
 	var row1 = HBoxContainer.new()
 	row1.add_theme_constant_override("separation", 8)
 	box.add_child(row1)
@@ -1075,6 +1091,17 @@ func _dc_refresh() -> void:
 			dc_code_label.text = "Making your code..."
 		else:
 			dc_code_label.text = "Press New code to make one."
+	if dc_code_info:
+		dc_code_info.visible = dc_my_code != "" and dc_my_local >= 0
+		var warn = false
+		if dc_my_local + dc_my_pub <= 0:
+			dc_code_info.text = "Your browser didn't share any network address, so nobody can connect to this code. A VPN, a privacy extension or a browser setting (WebRTC) may be blocking it."
+			warn = true
+		elif dc_my_pub <= 0:
+			dc_code_info.text = "(" + str(dc_my_local) + " local network address - no public address found, so only players on the same network as you can use this code)"
+		else:
+			dc_code_info.text = "(" + str(dc_my_local) + " local + " + str(dc_my_pub) + " public network address" + ("es" if dc_my_local + dc_my_pub > 1 else "") + " - it stays good for 30 minutes)"
+		dc_code_info.add_theme_color_override("font_color", Color(1.0, 0.55, 0.4) if warn else Color(0.7, 0.7, 0.74))
 	if dc_status_label:
 		dc_status_label.text = dc_status_text
 		dc_status_label.visible = dc_status_text != ""
@@ -1104,7 +1131,7 @@ func _dc_refresh() -> void:
 		if st == "connected":
 			dc_dyn_box.add_child(_dc_label("Connected with " + who, 13, green, dc_inner_w))
 		elif st == "failed":
-			dc_dyn_box.add_child(_dc_label(who + ": didn't connect - swap new codes and try again.", 13, red, dc_inner_w))
+			dc_dyn_box.add_child(_dc_label(who + ": " + _dc_fail_text(String(en.get("why", ""))), 13, red, dc_inner_w))
 		elif String(en["kind"]) == "answer":
 			if String(en["code"]) == "":
 				dc_dyn_box.add_child(_dc_label(who + ": making your reply code...", 13, grey, dc_inner_w))
@@ -1119,9 +1146,20 @@ func _dc_refresh() -> void:
 				var rc = String(en["code"])
 				cb.pressed.connect(func(): _dc_copy(rc))
 				dc_dyn_box.add_child(cb)
-				dc_dyn_box.add_child(_dc_label("(waiting for them to enter it...)", 11, grey, dc_inner_w))
+				if int(en.get("addrs", 1)) <= 0:
+					dc_dyn_box.add_child(_dc_label("Your browser didn't share any network address for this reply, so it can't connect. A VPN, a privacy extension or a browser setting (WebRTC) may be blocking it.", 11, red, dc_inner_w))
+				var found = String(en.get("stage", "")) == "route"
+				dc_dyn_box.add_child(_dc_label(("Found their computer. " if found else "") + "Waiting for them to enter it - take your time, it stays good for 15 minutes.", 11, Color(0.6, 1.0, 0.7) if found else grey, dc_inner_w))
 		else:
-			dc_dyn_box.add_child(_dc_label("Connecting to your friend...", 13, grey, dc_inner_w))
+			var stage_text = "Connecting to your friend... (looking for a route)"
+			match String(en.get("stage", "")):
+				"route":
+					stage_text = "Found your friend - securing the connection..."
+				"secure":
+					stage_text = "Secured - saying hello..."
+				"searching":
+					stage_text = "Still looking for a route to your friend... (this can take up to 3 minutes)"
+			dc_dyn_box.add_child(_dc_label(stage_text, 13, grey, dc_inner_w))
 
 	dc_dyn_box.add_child(HSeparator.new())
 	dc_dyn_box.add_child(_dc_label("3. PLAY TOGETHER", 15, yellow, dc_inner_w))
@@ -1154,6 +1192,18 @@ func _dc_refresh() -> void:
 	leave_b.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
 	leave_b.pressed.connect(_dc_leave_group)
 	dc_dyn_box.add_child(leave_b)
+
+func _dc_fail_text(why: String) -> String:
+	match why:
+		"route":
+			return "no network route between your computers. If you're on the same Wi-Fi, it may stop devices from reaching each other - a phone hotspot usually works."
+		"secure":
+			return "your computers found each other, but the secure handshake didn't finish. Swap new codes and try again."
+		"closed":
+			return "the other player closed the connection."
+		"expired":
+			return "the reply code wasn't entered in time (15 minutes)."
+	return "didn't connect - swap new codes and try again."
 
 func _dc_mode_fits(mode: String, n: int) -> bool:
 	match mode:
@@ -1559,7 +1609,9 @@ const HX_JS: String = """(function () {
 	window.hx = hx;
 	var NL = String.fromCharCode(10);
 	var CRLF = String.fromCharCode(13, 10);
-	var ICE_SERVERS = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }, { urls: ['stun:stun.cloudflare.com:3478'] }];
+	var ICE_SERVERS = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }, { urls: ['stun:stun.cloudflare.com:3478'] }, { urls: ['stun:stun.relay.metered.ca:80'] }];
+	var CODE_VERSION = 2;
+	var T0 = Date.now();
 	var GATHER_MS = 2500;
 	hx.room = null;
 	hx.nick = 'Player';
@@ -1592,7 +1644,7 @@ const HX_JS: String = """(function () {
 			try { if (typeof window._godot_on_direct === 'function' || window._godot_on_direct) { window._godot_on_direct(JSON.stringify(o)); } } catch (e) { console.error('[Direct]', e); }
 		}, 0);
 	}
-	function log(m) { try { console.log('[Direct] ' + m); } catch (e) {} }
+	function log(m) { try { console.log('[Direct] ' + ((Date.now() - T0) / 1000).toFixed(1) + 's ' + m); } catch (e) {} }
 
 	hx.selfId = function () {
 		if (!hx.fixedId) {
@@ -1746,14 +1798,18 @@ const HX_JS: String = """(function () {
 	}
 	function parseCand(s) {
 		var p = s.split(' ');
-		if (p.length < 8 || p[1] !== '1' || p[2].toLowerCase() !== 'udp' || p[6] !== 'typ') { return null; }
+		if (p.length < 8 || p[1] !== '1' || p[6] !== 'typ') { return null; }
+		var proto = p[2].toLowerCase();
+		var tcp = proto === 'tcp';
+		if (!tcp && proto !== 'udp') { return null; }
+		if (tcp && s.indexOf('tcptype passive') < 0) { return null; } // (active ones just dial out)
 		var type = p[7] === 'host' ? 0 : (p[7] === 'srflx' ? 1 : -1);
-		if (type < 0) { return null; }
+		if (type < 0 || (tcp && type !== 0)) { return null; }
 		var port = parseInt(p[5], 10);
 		if (!(port > 0 && port < 65536)) { return null; }
 		var ad = encAddr(p[4]);
 		if (!ad) { return null; }
-		return { type: type, fam: ad.fam, bytes: ad.bytes, port: port, addr: p[4] };
+		return { type: type, fam: ad.fam, bytes: ad.bytes, port: port, addr: p[4], tcp: tcp };
 	}
 	function parseSdp(sdp) {
 		var info = { ufrag: '', pwd: '', fpAlg: 'sha-256', fp: '', setup: 'actpass', mid: '0', cands: [] };
@@ -1771,19 +1827,33 @@ const HX_JS: String = """(function () {
 		return info;
 	}
 	function pickCands(list) {
-		var seen = {}, host = [], host6 = [], srf = [], srf6 = [];
+		var seen = {}, host = [], host6 = [], srf = [], srf6 = [], tcp = [];
 		for (var i = 0; i < list.length; i++) {
 			var c = list[i];
-			var k = c.type + '/' + c.fam + '/' + c.bytes.join('.') + '/' + c.port;
+			var k = (c.tcp ? 't' : 'u') + c.type + '/' + c.fam + '/' + c.bytes.join('.') + '/' + c.port;
 			if (seen[k]) { continue; }
 			seen[k] = true;
-			if (c.type === 0) { (c.fam === 1 ? host6 : host).push(c); } else { (c.fam === 1 ? srf6 : srf).push(c); }
+			if (c.tcp) { tcp.push(c); }
+			else if (c.type === 0) { (c.fam === 1 ? host6 : host).push(c); } else { (c.fam === 1 ? srf6 : srf).push(c); }
 		}
-		return srf.slice(0, 2).concat(host.slice(0, 2), srf6.slice(0, 1), host6.slice(0, 1));
+		var out = srf.slice(0, 2).concat(host.slice(0, 3), srf6.slice(0, 1), host6.slice(0, 1));
+		// TCP only for addresses already in the code (they cost 4 bytes each then)
+		var n = 0;
+		for (var j = 0; j < tcp.length && n < 2; j++) {
+			for (var q = 0; q < out.length; q++) {
+				if (!out[q].tcp && out[q].type === 0 && out[q].bytes.join('.') === tcp[j].bytes.join('.')) { out.push(tcp[j]); n++; break; }
+			}
+		}
+		return out;
+	}
+	function candSummary(list) {
+		var c = pickCands(list), loc = 0, pub = 0;
+		for (var i = 0; i < c.length; i++) { if (c[i].tcp) { continue; } if (c[i].type === 0) { loc++; } else { pub++; } }
+		return { local: loc, pub: pub };
 	}
 	function encodeInfo(kind, tok, info) {
 		var w = new W();
-		w.u8(16 | kind);
+		w.u8((CODE_VERSION << 4) | kind);
 		w.u16(tok);
 		var setup = info.setup === 'active' ? 1 : (info.setup === 'passive' ? 2 : 0);
 		var alg = info.fpAlg === 'sha-384' ? 1 : (info.fpAlg === 'sha-512' ? 2 : 0);
@@ -1799,8 +1869,10 @@ const HX_JS: String = """(function () {
 		w.u8(cands.length);
 		for (var j = 0; j < cands.length; j++) {
 			var c = cands[j];
-			w.u8((c.type << 4) | c.fam);
-			w.bytes(c.bytes);
+			var ref = -1;
+			for (var q = 0; q < j; q++) { if (cands[q].fam === c.fam && cands[q].bytes.join('.') === c.bytes.join('.')) { ref = q; break; } }
+			var head = (c.type << 4) | (c.tcp ? 64 : 0);
+			if (ref >= 0) { w.u8(head | 3); w.u8(ref); } else { w.u8(head | c.fam); w.bytes(c.bytes); }
 			w.u16(c.port);
 		}
 		w.u16(crc16(w.b, w.b.length));
@@ -1815,7 +1887,7 @@ const HX_JS: String = """(function () {
 	function parsePayload(b, n) {
 		var r = new R(b, n);
 		var v = r.u8();
-		if ((v >> 4) !== 1) { throw new Error('version'); }
+		if ((v >> 4) !== CODE_VERSION) { var ve = new Error('version'); ve.old = true; throw ve; }
 		var info = { kind: v & 15, tok: r.u16(), cands: [] };
 		var sa = r.u8();
 		info.setup = ['actpass', 'active', 'passive', 'actpass'][sa & 3];
@@ -1833,9 +1905,16 @@ const HX_JS: String = """(function () {
 		for (var j = 0; j < nc; j++) {
 			var tf = r.u8();
 			var fam = tf & 15;
-			var bytes = r.bytes(fam === 0 ? 4 : 16);
+			var addr;
+			if (fam === 3) {
+				var ri = r.u8();
+				if (ri >= info.cands.length) { throw new Error('ref'); }
+				addr = info.cands[ri].addr;
+			} else if (fam <= 2) {
+				addr = decAddr(fam, r.bytes(fam === 0 ? 4 : 16));
+			} else { throw new Error('fam'); }
 			var port = r.u16();
-			info.cands.push({ type: tf >> 4, fam: fam, addr: decAddr(fam, bytes), port: port });
+			info.cands.push({ type: (tf >> 4) & 3, tcp: (tf & 64) !== 0, addr: addr, port: port });
 		}
 		if (r.i !== n) { throw new Error('length'); }
 		return info;
@@ -1850,7 +1929,7 @@ const HX_JS: String = """(function () {
 			if (!b || b.length < 40) { continue; }
 			var n = b.length - 2;
 			if (crc16(b, n) !== ((b[n] << 8) | b[n + 1])) { continue; }
-			try { return parsePayload(b, n); } catch (e) { continue; }
+			try { return parsePayload(b, n); } catch (e) { if (e.old) { return { old: true }; } continue; }
 		}
 		return null;
 	}
@@ -1863,39 +1942,83 @@ const HX_JS: String = """(function () {
 			'a=sctp-port:5000', 'a=max-message-size:262144'];
 		for (var i = 0; i < info.cands.length; i++) {
 			var c = info.cands[i];
-			var prio = (c.type === 0 ? 126 : 100) * 16777216 + (65535 - i) * 256 + 255;
-			L.push('a=candidate:' + (i + 1) + ' 1 udp ' + prio + ' ' + c.addr + ' ' + c.port + ' typ ' + (c.type === 0 ? 'host' : 'srflx') + (c.type === 1 ? ' raddr 0.0.0.0 rport 0' : ''));
+			var prio = (c.tcp ? 90 : (c.type === 0 ? 126 : 100)) * 16777216 + (65535 - i) * 256 + 255;
+			L.push('a=candidate:' + (i + 1) + ' 1 ' + (c.tcp ? 'tcp' : 'udp') + ' ' + prio + ' ' + c.addr + ' ' + c.port + ' typ ' + (c.type === 0 ? 'host' : 'srflx') + (c.type === 1 ? ' raddr 0.0.0.0 rport 0' : '') + (c.tcp ? ' tcptype passive' : ''));
 		}
 		L.push('a=end-of-candidates');
 		return L.join(CRLF) + CRLF;
 	}
 	function fpKey(fp) { return String(fp).split(':').join('').substr(0, 10).toUpperCase(); }
+	function ownMid(pc) { return parseSdp(pc.localDescription ? pc.localDescription.sdp : '').mid || '0'; }
+	// The remote side as an "answer" to our own offer, with the DTLS roles we pick.
+	function remoteAnswer(info, setup, pc) {
+		var r = {};
+		for (var k in info) { r[k] = info[k]; }
+		r.setup = setup;
+		r.mid = ownMid(pc);
+		return { type: 'answer', sdp: buildSdp(r) };
+	}
 	hx._codec = { encodeInfo: encodeInfo, decodeCode: decodeCode, codeText: codeText, parseSdp: parseSdp, buildSdp: buildSdp, b32enc: b32enc, b32dec: b32dec };
 
 	// ---------- connections ----------
+	function tag(c) { return c.kind + (c.tok !== undefined ? ' ' + c.tok : '') + (c.nick ? ' (' + c.nick + ')' : ''); }
 	function makeConn(kind) {
 		var pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 		var dc = pc.createDataChannel('hx', { negotiated: true, id: 0, ordered: true });
-		var c = { pc: pc, dc: dc, kind: kind, t: now(), lastRx: now(), state: 'making', id: '', nick: '', room: null, key: '', dead: false };
+		var c = { pc: pc, dc: dc, kind: kind, t: now(), lastRx: now(), state: 'making', id: '', nick: '', room: null, key: '', dead: false, route: false, secure: false };
 		dc.onopen = function () {
 			c.lastRx = now();
-			sendRaw(c, { t: 'hi', id: hx.selfId(), n: hx.nick, r: hx.room, k: c.key, v: 1 });
+			log(tag(c) + ': channel open');
+			sendRaw(c, { t: 'hi', id: hx.selfId(), n: hx.nick, r: hx.room, k: c.key, v: CODE_VERSION });
 		};
 		dc.onmessage = function (ev) { onMsg(c, ev.data); };
-		dc.onclose = function () { drop(c, 'closed'); };
+		dc.onclose = function () { drop(c, c.secure ? 'closed' : (c.route ? 'secure' : 'route')); };
+		pc.oniceconnectionstatechange = function () {
+			var s = pc.iceConnectionState;
+			log(tag(c) + ': network ' + s);
+			if ((s === 'connected' || s === 'completed') && !c.route) { c.route = true; stage(c, 'route'); }
+			else if (s === 'failed' && !c.linked) { stage(c, c.applied || c.kind === 'answer' ? 'searching' : 'waiting'); }
+		};
 		pc.onconnectionstatechange = function () {
-			if (pc.connectionState === 'closed') { drop(c, 'closed'); }
+			var s = pc.connectionState;
+			log(tag(c) + ': connection ' + s);
+			if (s === 'connected' && !c.secure) { c.secure = true; stage(c, 'secure'); }
+			else if (s === 'closed') { drop(c, 'closed'); }
 		};
 		return c;
 	}
+	function stage(c, st) {
+		if (c.linked || c.stage === st) { return; }
+		c.stage = st;
+		if (c.kind === 'offer') { emit({ e: 'stage', kind: 'offer', tok: c.tok, st: st }); }
+		else if (c.kind === 'answer') { emit({ e: 'stage', kind: 'answer', key: c.key, st: st }); }
+	}
+	// Wait for this computer's network addresses. A code is only as good as
+	// the addresses in it, so: done as soon as we have a local and a public
+	// one; otherwise give the browser up to ~10s (address lookups can be slow).
 	function gathered(pc, ms) {
 		return new Promise(function (res) {
-			var done = false;
+			var done = false, host = 0, pub = 0, t0 = now(), firstAt = 0;
 			function fin() { if (!done) { done = true; res(); } }
-			if (pc.iceGatheringState === 'complete') { fin(); return; }
-			pc.addEventListener('icegatheringstatechange', function () { if (pc.iceGatheringState === 'complete') { fin(); } });
-			pc.addEventListener('icecandidate', function (e) { if (!e.candidate) { fin(); } });
-			setTimeout(fin, ms);
+			function count(sdp) {
+				var cs = parseSdp(sdp || '').cands;
+				host = 0; pub = 0;
+				for (var i = 0; i < cs.length; i++) { if (cs[i].type === 0) { host++; } else { pub++; } }
+			}
+			function check() {
+				if (done) { return; }
+				if (pc.iceGatheringState === 'complete') { fin(); return; }
+				count(pc.localDescription ? pc.localDescription.sdp : '');
+				if (host + pub > 0 && !firstAt) { firstAt = now(); }
+				var t = now() - t0;
+				if (host > 0 && pub > 0 && now() - firstAt > 300) { fin(); return; }
+				if (host + pub > 0 && t >= ms) { fin(); return; }
+				if (t >= ms * 4) { fin(); return; } // (nothing at all - give up waiting)
+			}
+			pc.addEventListener('icegatheringstatechange', check);
+			pc.addEventListener('icecandidate', function (e) { if (!e.candidate) { fin(); } else { setTimeout(check, 320); } });
+			var iv = setInterval(function () { check(); if (done) { clearInterval(iv); } }, 250);
+			check();
 		});
 	}
 	function sendRaw(c, obj) {
@@ -1907,11 +2030,12 @@ const HX_JS: String = """(function () {
 		for (var id in hx.links) { if (!hx.links[id].dead) { out.push(hx.links[id]); } }
 		return out;
 	}
-	function state(c, s) {
+	function state(c, s, why) {
 		if (c.state === s) { return; }
 		c.state = s;
-		if (c.kind === 'offer') { emit({ e: 'state', kind: 'offer', tok: c.tok, s: s, n: c.nick, id: c.id }); }
-		else if (c.kind === 'answer') { emit({ e: 'state', kind: 'answer', key: c.key, s: s, n: c.nick, id: c.id }); }
+		var d = { e: 'state', kind: c.kind, s: s, n: c.nick, id: c.id, why: why || '', net: c.pc.iceConnectionState, conn: c.pc.connectionState };
+		if (c.kind === 'offer') { d.tok = c.tok; } else if (c.kind === 'answer') { d.key = c.key; } else { return; }
+		emit(d);
 	}
 	function forget(c) {
 		for (var t in hx.pend) { if (hx.pend[t] === c) { delete hx.pend[t]; } }
@@ -1938,7 +2062,8 @@ const HX_JS: String = """(function () {
 			floodPeers();
 			groupChanged();
 		} else if (c.state !== 'failed' && c.state !== 'replaced' && (c.kind === 'offer' || c.kind === 'answer')) {
-			state(c, 'failed');
+			log(tag(c) + ': gave up (' + why + ') after ' + Math.round((now() - c.t) / 1000) + 's');
+			state(c, 'failed', why);
 		}
 	}
 	function onMsg(c, raw) {
@@ -2136,7 +2261,7 @@ const HX_JS: String = """(function () {
 			if (id === me || hx.links[id] || me > id) { continue; }
 			var busy = false;
 			for (var s in hx.mesh) { if (hx.mesh[s].peer === id) { busy = true; } }
-			if (busy || now() - (hx.meshTried[id] || 0) < 45000) { continue; }
+			if (busy || now() - (hx.meshTried[id] || 0) < 12000) { continue; }
 			hx.meshTried[id] = now();
 			startMesh(id);
 		}
@@ -2166,9 +2291,10 @@ const HX_JS: String = """(function () {
 	hx.makeCode = function (nick) {
 		if (nick) { hx.nick = String(nick).substr(0, 24); }
 		hx.selfId();
-		// keep a few older codes alive (a friend may still be entering one)
-		var toks = Object.keys(hx.pend);
-		if (toks.length >= 4) {
+		// keep a few older codes alive (a friend may still be entering one) -
+		// but never one that's connecting right now
+		var toks = Object.keys(hx.pend).filter(function (k) { return !hx.pend[k].applied; });
+		if (toks.length >= 6) {
 			toks.sort(function (a, b) { return hx.pend[a].t - hx.pend[b].t; });
 			var oldest = hx.pend[toks[0]];
 			oldest.state = 'replaced';
@@ -2188,7 +2314,9 @@ const HX_JS: String = """(function () {
 				c.key = 'c' + tok + fpKey(info.fp);
 				c.code = codeText(encodeInfo(0, tok, info));
 				c.state = 'ready';
-				emit({ e: 'code', code: c.code, tok: tok, cands: pickCands(info.cands).length });
+				var cs = candSummary(info.cands);
+				log('join code ' + tok + ' ready: ' + cs.local + ' local + ' + cs.pub + ' public address(es)');
+				emit({ e: 'code', code: c.code, tok: tok, local: cs.local, pub: cs.pub });
 			})
 			.catch(function (err) { c.state = 'failed'; drop(c, 'make'); emit({ e: 'err', m: 'Could not make a join code (' + err + ').' }); });
 	};
@@ -2196,6 +2324,7 @@ const HX_JS: String = """(function () {
 		if (nick) { hx.nick = String(nick).substr(0, 24); }
 		var info = decodeCode(text);
 		if (!info) { emit({ e: 'err', m: "That code isn't right - check it, or copy it again." }); return; }
+		if (info.old) { emit({ e: 'err', m: 'That code is from an older version of the game - you both need the latest version (refresh the page).' }); return; }
 		hx.selfId();
 		if (info.kind === 1) { applyReply(info); } else if (info.kind === 0) { answerJoin(info); }
 		else { emit({ e: 'err', m: "That code isn't right - check it, or copy it again." }); }
@@ -2218,15 +2347,22 @@ const HX_JS: String = """(function () {
 		c.tok = info.tok;
 		hx.ans[key] = c;
 		emit({ e: 'state', kind: 'answer', key: key, s: 'making' });
-		c.pc.setRemoteDescription({ type: 'offer', sdp: buildSdp(info) })
-			.then(function () { return c.pc.createAnswer(); })
-			.then(function (a) { return c.pc.setLocalDescription(a); })
+		log('entered a join code (' + info.cands.length + ' address(es) in it)');
+		// We're ready before the code's owner is, so we wait for them to start
+		// the secure handshake (DTLS server): they start it once they have our
+		// reply. Both sides make an offer and read the other's code as its answer.
+		c.pc.createOffer()
+			.then(function (o) { return c.pc.setLocalDescription(o); })
+			.then(function () { return c.pc.setRemoteDescription(remoteAnswer(info, 'active', c.pc)); })
 			.then(function () { return gathered(c.pc, GATHER_MS); })
 			.then(function () {
 				if (c.dead) { return; }
-				c.reply = codeText(encodeInfo(1, info.tok, parseSdp(c.pc.localDescription.sdp)));
+				var mine = parseSdp(c.pc.localDescription.sdp);
+				c.reply = codeText(encodeInfo(1, info.tok, mine));
 				if (!c.linked) { c.state = 'waiting'; }
-				emit({ e: 'reply', key: key, code: c.reply });
+				var cs = candSummary(mine.cands);
+				log('reply code ready: ' + cs.local + ' local + ' + cs.pub + ' public address(es)');
+				emit({ e: 'reply', key: key, code: c.reply, local: cs.local, pub: cs.pub });
 			})
 			.catch(function (err) { c.state = 'failed'; drop(c, 'answer'); emit({ e: 'err', m: 'Could not use that code (' + err + ').' }); });
 	}
@@ -2239,10 +2375,20 @@ const HX_JS: String = """(function () {
 			emit({ e: 'err', m: "That reply is for a join code you don't have any more - make a new code and swap again." });
 			return;
 		}
+		var sig = info.ufrag + '/' + info.pwd;
+		if (c.applied) {
+			// the same reply again (pasted twice, Enter pressed twice...): fine
+			if (c.replySig === sig) { emit({ e: 'applied', tok: info.tok }); return; }
+			emit({ e: 'err', m: 'That join code is already connecting to someone else - make a new code for this friend.' });
+			return;
+		}
 		if (c.pc.signalingState !== 'have-local-offer') { emit({ e: 'err', m: 'That join code is already being used.' }); return; }
 		c.applied = now();
+		c.replySig = sig;
 		state(c, 'connecting');
-		c.pc.setRemoteDescription({ type: 'answer', sdp: buildSdp(info) })
+		log('entered a reply code (' + info.cands.length + ' address(es) in it)');
+		// Our friend is waiting for us: we start the secure handshake (DTLS client).
+		c.pc.setRemoteDescription(remoteAnswer(info, 'passive', c.pc))
 			.then(function () { emit({ e: 'applied', tok: info.tok }); })
 			.catch(function (err) { c.state = 'failed'; drop(c, 'reply'); emit({ e: 'err', m: "Couldn't use that reply code (" + err + ')' }); });
 		if (hx.myTok === info.tok) { hx.myTok = -1; emit({ e: 'used', tok: info.tok }); }
@@ -2338,16 +2484,16 @@ const HX_JS: String = """(function () {
 		var k;
 		for (k in hx.pend) {
 			var p = hx.pend[k];
-			if (p.applied && !p.linked && t - p.applied > 60000) { drop(p, 'no answer'); }
+			if (p.applied && !p.linked && t - p.applied > 180000) { drop(p, p.route ? 'secure' : 'route'); }
 			else if (!p.applied && t - p.t > 1800000) { p.state = 'replaced'; drop(p, 'old'); }
 		}
 		for (k in hx.ans) {
 			var a = hx.ans[k];
-			if (!a.linked && t - a.t > 600000) { drop(a, 'old'); }
+			if (!a.linked && t - a.t > 900000) { drop(a, 'expired'); }
 		}
 		for (k in hx.mesh) {
 			var m = hx.mesh[k];
-			if (!m.linked && t - m.t > 30000) { m.state = 'replaced'; drop(m, 'mesh timeout'); }
+			if (!m.linked && t - m.t > 20000) { m.state = 'replaced'; drop(m, 'mesh timeout'); }
 		}
 		for (k in hx.seen) { if (t - hx.seen[k] > 120000) { delete hx.seen[k]; } }
 	}, 2000);
