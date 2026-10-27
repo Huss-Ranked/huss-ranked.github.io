@@ -534,8 +534,9 @@ var color_field: Control = null
 # aim assist that pulls the camera toward a nearby opponent.
 const MOBILE_LOOK_SENSITIVITY: float = 0.006
 const AIM_ASSIST_RANGE: float = 12.0
-const AIM_ASSIST_CONE_DEG: float = 40.0
-const AIM_ASSIST_STRENGTH: float = 4.0
+const AIM_ASSIST_CONE_DEG: float = 20.0 # they have to be roughly in your sights already
+const AIM_ASSIST_STRENGTH: float = 1.2 # (fades to nothing at the edge of the cone)
+const AIM_ASSIST_MAX_TURN: float = 12.0 # degrees per second, at most
 var mobile_controls: bool = false
 var mobile_ui: Control = null
 var console_panel: Control = null
@@ -629,10 +630,16 @@ func _ready() -> void :
 	_init_trystero_bridge()
 	_init_admin_console()
 	_init_view_key_guard()
+	get_viewport().gui_focus_changed.connect(_on_gui_focus_changed)
 	_build_main_menu()
+
+func _input(event: InputEvent) -> void :
+	if _osk_visible():
+		_osk_input(event)
 
 func _process(delta: float) -> void :
 	_net_tick()
+	_osk_tick(delta)
 
 	team_hud_timer -= delta
 	if team_hud_timer <= 0.0:
@@ -713,6 +720,1645 @@ func _on_leave_requested() -> void :
 		_return_to_main_menu()
 
 
+
+# --- DIRECT CONNECT (join codes - for Wi-Fi that blocks the relay servers) ---
+# Players swap codes that carry their computer's connection details (WebRTC)
+# and get a direct link, with no relay or signalling server in between. The
+# links work as a second transport next to Trystero (same rooms, same
+# packets), so a group linked this way can queue and play like normal - in
+# its own private lobby. The browser side is HX_JS.
+# Swapping: A sends B a join code; B enters it and gets a reply code; A enters
+# that and they're linked (a browser needs both sides' details). Everyone A
+# links with gets linked with each other automatically.
+var js_on_direct_cb: JavaScriptObject
+var dc_canvas: CanvasLayer = null
+var dc_open: bool = false
+var dc_my_code: String = ""
+var dc_my_tok: int = -1
+var dc_making: bool = false
+var dc_entries: Array = [] # {kind: "answer"/"offer", id, code, state, nick, num}
+var dc_entry_seq: int = 0
+var dc_group: Array = [] # [{id, n, d, me}] from the browser side
+var dc_status_text: String = ""
+var dc_status_bad: bool = false
+var dc_lobby: String = "" # queueing with the group: its private lobby room
+var dc_n: int = 0 # ...and how many of us there are
+var dc_queue_ms: int = 0
+var dc_sig: String = ""
+var dc_inner_w: float = 500.0
+var dc_code_label: Label = null
+var dc_input: LineEdit = null
+var dc_status_label: Label = null
+var dc_dyn_box: VBoxContainer = null
+var dc_party_label: Label = null
+var dc_paste_to_input: bool = false
+const DC_MODES: Array = [["1v1", "1v1", "2 players"], ["2v2", "2v2", "4 players"], ["3v3", "3v3", "6 players"], ["ffa", "Free For All", "3-5 players"], ["royale", "Huss Royale", "2-15 + bots"]]
+
+# ---- the browser side (overridden by the tests) ----
+func _hx_obj():
+	if not OS.has_feature("web"):
+		return null
+	var window = JavaScriptBridge.get_interface("window")
+	if window == null:
+		return null
+	return window.hx
+
+func _hx_available() -> bool:
+	return _hx_obj() != null
+
+func _hx_set_room(code: String) -> void:
+	var hx = _hx_obj()
+	if hx:
+		hx.setRoom(code)
+
+func _hx_make_code() -> void:
+	var hx = _hx_obj()
+	if hx:
+		hx.makeCode(local_nickname)
+
+func _hx_enter_code(text: String) -> void:
+	var hx = _hx_obj()
+	if hx:
+		hx.enterCode(text, local_nickname)
+
+func _hx_ctl(d: Dictionary) -> void:
+	var hx = _hx_obj()
+	if hx:
+		hx.ctl(JSON.stringify(d))
+
+func _hx_group() -> Array:
+	var hx = _hx_obj()
+	if hx == null:
+		return []
+	var s = hx.groupJson()
+	if typeof(s) != TYPE_STRING:
+		return []
+	var j = JSON.parse_string(s)
+	return j if j is Array else []
+
+func _hx_copy(text: String) -> void:
+	var hx = _hx_obj()
+	if hx:
+		hx.copyText(text)
+
+func _hx_arm_paste() -> bool:
+	var hx = _hx_obj()
+	if hx:
+		hx.armPaste()
+		return true
+	return false
+
+func _hx_reset() -> void:
+	var hx = _hx_obj()
+	if hx:
+		hx.reset()
+
+func _hx_set_nick(nick: String) -> void:
+	var hx = _hx_obj()
+	if hx:
+		hx.setNick(nick)
+
+# ---- events from the browser side ----
+func _on_hx_event(args: Array) -> void:
+	if args.is_empty():
+		return
+	var d = JSON.parse_string(String(args[0]))
+	if d is Dictionary:
+		_dc_event(d)
+
+func _dc_entry(kind: String, id: String) -> Dictionary:
+	for en in dc_entries:
+		if String(en["kind"]) == kind and String(en["id"]) == id:
+			return en
+	dc_entry_seq += 1
+	var made = {"kind": kind, "id": id, "code": "", "state": "making", "nick": "", "num": dc_entry_seq}
+	dc_entries.append(made)
+	return made
+
+func _dc_status(text: String, bad: bool) -> void:
+	dc_status_text = text
+	dc_status_bad = bad
+
+func _dc_event(d: Dictionary) -> void:
+	match String(d.get("e", "")):
+		"code":
+			dc_my_code = String(d.get("code", ""))
+			dc_my_tok = int(d.get("tok", -1))
+			dc_making = false
+		"used":
+			# A friend's reply used up our code: make a fresh one for anyone else.
+			if int(d.get("tok", -1)) == dc_my_tok:
+				dc_my_code = ""
+				dc_my_tok = -1
+				_dc_make_code()
+		"reply":
+			var ea = _dc_entry("answer", String(d.get("key", "")))
+			ea["code"] = String(d.get("code", ""))
+			if String(ea["state"]) != "connected":
+				ea["state"] = "waiting"
+			if dc_input and is_instance_valid(dc_input):
+				dc_input.text = ""
+			_dc_status("Got it! Now send your friend the reply code below.", false)
+		"applied":
+			var eo = _dc_entry("offer", str(int(d.get("tok", -1))))
+			if String(eo["state"]) != "connected":
+				eo["state"] = "connecting"
+			if dc_input and is_instance_valid(dc_input):
+				dc_input.text = ""
+			_dc_status("Reply code accepted - connecting...", false)
+		"state":
+			var sk = String(d.get("kind", ""))
+			if sk == "answer" or sk == "offer":
+				var es = _dc_entry(sk, String(d.get("key", "")) if sk == "answer" else str(int(d.get("tok", -1))))
+				if String(es["state"]) != "connected" or String(d.get("s", "")) == "failed":
+					es["state"] = String(d.get("s", es["state"]))
+				if String(d.get("n", "")) != "":
+					es["nick"] = String(d.get("n", ""))
+				if String(es["state"]) == "failed":
+					_dc_status("A connection didn't go through. Swap new codes and try again (you both need to be in the game while you do).", true)
+		"link":
+			var nick = String(d.get("n", "Player"))
+			var lk = String(d.get("kind", ""))
+			if lk == "answer" or lk == "offer":
+				var el = _dc_entry(lk, String(d.get("key", "")) if lk == "answer" else str(int(d.get("tok", -1))))
+				el["state"] = "connected"
+				el["nick"] = nick
+				_dc_status("Connected with " + nick + "!", false)
+			log_console("[Direct] Connected with " + nick + ".")
+			dc_group = _hx_group()
+		"unlink":
+			log_console("[Direct] Lost the connection to " + String(d.get("n", "a player")) + ".")
+			dc_group = _hx_group()
+		"group":
+			dc_group = _hx_group()
+		"ctl":
+			var j = d.get("j", {})
+			if j is Dictionary:
+				_dc_on_ctl(String(d.get("from", "")), j)
+		"err":
+			_dc_status(String(d.get("m", "Something went wrong.")), true)
+		"copied":
+			_dc_status("Copied! Now paste it to your friend.", false)
+		"copyfail":
+			_dc_status("Couldn't copy it automatically - select the code and copy it by hand.", true)
+		"paste":
+			_dc_pasted(String(d.get("t", "")))
+	_dc_refresh()
+
+# ---- the panel ----
+func _open_direct_panel() -> void:
+	_save_nickname_from_input()
+	dc_open = true
+	_hx_set_nick(local_nickname)
+	if dc_my_code == "" and not dc_making:
+		_dc_make_code()
+	dc_group = _hx_group()
+	_build_direct_panel()
+
+func _close_direct_panel() -> void:
+	dc_open = false
+	if osk_target and is_instance_valid(osk_target) and osk_target == dc_input:
+		_osk_hide()
+	_free_direct_panel()
+
+func _free_direct_panel() -> void:
+	if dc_canvas and is_instance_valid(dc_canvas):
+		dc_canvas.queue_free()
+	dc_canvas = null
+	dc_code_label = null
+	dc_input = null
+	dc_status_label = null
+	dc_dyn_box = null
+
+func _dc_make_code() -> void:
+	if not _hx_available():
+		dc_making = false
+		_dc_status("Join codes only work in the browser version of the game.", true)
+		return
+	dc_making = true
+	_hx_set_nick(local_nickname)
+	_hx_make_code()
+
+func _dc_new_code() -> void:
+	dc_my_code = ""
+	dc_my_tok = -1
+	_dc_make_code()
+	_dc_refresh()
+
+func _dc_label(text: String, size: int, color: Color, width: float) -> Label:
+	var l = Label.new()
+	l.text = text
+	l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	l.custom_minimum_size = Vector2(width, 0)
+	l.add_theme_font_size_override("font_size", size)
+	l.add_theme_color_override("font_color", color)
+	return l
+
+func _build_direct_panel() -> void:
+	_free_direct_panel()
+	var vp = get_viewport().get_visible_rect().size
+	dc_canvas = CanvasLayer.new()
+	dc_canvas.layer = 40
+	add_child(dc_canvas)
+	var dim = ColorRect.new()
+	dim.color = Color(0, 0, 0, 0.6)
+	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
+	dim.mouse_filter = Control.MOUSE_FILTER_STOP
+	dc_canvas.add_child(dim)
+	var center = CenterContainer.new()
+	center.set_anchors_preset(Control.PRESET_FULL_RECT)
+	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	dc_canvas.add_child(center)
+	var w = min(600.0, vp.x - 16.0)
+	var h = min(vp.y - 16.0, 720.0)
+	dc_inner_w = w - 44.0
+	var panel = PanelContainer.new()
+	panel.custom_minimum_size = Vector2(w, 0)
+	var psb = StyleBoxFlat.new()
+	psb.bg_color = Color(0.1, 0.11, 0.14, 0.98)
+	psb.border_color = Color(1.0, 0.9, 0.2, 0.45)
+	psb.set_border_width_all(2)
+	psb.set_corner_radius_all(8)
+	psb.set_content_margin_all(8)
+	panel.add_theme_stylebox_override("panel", psb)
+	center.add_child(panel)
+	var scroll = ScrollContainer.new()
+	scroll.custom_minimum_size = Vector2(w - 16.0, h - 16.0)
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	panel.add_child(scroll)
+	var box = VBoxContainer.new()
+	box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	box.add_theme_constant_override("separation", 7)
+	scroll.add_child(box)
+	var yellow = Color(1.0, 0.9, 0.2)
+	var grey = Color(0.78, 0.78, 0.8)
+
+	var head = HBoxContainer.new()
+	box.add_child(head)
+	var title = Label.new()
+	title.text = "DIRECT CONNECT"
+	title.add_theme_font_size_override("font_size", 20)
+	title.add_theme_color_override("font_color", yellow)
+	title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	head.add_child(title)
+	var close_b = Button.new()
+	close_b.text = "Close"
+	close_b.custom_minimum_size = Vector2(80, 34)
+	close_b.pressed.connect(_close_direct_panel)
+	head.add_child(close_b)
+	box.add_child(_dc_label("Wi-Fi blocking the relay servers? Swap codes with your friends and your games connect straight to each other.", 12, grey, dc_inner_w))
+	box.add_child(HSeparator.new())
+
+	box.add_child(_dc_label("1. YOUR JOIN CODE", 15, yellow, dc_inner_w))
+	dc_code_label = _dc_label("", 15, Color(0.45, 0.9, 1.0), dc_inner_w)
+	box.add_child(dc_code_label)
+	var row1 = HBoxContainer.new()
+	row1.add_theme_constant_override("separation", 8)
+	box.add_child(row1)
+	var copy_b = Button.new()
+	copy_b.text = "Copy code"
+	copy_b.custom_minimum_size = Vector2(130, 36)
+	copy_b.action_mode = BaseButton.ACTION_MODE_BUTTON_PRESS # (copying needs the tap that's still going on)
+	copy_b.pressed.connect(func(): _dc_copy(dc_my_code))
+	row1.add_child(copy_b)
+	var new_b = Button.new()
+	new_b.text = "New code"
+	new_b.custom_minimum_size = Vector2(110, 36)
+	new_b.pressed.connect(_dc_new_code)
+	row1.add_child(new_b)
+	box.add_child(_dc_label("Send it to a friend. When they enter it, their game gives them a reply code - they send that back to you, and you enter it in step 2.", 12, grey, dc_inner_w))
+	box.add_child(HSeparator.new())
+
+	box.add_child(_dc_label("2. ENTER A CODE", 15, yellow, dc_inner_w))
+	box.add_child(_dc_label("A friend's join code (you'll get a reply code to send back), or the reply code a friend sent you.", 12, grey, dc_inner_w))
+	var row2 = HBoxContainer.new()
+	row2.add_theme_constant_override("separation", 6)
+	box.add_child(row2)
+	dc_input = LineEdit.new()
+	dc_input.placeholder_text = "Paste a code here (HX-...)"
+	dc_input.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	dc_input.custom_minimum_size = Vector2(120, 36)
+	dc_input.set_meta("osk_upper", true)
+	dc_input.text_submitted.connect(func(_t): _dc_submit())
+	_osk_prep(dc_input)
+	row2.add_child(dc_input)
+	var paste_b = Button.new()
+	paste_b.text = "Paste"
+	paste_b.custom_minimum_size = Vector2(70, 36)
+	paste_b.action_mode = BaseButton.ACTION_MODE_BUTTON_PRESS
+	paste_b.pressed.connect(_dc_paste_pressed)
+	row2.add_child(paste_b)
+	var enter_b = Button.new()
+	enter_b.text = "Enter"
+	enter_b.custom_minimum_size = Vector2(70, 36)
+	enter_b.pressed.connect(_dc_submit)
+	row2.add_child(enter_b)
+	dc_status_label = _dc_label("", 13, Color(0.6, 1.0, 0.7), dc_inner_w)
+	box.add_child(dc_status_label)
+	dc_dyn_box = VBoxContainer.new()
+	dc_dyn_box.add_theme_constant_override("separation", 6)
+	box.add_child(dc_dyn_box)
+	dc_sig = ""
+	_dc_refresh()
+
+func _dc_refresh() -> void:
+	var n = max(dc_group.size(), 1)
+	if dc_party_label and is_instance_valid(dc_party_label):
+		dc_party_label.visible = n > 1
+		dc_party_label.text = "Direct group: " + str(n) + " players connected"
+	if not dc_canvas or not is_instance_valid(dc_canvas):
+		return
+	if dc_code_label:
+		if dc_my_code != "":
+			dc_code_label.text = dc_my_code
+		elif dc_making:
+			dc_code_label.text = "Making your code..."
+		else:
+			dc_code_label.text = "Press New code to make one."
+	if dc_status_label:
+		dc_status_label.text = dc_status_text
+		dc_status_label.visible = dc_status_text != ""
+		dc_status_label.add_theme_color_override("font_color", Color(1.0, 0.55, 0.4) if dc_status_bad else Color(0.6, 1.0, 0.7))
+	if not dc_dyn_box:
+		return
+	var sig = str([dc_entries, dc_group, mm_phase])
+	if sig == dc_sig and dc_dyn_box.get_child_count() > 0:
+		return
+	dc_sig = sig
+	for c in dc_dyn_box.get_children():
+		c.queue_free()
+	var yellow = Color(1.0, 0.9, 0.2)
+	var grey = Color(0.78, 0.78, 0.8)
+	var green = Color(0.6, 1.0, 0.7)
+	var red = Color(1.0, 0.55, 0.4)
+
+	var shown: Array = []
+	for en in dc_entries:
+		if String(en["state"]) != "replaced":
+			shown.append(en)
+	if not shown.is_empty():
+		dc_dyn_box.add_child(_dc_label("CONNECTIONS", 13, yellow, dc_inner_w))
+	for en in shown:
+		var who = String(en["nick"]) if String(en["nick"]) != "" else "Friend #" + str(int(en["num"]))
+		var st = String(en["state"])
+		if st == "connected":
+			dc_dyn_box.add_child(_dc_label("Connected with " + who, 13, green, dc_inner_w))
+		elif st == "failed":
+			dc_dyn_box.add_child(_dc_label(who + ": didn't connect - swap new codes and try again.", 13, red, dc_inner_w))
+		elif String(en["kind"]) == "answer":
+			if String(en["code"]) == "":
+				dc_dyn_box.add_child(_dc_label(who + ": making your reply code...", 13, grey, dc_inner_w))
+			else:
+				dc_dyn_box.add_child(_dc_label(who + ": send them this reply code -", 13, Color(1, 1, 1), dc_inner_w))
+				dc_dyn_box.add_child(_dc_label(String(en["code"]), 14, Color(0.45, 0.9, 1.0), dc_inner_w))
+				var cb = Button.new()
+				cb.text = "Copy reply code"
+				cb.custom_minimum_size = Vector2(160, 34)
+				cb.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+				cb.action_mode = BaseButton.ACTION_MODE_BUTTON_PRESS
+				var rc = String(en["code"])
+				cb.pressed.connect(func(): _dc_copy(rc))
+				dc_dyn_box.add_child(cb)
+				dc_dyn_box.add_child(_dc_label("(waiting for them to enter it...)", 11, grey, dc_inner_w))
+		else:
+			dc_dyn_box.add_child(_dc_label("Connecting to your friend...", 13, grey, dc_inner_w))
+
+	dc_dyn_box.add_child(HSeparator.new())
+	dc_dyn_box.add_child(_dc_label("3. PLAY TOGETHER", 15, yellow, dc_inner_w))
+	if dc_group.size() <= 1:
+		dc_dyn_box.add_child(_dc_label("Nobody's connected yet. Swap codes above - for 2v2 and up, swap with each player (or let one player collect everyone's codes).", 12, grey, dc_inner_w))
+		return
+	var names: Array = []
+	for g in dc_group:
+		if bool(g.get("me", false)):
+			names.push_front("You")
+		else:
+			names.append(String(g.get("n", "Player")))
+	dc_dyn_box.add_child(_dc_label("Your group (" + str(dc_group.size()) + "): " + ", ".join(PackedStringArray(names)), 14, green, dc_inner_w))
+	dc_dyn_box.add_child(_dc_label("Pick a mode - everyone in the group queues together into a private match:", 12, grey, dc_inner_w))
+	var grid = GridContainer.new()
+	grid.columns = 3 if dc_inner_w >= 430.0 else 2
+	grid.add_theme_constant_override("h_separation", 6)
+	grid.add_theme_constant_override("v_separation", 6)
+	dc_dyn_box.add_child(grid)
+	for m in DC_MODES:
+		var b = Button.new()
+		b.text = String(m[1]) + "\n(" + String(m[2]) + ")"
+		b.custom_minimum_size = Vector2(min(170.0, (dc_inner_w - 12.0) / grid.columns), 52)
+		b.disabled = not _dc_mode_fits(String(m[0]), dc_group.size()) or mm_phase != "menu"
+		b.pressed.connect(_dc_queue.bind(String(m[0])))
+		grid.add_child(b)
+	var leave_b = Button.new()
+	leave_b.text = "Leave group"
+	leave_b.custom_minimum_size = Vector2(130, 32)
+	leave_b.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+	leave_b.pressed.connect(_dc_leave_group)
+	dc_dyn_box.add_child(leave_b)
+
+func _dc_mode_fits(mode: String, n: int) -> bool:
+	match mode:
+		"1v1":
+			return n == 2
+		"2v2":
+			return n == 4
+		"3v3":
+			return n == 6
+		"ffa":
+			return n >= 3 and n <= 5
+		"royale":
+			return n >= 2 and n <= 15
+	return false
+
+func _dc_submit() -> void:
+	var t = dc_input.text.strip_edges() if dc_input and is_instance_valid(dc_input) else ""
+	if t == "":
+		_dc_status("Paste (or type) a code first.", true)
+		_dc_refresh()
+		return
+	if not _hx_available():
+		_dc_status("Join codes only work in the browser version of the game.", true)
+		_dc_refresh()
+		return
+	_dc_status("Checking the code...", false)
+	_hx_set_nick(local_nickname)
+	_hx_enter_code(t)
+	_dc_refresh()
+
+func _dc_copy(text: String) -> void:
+	if text == "":
+		return
+	DisplayServer.clipboard_set(text)
+	_hx_copy(text)
+	_dc_status("Copied! Now paste it to your friend." if not OS.has_feature("web") else "Copying...", false)
+	_dc_refresh()
+
+func _dc_paste_pressed() -> void:
+	if _hx_arm_paste():
+		dc_paste_to_input = true
+		return
+	var t = DisplayServer.clipboard_get().strip_edges()
+	if t != "" and dc_input and is_instance_valid(dc_input):
+		dc_input.text = t
+		_dc_submit()
+
+func _dc_pasted(t: String) -> void:
+	var clean = t.strip_edges().replace("\r", " ").replace("\n", " ")
+	if clean == "":
+		return
+	if osk_target and is_instance_valid(osk_target) and osk_canvas and osk_canvas.visible:
+		_osk_paste_text(clean)
+	elif dc_paste_to_input and dc_input and is_instance_valid(dc_input):
+		dc_input.text = clean
+		_dc_submit()
+	dc_paste_to_input = false
+
+func _dc_leave_group() -> void:
+	_hx_reset()
+	dc_entries.clear()
+	dc_group = _hx_group()
+	_dc_status("You left the group.", false)
+	_dc_refresh()
+
+# ---- queueing together ----
+func _dc_queue(mode: String) -> void:
+	var n = dc_group.size()
+	if mm_phase != "menu" or not _dc_mode_fits(mode, n):
+		return
+	var me = _get_self_trystero_id()
+	if me == "":
+		return
+	var ids: Array = []
+	for g in dc_group:
+		ids.append(String(g.get("id", "")))
+	var lobby = "direct_" + mode + "_" + me.substr(0, 8) + "_" + str(randi() % 1000000)
+	_hx_ctl({"a": "dq", "mode": mode, "lobby": lobby, "n": n, "ids": ids, "by": local_nickname})
+	log_console("[Direct] Queueing your group of " + str(n) + " for " + String(GAME_MODES[mode]["label"]) + "...")
+	_dc_start_queue(mode, lobby, n)
+
+func _dc_on_ctl(from: String, j: Dictionary) -> void:
+	var me = _get_self_trystero_id()
+	match String(j.get("a", "")):
+		"dq":
+			var ids = j.get("ids", [])
+			if me == "" or not (ids is Array) or not ids.has(me):
+				return
+			var mode = String(j.get("mode", ""))
+			var lobby = String(j.get("lobby", ""))
+			if not GAME_MODES.has(mode) or lobby == "":
+				return
+			var by = String(j.get("by", "Someone"))
+			var label = String(GAME_MODES[mode]["label"])
+			if mm_phase != "menu" or is_match_active or is_single_player:
+				_hx_ctl({"a": "dq_busy", "to": from, "by": local_nickname})
+				log_console("[Direct] " + by + " queued your group for " + label + ", but you're not on the menu - go back to it to play with them.")
+				return
+			log_console("[Direct] " + by + " picked " + label + " - queueing with your group!")
+			_dc_start_queue(mode, lobby, clampi(int(j.get("n", 2)), 2, 15))
+		"dq_busy":
+			if String(j.get("to", "")) == me:
+				log_console("[Direct] " + String(j.get("by", "Someone")) + " isn't on the menu, so they can't join this queue yet.")
+
+func _dc_start_queue(mode: String, lobby: String, n: int) -> void:
+	dc_lobby = lobby
+	dc_n = n
+	dc_queue_ms = _now_ms()
+	dc_open = false
+	_osk_hide()
+	_free_direct_panel()
+	_on_find_match_pressed(mode, true)
+
+
+# --- ON-SCREEN KEYBOARD (mobile controls) ---
+# Tapping any text box (nickname, party code, join codes...) brings it up;
+# tapping anywhere else closes it. The strip on top shows what you're typing,
+# in case the box itself is hidden behind the keyboard.
+var osk_canvas: CanvasLayer = null
+var osk_panel: PanelContainer = null
+var osk_target: LineEdit = null
+var osk_preview: Label = null
+var osk_shift: bool = false
+var osk_letter_buttons: Array = []
+var osk_shift_button: Button = null
+var osk_bs_held: bool = false
+var osk_bs_t: float = 0.0
+var osk_vp_size: Vector2 = Vector2.ZERO
+var osk_font: int = 16
+var osk_shown_ms: int = -100000
+const OSK_ROWS: Array = ["1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"]
+
+# Text boxes use our keyboard on mobile, not the browser's.
+func _osk_prep(le: LineEdit) -> void:
+	if le:
+		le.virtual_keyboard_enabled = not mobile_controls
+
+func _on_gui_focus_changed(c: Control) -> void:
+	if not mobile_controls:
+		return
+	if c is LineEdit and c.editable and c.is_visible_in_tree():
+		_osk_show(c)
+
+func _osk_visible() -> bool:
+	return osk_canvas != null and is_instance_valid(osk_canvas) and osk_canvas.visible
+
+func _osk_build() -> void:
+	var vp = get_viewport().get_visible_rect().size
+	osk_vp_size = vp
+	if osk_canvas and is_instance_valid(osk_canvas):
+		osk_canvas.queue_free()
+	osk_canvas = CanvasLayer.new()
+	osk_canvas.layer = 120
+	osk_canvas.visible = false
+	add_child(osk_canvas)
+	var kh = clamp(vp.y * 0.085, 30.0, 54.0)
+	osk_font = int(clamp(kh * 0.46, 13.0, 24.0))
+	osk_panel = PanelContainer.new()
+	osk_panel.anchor_left = 0.0
+	osk_panel.anchor_right = 1.0
+	osk_panel.anchor_top = 1.0
+	osk_panel.anchor_bottom = 1.0
+	osk_panel.offset_left = 0.0
+	osk_panel.offset_right = 0.0
+	osk_panel.offset_top = -(kh * 5.0 + kh * 0.9 + 40.0)
+	osk_panel.offset_bottom = 0.0
+	osk_panel.mouse_filter = Control.MOUSE_FILTER_STOP
+	var sb = StyleBoxFlat.new()
+	sb.bg_color = Color(0.07, 0.08, 0.11, 0.97)
+	sb.border_color = Color(1.0, 0.9, 0.2, 0.5)
+	sb.border_width_top = 2
+	sb.content_margin_left = 6
+	sb.content_margin_right = 6
+	sb.content_margin_top = 5
+	sb.content_margin_bottom = 6
+	osk_panel.add_theme_stylebox_override("panel", sb)
+	osk_canvas.add_child(osk_panel)
+	var col = VBoxContainer.new()
+	col.add_theme_constant_override("separation", 4)
+	osk_panel.add_child(col)
+	osk_preview = Label.new()
+	osk_preview.custom_minimum_size = Vector2(0, kh * 0.9)
+	osk_preview.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	osk_preview.clip_text = true
+	osk_preview.add_theme_font_size_override("font_size", osk_font)
+	osk_preview.add_theme_color_override("font_color", Color(1.0, 0.95, 0.6))
+	col.add_child(osk_preview)
+	osk_letter_buttons.clear()
+	for r in range(OSK_ROWS.size()):
+		var row = HBoxContainer.new()
+		row.add_theme_constant_override("separation", 4)
+		row.custom_minimum_size = Vector2(0, kh)
+		col.add_child(row)
+		if r == 2:
+			_osk_spacer(row, 0.5)
+		if r == 3:
+			osk_shift_button = _osk_key(row, "SHIFT", int(osk_font * 0.8), 1.5, _osk_toggle_shift)
+		for ch in String(OSK_ROWS[r]):
+			var b = _osk_key(row, ch, osk_font, 1.0, _osk_type.bind(ch))
+			if ch >= "a" and ch <= "z":
+				osk_letter_buttons.append(b)
+		if r == 2:
+			_osk_spacer(row, 0.5)
+		if r == 3:
+			var bs = _osk_key(row, "DEL", int(osk_font * 0.8), 1.5, Callable())
+			bs.button_down.connect(_osk_bs_down)
+			bs.button_up.connect(_osk_bs_up)
+	var last = HBoxContainer.new()
+	last.add_theme_constant_override("separation", 4)
+	last.custom_minimum_size = Vector2(0, kh)
+	col.add_child(last)
+	var paste = _osk_key(last, "PASTE", int(osk_font * 0.8), 1.6, _osk_paste)
+	paste.action_mode = BaseButton.ACTION_MODE_BUTTON_PRESS # (reading the clipboard needs the tap that's still going on)
+	_osk_key(last, "-", osk_font, 1.0, _osk_type.bind("-"))
+	_osk_key(last, "_", osk_font, 1.0, _osk_type.bind("_"))
+	_osk_key(last, "SPACE", int(osk_font * 0.8), 3.6, _osk_type.bind(" "))
+	_osk_key(last, ".", osk_font, 1.0, _osk_type.bind("."))
+	var done = _osk_key(last, "DONE", int(osk_font * 0.8), 1.8, _osk_done)
+	done.add_theme_color_override("font_color", Color(1.0, 0.9, 0.2))
+
+func _osk_spacer(row: HBoxContainer, ratio: float) -> void:
+	var s = Control.new()
+	s.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	s.size_flags_stretch_ratio = ratio
+	s.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	row.add_child(s)
+
+func _osk_key(row: HBoxContainer, text: String, fs: int, ratio: float, cb: Callable) -> Button:
+	var b = Button.new()
+	b.text = text
+	b.focus_mode = Control.FOCUS_NONE # (the text box keeps the focus)
+	b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	b.size_flags_stretch_ratio = ratio
+	b.custom_minimum_size = Vector2(8, 0)
+	b.clip_text = true
+	b.add_theme_font_size_override("font_size", fs)
+	if cb.is_valid():
+		b.pressed.connect(cb)
+	row.add_child(b)
+	return b
+
+func _osk_show(le: LineEdit) -> void:
+	if not osk_canvas or not is_instance_valid(osk_canvas) or get_viewport().get_visible_rect().size != osk_vp_size:
+		_osk_build()
+	osk_target = le
+	le.virtual_keyboard_enabled = false
+	DisplayServer.virtual_keyboard_hide()
+	osk_shift = false
+	osk_bs_held = false
+	osk_canvas.visible = true
+	osk_shown_ms = Time.get_ticks_msec()
+	_osk_relabel()
+	_osk_refresh()
+
+func _osk_hide(release: bool = true) -> void:
+	osk_bs_held = false
+	if osk_canvas and is_instance_valid(osk_canvas):
+		osk_canvas.visible = false
+	var t = osk_target
+	osk_target = null
+	if release and t and is_instance_valid(t) and t.has_focus():
+		t.release_focus()
+
+# Any tap outside the keyboard closes it (and still does whatever it tapped).
+func _osk_input(event: InputEvent) -> void:
+	var pos = null
+	if event is InputEventScreenTouch and event.pressed:
+		pos = event.position
+	elif event is InputEventMouseButton and event.pressed and event.button_index == MOUSE_BUTTON_LEFT:
+		pos = event.position
+	if pos == null or not osk_panel or not is_instance_valid(osk_panel):
+		return
+	if osk_panel.get_global_rect().has_point(pos):
+		return
+	# A tap on the box you're typing in just moves the cursor. (Browsers send
+	# every tap twice - as a touch and as a click - so this also keeps the
+	# second half of the tap that opened the keyboard from closing it.)
+	if osk_target and is_instance_valid(osk_target) and osk_target.get_global_rect().has_point(pos):
+		return
+	if Time.get_ticks_msec() - osk_shown_ms < 250:
+		return
+	_osk_hide()
+
+func _osk_tick(delta: float) -> void:
+	if not _osk_visible():
+		return
+	if not osk_target or not is_instance_valid(osk_target) or not osk_target.is_visible_in_tree():
+		_osk_hide(false)
+		return
+	if osk_bs_held:
+		osk_bs_t += delta
+		if osk_bs_t > 0.45:
+			osk_bs_t -= 0.06
+			_osk_backspace()
+	_osk_refresh()
+
+func _osk_upper() -> bool:
+	var base_up = osk_target != null and is_instance_valid(osk_target) and osk_target.has_meta("osk_upper")
+	return base_up != osk_shift
+
+func _osk_relabel() -> void:
+	var up = _osk_upper()
+	for b in osk_letter_buttons:
+		if is_instance_valid(b):
+			b.text = b.text.to_upper() if up else b.text.to_lower()
+	if osk_shift_button and is_instance_valid(osk_shift_button):
+		osk_shift_button.add_theme_color_override("font_color", Color(1.0, 0.9, 0.2) if osk_shift else Color(1, 1, 1))
+
+func _osk_refresh() -> void:
+	if not osk_preview or not osk_target or not is_instance_valid(osk_target):
+		return
+	var t = osk_target.text
+	var shown = ""
+	if t == "":
+		shown = "|   " + osk_target.placeholder_text
+	else:
+		var c = clampi(osk_target.caret_column, 0, t.length())
+		shown = t.substr(0, c) + "|" + t.substr(c)
+		var maxc = int(osk_vp_size.x / (osk_font * 0.62))
+		if shown.length() > maxc and maxc > 10:
+			var start = clampi(c + 8 - maxc, 0, shown.length() - maxc)
+			shown = ("..." if start > 0 else "") + shown.substr(start + (3 if start > 0 else 0), maxc - (3 if start > 0 else 0))
+	if osk_preview.text != shown:
+		osk_preview.text = shown
+
+func _osk_insert(s: String) -> void:
+	var le = osk_target
+	if not le or not is_instance_valid(le):
+		return
+	var t = le.text
+	var c = clampi(le.caret_column, 0, t.length())
+	if le.max_length > 0:
+		var room = le.max_length - t.length()
+		if room <= 0:
+			return
+		s = s.substr(0, room)
+	le.text = t.substr(0, c) + s + t.substr(c)
+	le.caret_column = c + s.length()
+	le.text_changed.emit(le.text)
+	_osk_refresh()
+
+func _osk_type(ch: String) -> void:
+	_osk_insert(ch.to_upper() if _osk_upper() else ch)
+	if osk_shift:
+		osk_shift = false
+		_osk_relabel()
+
+func _osk_toggle_shift() -> void:
+	osk_shift = not osk_shift
+	_osk_relabel()
+
+func _osk_backspace() -> void:
+	var le = osk_target
+	if not le or not is_instance_valid(le):
+		return
+	var c = clampi(le.caret_column, 0, le.text.length())
+	if c <= 0:
+		return
+	le.text = le.text.substr(0, c - 1) + le.text.substr(c)
+	le.caret_column = c - 1
+	le.text_changed.emit(le.text)
+	_osk_refresh()
+
+func _osk_bs_down() -> void:
+	osk_bs_held = true
+	osk_bs_t = 0.0
+	_osk_backspace()
+
+func _osk_bs_up() -> void:
+	osk_bs_held = false
+
+func _osk_done() -> void:
+	var le = osk_target
+	_osk_hide()
+	if le and is_instance_valid(le):
+		le.text_submitted.emit(le.text)
+
+func _osk_paste() -> void:
+	if _hx_arm_paste():
+		return # (the browser hands it over when the tap ends)
+	_osk_paste_text(DisplayServer.clipboard_get())
+
+func _osk_paste_text(t: String) -> void:
+	var clean = t.strip_edges().replace("\r", " ").replace("\n", " ")
+	if clean == "" or not osk_target or not is_instance_valid(osk_target):
+		return
+	if osk_target == dc_input:
+		# A pasted code goes straight in.
+		dc_input.text = clean
+		_osk_hide()
+		_dc_submit()
+		return
+	_osk_insert(clean)
+
+# The browser side of direct connect (see DIRECT CONNECT above). It has no
+# backslashes in it, so it can live in this string as-is.
+const HX_JS: String = """(function () {
+	// Direct connect: players swap join/reply codes (their WebRTC details) and
+	// get a data channel without any relay/signalling server. The links act as
+	// a second transport next to Trystero: same rooms, same packets.
+	if (window.hx) { return; }
+	var hx = {};
+	window.hx = hx;
+	var NL = String.fromCharCode(10);
+	var CRLF = String.fromCharCode(13, 10);
+	var ICE_SERVERS = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }, { urls: ['stun:stun.cloudflare.com:3478'] }];
+	var GATHER_MS = 2500;
+	hx.room = null;
+	hx.nick = 'Player';
+	hx.links = {};   // remote id -> conn (open + said hi)
+	hx.pend = {};    // my join codes: tok -> conn
+	hx.ans = {};     // join codes I entered: key -> conn
+	hx.mesh = {};    // automatic links to the rest of the group: sid -> conn
+	hx.meshTried = {};
+	hx.tP = {};      // present in the current room through Trystero
+	hx.dP = {};      // present in the current room through a direct link
+	hx.graph = {};   // origin -> {t, l, n, msg} (who each player is linked to)
+	hx.seen = {};
+	hx.q = 0;
+	hx.fixedId = null;
+	hx.myTok = -1;
+	hx.pendingCopy = null;
+	hx.pendingPaste = false;
+
+	function now() { return Date.now(); }
+	function rid(n) {
+		var a = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+		var r = new Uint8Array(n);
+		crypto.getRandomValues(r);
+		var s = '';
+		for (var i = 0; i < n; i++) { s += a.charAt(r[i] % a.length); }
+		return s;
+	}
+	function emit(o) {
+		setTimeout(function () {
+			try { if (typeof window._godot_on_direct === 'function' || window._godot_on_direct) { window._godot_on_direct(JSON.stringify(o)); } } catch (e) { console.error('[Direct]', e); }
+		}, 0);
+	}
+	function log(m) { try { console.log('[Direct] ' + m); } catch (e) {} }
+
+	hx.selfId = function () {
+		if (!hx.fixedId) {
+			var t = window.trysteroSelfId;
+			if (typeof t === 'string' && t.length > 0) {
+				hx.fixedId = t;
+			} else {
+				// Trystero never loaded (blocked?) - use our own id for everything.
+				hx.fixedId = rid(20);
+				window.trysteroSelfId = hx.fixedId;
+			}
+		}
+		return hx.fixedId;
+	};
+
+	// ---------- compact codes ----------
+	var B32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+	var ICEC = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+	function b32enc(bytes) {
+		var out = '', buf = 0, bits = 0;
+		for (var i = 0; i < bytes.length; i++) {
+			buf = ((buf << 8) | bytes[i]) & 65535;
+			bits += 8;
+			while (bits >= 5) { out += B32.charAt((buf >>> (bits - 5)) & 31); bits -= 5; }
+			buf &= (1 << bits) - 1;
+		}
+		if (bits > 0) { out += B32.charAt((buf << (5 - bits)) & 31); }
+		return out;
+	}
+	function b32dec(str) {
+		var out = [], buf = 0, bits = 0;
+		for (var i = 0; i < str.length; i++) {
+			var v = B32.indexOf(str.charAt(i));
+			if (v < 0) { return null; }
+			buf = ((buf << 5) | v) & 65535;
+			bits += 5;
+			if (bits >= 8) { out.push((buf >>> (bits - 8)) & 255); bits -= 8; buf &= (1 << bits) - 1; }
+		}
+		return out;
+	}
+	function cleanCode(text) {
+		var s = String(text || '').toUpperCase();
+		var out = '';
+		for (var i = 0; i < s.length; i++) {
+			var c = s.charAt(i);
+			if (c === 'O') { c = '0'; } else if (c === 'I' || c === 'L') { c = '1'; }
+			if (B32.indexOf(c) >= 0) { out += c; }
+		}
+		return out;
+	}
+	function crc16(b, n) {
+		var c = 65535;
+		for (var i = 0; i < n; i++) {
+			c ^= (b[i] << 8);
+			for (var k = 0; k < 8; k++) { c = (c & 32768) ? (((c << 1) ^ 4129) & 65535) : ((c << 1) & 65535); }
+		}
+		return c;
+	}
+	function W() { this.b = []; }
+	W.prototype.u8 = function (v) { this.b.push(v & 255); };
+	W.prototype.u16 = function (v) { this.u8(v >> 8); this.u8(v); };
+	W.prototype.bytes = function (a) { for (var i = 0; i < a.length; i++) { this.u8(a[i]); } };
+	function R(b, n) { this.b = b; this.i = 0; this.n = n; }
+	R.prototype.u8 = function () { if (this.i >= this.n) { throw new Error('short code'); } return this.b[this.i++]; };
+	R.prototype.u16 = function () { var h = this.u8(); return (h << 8) | this.u8(); };
+	R.prototype.bytes = function (k) { var o = []; for (var i = 0; i < k; i++) { o.push(this.u8()); } return o; };
+	function packIce(w, s) {
+		w.u8(s.length);
+		var buf = 0, bits = 0;
+		for (var i = 0; i < s.length; i++) {
+			var v = ICEC.indexOf(s.charAt(i));
+			if (v < 0) { throw new Error('odd ICE credentials'); }
+			buf = ((buf << 6) | v) & 65535;
+			bits += 6;
+			while (bits >= 8) { w.u8((buf >>> (bits - 8)) & 255); bits -= 8; buf &= (1 << bits) - 1; }
+		}
+		if (bits > 0) { w.u8((buf << (8 - bits)) & 255); }
+	}
+	function unpackIce(r) {
+		var n = r.u8();
+		var nb = Math.ceil(n * 6 / 8);
+		var buf = 0, bits = 0, s = '';
+		for (var i = 0; i < nb; i++) {
+			buf = ((buf << 8) | r.u8()) & 65535;
+			bits += 8;
+			while (bits >= 6 && s.length < n) { s += ICEC.charAt((buf >>> (bits - 6)) & 63); bits -= 6; buf &= (1 << bits) - 1; }
+		}
+		return s;
+	}
+	function isHex(s) {
+		if (s.length === 0) { return false; }
+		for (var i = 0; i < s.length; i++) { if ('0123456789abcdefABCDEF'.indexOf(s.charAt(i)) < 0) { return false; } }
+		return true;
+	}
+	function isDigits(s) {
+		if (s.length === 0 || s.length > 3) { return false; }
+		for (var i = 0; i < s.length; i++) { if ('0123456789'.indexOf(s.charAt(i)) < 0) { return false; } }
+		return Number(s) <= 255;
+	}
+	function parseV6(a) {
+		var z = a.indexOf('%');
+		if (z >= 0) { a = a.substr(0, z); }
+		var halves = a.split('::');
+		if (halves.length > 2) { return null; }
+		var head = halves[0] ? halves[0].split(':') : [];
+		var tail = (halves.length === 2 && halves[1]) ? halves[1].split(':') : [];
+		if (halves.length === 1 && head.length !== 8) { return null; }
+		var fill = 8 - head.length - tail.length;
+		if (fill < 0) { return null; }
+		var groups = head.slice();
+		if (halves.length === 2) { for (var f = 0; f < fill; f++) { groups.push('0'); } }
+		groups = groups.concat(tail);
+		if (groups.length !== 8) { return null; }
+		var out = [];
+		for (var i = 0; i < 8; i++) {
+			var g = groups[i];
+			if (!isHex(g) || g.length > 4) { return null; }
+			var v = parseInt(g, 16);
+			out.push(v >> 8, v & 255);
+		}
+		return out;
+	}
+	function encAddr(a) {
+		var p4 = a.split('.');
+		if (p4.length === 4 && p4.every(isDigits)) { return { fam: 0, bytes: p4.map(Number) }; }
+		var low = a.toLowerCase();
+		if (low.length === 42 && low.substr(36) === '.local') {
+			var hex = low.substr(0, 36).split('-').join('');
+			if (hex.length === 32 && isHex(hex)) {
+				var b = [];
+				for (var i = 0; i < 32; i += 2) { b.push(parseInt(hex.substr(i, 2), 16)); }
+				return { fam: 2, bytes: b };
+			}
+		}
+		if (a.indexOf(':') >= 0) {
+			var v6 = parseV6(a);
+			if (v6) { return { fam: 1, bytes: v6 }; }
+		}
+		return null;
+	}
+	function hx2(v) { var s = v.toString(16); return s.length < 2 ? '0' + s : s; }
+	function decAddr(fam, b) {
+		if (fam === 0) { return b.join('.'); }
+		if (fam === 1) {
+			var g = [];
+			for (var i = 0; i < 16; i += 2) { g.push(((b[i] << 8) | b[i + 1]).toString(16)); }
+			return g.join(':');
+		}
+		var h = b.map(hx2).join('');
+		return h.substr(0, 8) + '-' + h.substr(8, 4) + '-' + h.substr(12, 4) + '-' + h.substr(16, 4) + '-' + h.substr(20, 12) + '.local';
+	}
+	function parseCand(s) {
+		var p = s.split(' ');
+		if (p.length < 8 || p[1] !== '1' || p[2].toLowerCase() !== 'udp' || p[6] !== 'typ') { return null; }
+		var type = p[7] === 'host' ? 0 : (p[7] === 'srflx' ? 1 : -1);
+		if (type < 0) { return null; }
+		var port = parseInt(p[5], 10);
+		if (!(port > 0 && port < 65536)) { return null; }
+		var ad = encAddr(p[4]);
+		if (!ad) { return null; }
+		return { type: type, fam: ad.fam, bytes: ad.bytes, port: port, addr: p[4] };
+	}
+	function parseSdp(sdp) {
+		var info = { ufrag: '', pwd: '', fpAlg: 'sha-256', fp: '', setup: 'actpass', mid: '0', cands: [] };
+		var lines = String(sdp).split(NL);
+		for (var i = 0; i < lines.length; i++) {
+			var l = lines[i];
+			if (l.charCodeAt(l.length - 1) === 13) { l = l.substr(0, l.length - 1); }
+			if (l.indexOf('a=ice-ufrag:') === 0) { if (!info.ufrag) { info.ufrag = l.substr(12); } }
+			else if (l.indexOf('a=ice-pwd:') === 0) { if (!info.pwd) { info.pwd = l.substr(10); } }
+			else if (l.indexOf('a=fingerprint:') === 0) { var fp = l.substr(14).split(' '); info.fpAlg = fp[0].toLowerCase(); info.fp = fp[1] || ''; }
+			else if (l.indexOf('a=setup:') === 0) { info.setup = l.substr(8); }
+			else if (l.indexOf('a=mid:') === 0) { info.mid = l.substr(6); }
+			else if (l.indexOf('a=candidate:') === 0) { var c = parseCand(l.substr(12)); if (c) { info.cands.push(c); } }
+		}
+		return info;
+	}
+	function pickCands(list) {
+		var seen = {}, host = [], host6 = [], srf = [], srf6 = [];
+		for (var i = 0; i < list.length; i++) {
+			var c = list[i];
+			var k = c.type + '/' + c.fam + '/' + c.bytes.join('.') + '/' + c.port;
+			if (seen[k]) { continue; }
+			seen[k] = true;
+			if (c.type === 0) { (c.fam === 1 ? host6 : host).push(c); } else { (c.fam === 1 ? srf6 : srf).push(c); }
+		}
+		return srf.slice(0, 2).concat(host.slice(0, 2), srf6.slice(0, 1), host6.slice(0, 1));
+	}
+	function encodeInfo(kind, tok, info) {
+		var w = new W();
+		w.u8(16 | kind);
+		w.u16(tok);
+		var setup = info.setup === 'active' ? 1 : (info.setup === 'passive' ? 2 : 0);
+		var alg = info.fpAlg === 'sha-384' ? 1 : (info.fpAlg === 'sha-512' ? 2 : 0);
+		w.u8(setup | (alg << 2));
+		packIce(w, info.ufrag);
+		packIce(w, info.pwd);
+		var fpb = info.fp.split(':').map(function (h) { return parseInt(h, 16); });
+		if (fpb.length !== [32, 48, 64][alg] || fpb.some(isNaN)) { throw new Error('odd fingerprint'); }
+		w.bytes(fpb);
+		w.u8(info.mid.length);
+		for (var i = 0; i < info.mid.length; i++) { w.u8(info.mid.charCodeAt(i)); }
+		var cands = pickCands(info.cands);
+		w.u8(cands.length);
+		for (var j = 0; j < cands.length; j++) {
+			var c = cands[j];
+			w.u8((c.type << 4) | c.fam);
+			w.bytes(c.bytes);
+			w.u16(c.port);
+		}
+		w.u16(crc16(w.b, w.b.length));
+		return w.b;
+	}
+	function codeText(bytes) {
+		var s = b32enc(bytes);
+		var g = [];
+		for (var i = 0; i < s.length; i += 5) { g.push(s.substr(i, 5)); }
+		return 'HX-' + g.join('-');
+	}
+	function parsePayload(b, n) {
+		var r = new R(b, n);
+		var v = r.u8();
+		if ((v >> 4) !== 1) { throw new Error('version'); }
+		var info = { kind: v & 15, tok: r.u16(), cands: [] };
+		var sa = r.u8();
+		info.setup = ['actpass', 'active', 'passive', 'actpass'][sa & 3];
+		var alg = (sa >> 2) & 3;
+		info.fpAlg = ['sha-256', 'sha-384', 'sha-512', 'sha-256'][alg];
+		info.ufrag = unpackIce(r);
+		info.pwd = unpackIce(r);
+		if (info.ufrag.length < 4 || info.pwd.length < 22) { throw new Error('credentials'); }
+		var fp = r.bytes([32, 48, 64, 32][alg]);
+		info.fp = fp.map(function (x) { return hx2(x).toUpperCase(); }).join(':');
+		var ml = r.u8();
+		info.mid = '';
+		for (var i = 0; i < ml; i++) { info.mid += String.fromCharCode(r.u8()); }
+		var nc = r.u8();
+		for (var j = 0; j < nc; j++) {
+			var tf = r.u8();
+			var fam = tf & 15;
+			var bytes = r.bytes(fam === 0 ? 4 : 16);
+			var port = r.u16();
+			info.cands.push({ type: tf >> 4, fam: fam, addr: decAddr(fam, bytes), port: port });
+		}
+		if (r.i !== n) { throw new Error('length'); }
+		return info;
+	}
+	function decodeCode(text) {
+		var s = cleanCode(text);
+		var tries = [];
+		if (s.substr(0, 2) === 'HX') { tries.push(s.substr(2)); }
+		tries.push(s);
+		for (var i = 0; i < tries.length; i++) {
+			var b = b32dec(tries[i]);
+			if (!b || b.length < 40) { continue; }
+			var n = b.length - 2;
+			if (crc16(b, n) !== ((b[n] << 8) | b[n + 1])) { continue; }
+			try { return parsePayload(b, n); } catch (e) { continue; }
+		}
+		return null;
+	}
+	function buildSdp(info) {
+		var L = ['v=0', 'o=- ' + (Math.floor(Math.random() * 900000000) + 100000000) + ' 2 IN IP4 127.0.0.1', 's=-', 't=0 0',
+			'a=group:BUNDLE ' + info.mid,
+			'm=application 9 UDP/DTLS/SCTP webrtc-datachannel', 'c=IN IP4 0.0.0.0',
+			'a=ice-ufrag:' + info.ufrag, 'a=ice-pwd:' + info.pwd, 'a=ice-options:trickle',
+			'a=fingerprint:' + info.fpAlg + ' ' + info.fp, 'a=setup:' + info.setup, 'a=mid:' + info.mid,
+			'a=sctp-port:5000', 'a=max-message-size:262144'];
+		for (var i = 0; i < info.cands.length; i++) {
+			var c = info.cands[i];
+			var prio = (c.type === 0 ? 126 : 100) * 16777216 + (65535 - i) * 256 + 255;
+			L.push('a=candidate:' + (i + 1) + ' 1 udp ' + prio + ' ' + c.addr + ' ' + c.port + ' typ ' + (c.type === 0 ? 'host' : 'srflx') + (c.type === 1 ? ' raddr 0.0.0.0 rport 0' : ''));
+		}
+		L.push('a=end-of-candidates');
+		return L.join(CRLF) + CRLF;
+	}
+	function fpKey(fp) { return String(fp).split(':').join('').substr(0, 10).toUpperCase(); }
+	hx._codec = { encodeInfo: encodeInfo, decodeCode: decodeCode, codeText: codeText, parseSdp: parseSdp, buildSdp: buildSdp, b32enc: b32enc, b32dec: b32dec };
+
+	// ---------- connections ----------
+	function makeConn(kind) {
+		var pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+		var dc = pc.createDataChannel('hx', { negotiated: true, id: 0, ordered: true });
+		var c = { pc: pc, dc: dc, kind: kind, t: now(), lastRx: now(), state: 'making', id: '', nick: '', room: null, key: '', dead: false };
+		dc.onopen = function () {
+			c.lastRx = now();
+			sendRaw(c, { t: 'hi', id: hx.selfId(), n: hx.nick, r: hx.room, k: c.key, v: 1 });
+		};
+		dc.onmessage = function (ev) { onMsg(c, ev.data); };
+		dc.onclose = function () { drop(c, 'closed'); };
+		pc.onconnectionstatechange = function () {
+			if (pc.connectionState === 'closed') { drop(c, 'closed'); }
+		};
+		return c;
+	}
+	function gathered(pc, ms) {
+		return new Promise(function (res) {
+			var done = false;
+			function fin() { if (!done) { done = true; res(); } }
+			if (pc.iceGatheringState === 'complete') { fin(); return; }
+			pc.addEventListener('icegatheringstatechange', function () { if (pc.iceGatheringState === 'complete') { fin(); } });
+			pc.addEventListener('icecandidate', function (e) { if (!e.candidate) { fin(); } });
+			setTimeout(fin, ms);
+		});
+	}
+	function sendRaw(c, obj) {
+		if (!c || c.dead || !c.dc || c.dc.readyState !== 'open') { return false; }
+		try { c.dc.send(JSON.stringify(obj)); return true; } catch (e) { return false; }
+	}
+	function liveLinks() {
+		var out = [];
+		for (var id in hx.links) { if (!hx.links[id].dead) { out.push(hx.links[id]); } }
+		return out;
+	}
+	function state(c, s) {
+		if (c.state === s) { return; }
+		c.state = s;
+		if (c.kind === 'offer') { emit({ e: 'state', kind: 'offer', tok: c.tok, s: s, n: c.nick, id: c.id }); }
+		else if (c.kind === 'answer') { emit({ e: 'state', kind: 'answer', key: c.key, s: s, n: c.nick, id: c.id }); }
+	}
+	function forget(c) {
+		for (var t in hx.pend) { if (hx.pend[t] === c) { delete hx.pend[t]; } }
+		for (var k in hx.ans) { if (hx.ans[k] === c) { delete hx.ans[k]; } }
+		for (var s in hx.mesh) { if (hx.mesh[s] === c) { delete hx.mesh[s]; } }
+	}
+	function close(c) {
+		if (c.dead) { return; }
+		c.dead = true;
+		try { c.dc.close(); } catch (e) {}
+		try { c.pc.close(); } catch (e) {}
+	}
+	function drop(c, why) {
+		if (c.dropped) { return; }
+		c.dropped = true;
+		var wasLinked = c.id && hx.links[c.id] === c;
+		close(c);
+		forget(c);
+		if (wasLinked) {
+			delete hx.links[c.id];
+			dLeave(c.id);
+			log('lost ' + c.nick + ' (' + why + ')');
+			emit({ e: 'unlink', id: c.id, n: c.nick });
+			floodPeers();
+			groupChanged();
+		} else if (c.state !== 'failed' && c.state !== 'replaced' && (c.kind === 'offer' || c.kind === 'answer')) {
+			state(c, 'failed');
+		}
+	}
+	function onMsg(c, raw) {
+		if (c.dead) { return; }
+		c.lastRx = now();
+		var m;
+		try { m = JSON.parse(raw); } catch (e) { return; }
+		if (!m || typeof m !== 'object') { return; }
+		if (m.t === 'hi') {
+			if (typeof m.id !== 'string' || !m.id || m.id === hx.fixedId) { drop(c, 'self'); return; }
+			c.id = m.id;
+			c.nick = String(m.n || 'Player').substr(0, 24);
+			c.room = (typeof m.r === 'string') ? m.r : null;
+			if (!c.key && m.k) { c.key = String(m.k); }
+			var prev = hx.links[c.id];
+			if (prev && prev !== c && !prev.dead) {
+				// Two links to the same player: both sides keep the same one.
+				if (String(prev.key) <= String(c.key)) { c.state = 'replaced'; drop(c, 'duplicate'); return; }
+				prev.state = 'replaced';
+				prev.dropped = true;
+				close(prev);
+				forget(prev);
+			}
+			hx.links[c.id] = c;
+			forget(c);
+			c.linked = true;
+			state(c, 'connected');
+			log('linked with ' + c.nick);
+			emit({ e: 'link', id: c.id, n: c.nick, kind: c.kind, tok: c.tok, key: c.key });
+			if (hx.room && c.room === hx.room) { dJoin(c.id); }
+			// catch the newcomer up on who's linked to whom
+			for (var o in hx.graph) { if (hx.graph[o].msg) { sendRaw(c, hx.graph[o].msg); } }
+			floodPeers();
+			groupChanged();
+			return;
+		}
+		if (!c.linked) { return; }
+		if (m.t === 'd') {
+			if (hx.room && m.r === hx.room && typeof m.j === 'string') { deliver(m.j, c.id); }
+		} else if (m.t === 'room') {
+			var old = c.room;
+			c.room = (typeof m.r === 'string') ? m.r : null;
+			if (hx.room && old === hx.room && c.room !== hx.room) { dLeave(c.id); }
+			if (hx.room && c.room === hx.room) { dJoin(c.id); }
+		} else if (m.t === 'f') {
+			onFlood(c, m);
+		} else if (m.t === 'n') {
+			c.nick = String(m.n || c.nick).substr(0, 24);
+			groupChanged();
+		}
+	}
+
+	// ---------- rooms / presence (merged with Trystero) ----------
+	function godotJoin(id) { try { if (window._godot_real_join) { window._godot_real_join(id); } } catch (e) { console.error(e); } }
+	function godotLeave(id) { try { if (window._godot_real_leave) { window._godot_real_leave(id); } } catch (e) { console.error(e); } }
+	function deliver(json, from) { try { if (window._godot_on_data_received) { window._godot_on_data_received(json, from); } } catch (e) { console.error(e); } }
+	function dJoin(id) {
+		if (hx.dP[id]) { return; }
+		hx.dP[id] = true;
+		if (!hx.tP[id]) { var r = hx.room; setTimeout(function () { if (hx.room === r && hx.dP[id]) { godotJoin(id); } }, 0); }
+	}
+	function dLeave(id) {
+		if (!hx.dP[id]) { return; }
+		delete hx.dP[id];
+		if (!hx.tP[id]) { setTimeout(function () { if (!hx.dP[id] && !hx.tP[id]) { godotLeave(id); } }, 0); }
+	}
+	// Trystero events go through these: they return whether Godot should hear it.
+	hx.tJoin = function (id) { var had = !!hx.dP[id]; hx.tP[id] = true; return !had; };
+	hx.tLeave = function (id) { delete hx.tP[id]; return !hx.dP[id]; };
+	hx.setRoom = function (code) {
+		var r = (typeof code === 'string' && code.length > 0) ? code : null;
+		hx.room = r;
+		hx.dP = {};
+		hx.tP = {};
+		var links = liveLinks();
+		for (var i = 0; i < links.length; i++) {
+			sendRaw(links[i], { t: 'room', r: r });
+			if (r && links[i].room === r) { dJoin(links[i].id); }
+		}
+	};
+	hx.send = function (json) {
+		if (!hx.room) { return; }
+		var msg = JSON.stringify({ t: 'd', r: hx.room, j: String(json) });
+		var links = liveLinks();
+		for (var i = 0; i < links.length; i++) {
+			var c = links[i];
+			if (c.room === hx.room && c.dc.readyState === 'open') { try { c.dc.send(msg); } catch (e) {} }
+		}
+	};
+
+	// ---------- group gossip, control messages, automatic mesh ----------
+	function flood(kind, data, to) {
+		var me = hx.selfId();
+		hx.q += 1;
+		var msg = { t: 'f', o: me, q: hx.q, k: kind, d: data };
+		if (to) { msg.to = to; }
+		hx.seen[me + ':' + hx.q] = now();
+		if (kind === 'peers') { hx.graph[me] = { t: data.t, l: data.l, n: data.n, msg: msg }; }
+		if (to && hx.links[to]) { sendRaw(hx.links[to], msg); return; }
+		var links = liveLinks();
+		for (var i = 0; i < links.length; i++) { sendRaw(links[i], msg); }
+	}
+	function onFlood(from, m) {
+		if (typeof m.o !== 'string') { return; }
+		var key = m.o + ':' + m.q;
+		if (hx.seen[key]) { return; }
+		hx.seen[key] = now();
+		var me = hx.fixedId;
+		if (m.o === me) { return; }
+		if (!m.to || m.to === me) {
+			var d = m.d || {};
+			if (m.k === 'peers') {
+				var g = hx.graph[m.o];
+				if (!g || d.t >= g.t) { hx.graph[m.o] = { t: d.t, l: Array.isArray(d.l) ? d.l : [], n: String(d.n || ''), msg: m, rx: now() }; groupChanged(); }
+			} else if (m.k === 'ctl') {
+				emit({ e: 'ctl', from: m.o, j: d });
+			} else if (m.k === 'sig') {
+				onSig(m.o, d);
+			}
+		}
+		if (m.to === me) { return; }
+		if (m.to && hx.links[m.to]) { sendRaw(hx.links[m.to], m); return; }
+		var links = liveLinks();
+		for (var i = 0; i < links.length; i++) { if (links[i] !== from) { sendRaw(links[i], m); } }
+	}
+	function floodPeers() {
+		if (!hx.fixedId) { return; }
+		flood('peers', { t: now(), l: Object.keys(hx.links), n: hx.nick });
+	}
+	function groupIds() {
+		var me = hx.fixedId;
+		if (!me) { return []; }
+		var out = [me], seen = {};
+		seen[me] = true;
+		var frontier = [me];
+		var fresh = now() - 30000;
+		while (frontier.length > 0) {
+			var next = [];
+			for (var i = 0; i < frontier.length; i++) {
+				var u = frontier[i];
+				var nb = [];
+				if (u === me) { nb = Object.keys(hx.links); }
+				else if (hx.graph[u] && (hx.graph[u].rx || now()) >= fresh) { nb = hx.graph[u].l; }
+				for (var j = 0; j < nb.length; j++) {
+					var v = String(nb[j]);
+					if (!seen[v]) { seen[v] = true; out.push(v); next.push(v); }
+				}
+			}
+			frontier = next;
+		}
+		return out;
+	}
+	hx.groupJson = function () {
+		var ids = groupIds();
+		var out = [];
+		for (var i = 0; i < ids.length; i++) {
+			var id = ids[i];
+			var l = hx.links[id];
+			var n = id === hx.fixedId ? hx.nick : (l ? l.nick : (hx.graph[id] ? hx.graph[id].n : ''));
+			out.push({ id: id, n: n || 'Player', d: !!l, me: id === hx.fixedId });
+		}
+		return JSON.stringify(out);
+	};
+	var groupTimer = null;
+	function groupChanged() {
+		if (groupTimer) { return; }
+		groupTimer = setTimeout(function () { groupTimer = null; emit({ e: 'group' }); }, 60);
+	}
+	function onSig(from, d) {
+		if (!d || typeof d.s !== 'string') { return; }
+		if (typeof d.o === 'string') {
+			if (hx.links[from] || hx.mesh[d.s]) { return; }
+			var c = makeConn('mesh');
+			c.key = 'm' + d.s;
+			c.peer = from;
+			hx.mesh[d.s] = c;
+			c.pc.setRemoteDescription({ type: 'offer', sdp: d.o })
+				.then(function () { return c.pc.createAnswer(); })
+				.then(function (a) { return c.pc.setLocalDescription(a); })
+				.then(function () { return gathered(c.pc, GATHER_MS); })
+				.then(function () { if (!c.dead) { flood('sig', { s: d.s, a: c.pc.localDescription.sdp }, from); } })
+				.catch(function () { drop(c, 'mesh answer'); });
+		} else if (typeof d.a === 'string') {
+			var m = hx.mesh[d.s];
+			if (!m || m.peer !== from || m.dead) { return; }
+			m.pc.setRemoteDescription({ type: 'answer', sdp: d.a }).catch(function () { drop(m, 'mesh'); });
+		}
+	}
+	function meshTick() {
+		var me = hx.fixedId;
+		if (!me) { return; }
+		var ids = groupIds();
+		for (var i = 0; i < ids.length; i++) {
+			var id = ids[i];
+			if (id === me || hx.links[id] || me > id) { continue; }
+			var busy = false;
+			for (var s in hx.mesh) { if (hx.mesh[s].peer === id) { busy = true; } }
+			if (busy || now() - (hx.meshTried[id] || 0) < 45000) { continue; }
+			hx.meshTried[id] = now();
+			startMesh(id);
+		}
+	}
+	function startMesh(peer) {
+		var c = makeConn('mesh');
+		var sid = rid(10);
+		c.key = 'm' + sid;
+		c.peer = peer;
+		hx.mesh[sid] = c;
+		c.pc.createOffer()
+			.then(function (o) { return c.pc.setLocalDescription(o); })
+			.then(function () { return gathered(c.pc, GATHER_MS); })
+			.then(function () { if (!c.dead) { flood('sig', { s: sid, o: c.pc.localDescription.sdp }, peer); } })
+			.catch(function () { drop(c, 'mesh offer'); });
+	}
+
+	// ---------- the API Godot calls ----------
+	hx.setNick = function (n) {
+		var nn = String(n || 'Player').substr(0, 24);
+		if (nn === hx.nick) { return; }
+		hx.nick = nn;
+		var links = liveLinks();
+		for (var i = 0; i < links.length; i++) { sendRaw(links[i], { t: 'n', n: nn }); }
+		floodPeers();
+	};
+	hx.makeCode = function (nick) {
+		if (nick) { hx.nick = String(nick).substr(0, 24); }
+		hx.selfId();
+		// keep a few older codes alive (a friend may still be entering one)
+		var toks = Object.keys(hx.pend);
+		if (toks.length >= 4) {
+			toks.sort(function (a, b) { return hx.pend[a].t - hx.pend[b].t; });
+			var oldest = hx.pend[toks[0]];
+			oldest.state = 'replaced';
+			drop(oldest, 'too many codes');
+		}
+		var tok = Math.floor(Math.random() * 65536);
+		while (hx.pend[tok]) { tok = Math.floor(Math.random() * 65536); }
+		var c = makeConn('offer');
+		c.tok = tok;
+		hx.pend[tok] = c;
+		hx.myTok = tok;
+		c.pc.createOffer()
+			.then(function (o) { return c.pc.setLocalDescription(o); })
+			.then(function () { return gathered(c.pc, GATHER_MS); })
+			.then(function () {
+				var info = parseSdp(c.pc.localDescription.sdp);
+				c.key = 'c' + tok + fpKey(info.fp);
+				c.code = codeText(encodeInfo(0, tok, info));
+				c.state = 'ready';
+				emit({ e: 'code', code: c.code, tok: tok, cands: pickCands(info.cands).length });
+			})
+			.catch(function (err) { c.state = 'failed'; drop(c, 'make'); emit({ e: 'err', m: 'Could not make a join code (' + err + ').' }); });
+	};
+	hx.enterCode = function (text, nick) {
+		if (nick) { hx.nick = String(nick).substr(0, 24); }
+		var info = decodeCode(text);
+		if (!info) { emit({ e: 'err', m: "That code isn't right - check it, or copy it again." }); return; }
+		hx.selfId();
+		if (info.kind === 1) { applyReply(info); } else if (info.kind === 0) { answerJoin(info); }
+		else { emit({ e: 'err', m: "That code isn't right - check it, or copy it again." }); }
+	};
+	function answerJoin(info) {
+		var key = 'c' + info.tok + fpKey(info.fp);
+		for (var t in hx.pend) {
+			if (hx.pend[t].key === key) { emit({ e: 'err', m: "That's your own join code - send it to a friend instead." }); return; }
+		}
+		for (var id in hx.links) {
+			if (hx.links[id].key === key) { emit({ e: 'err', m: "You're already connected with that code (" + hx.links[id].nick + ")." }); return; }
+		}
+		var old = hx.ans[key];
+		if (old && !old.dead) {
+			if (old.reply) { emit({ e: 'reply', key: key, code: old.reply, again: true }); }
+			return;
+		}
+		var c = makeConn('answer');
+		c.key = key;
+		c.tok = info.tok;
+		hx.ans[key] = c;
+		emit({ e: 'state', kind: 'answer', key: key, s: 'making' });
+		c.pc.setRemoteDescription({ type: 'offer', sdp: buildSdp(info) })
+			.then(function () { return c.pc.createAnswer(); })
+			.then(function (a) { return c.pc.setLocalDescription(a); })
+			.then(function () { return gathered(c.pc, GATHER_MS); })
+			.then(function () {
+				if (c.dead) { return; }
+				c.reply = codeText(encodeInfo(1, info.tok, parseSdp(c.pc.localDescription.sdp)));
+				if (!c.linked) { c.state = 'waiting'; }
+				emit({ e: 'reply', key: key, code: c.reply });
+			})
+			.catch(function (err) { c.state = 'failed'; drop(c, 'answer'); emit({ e: 'err', m: 'Could not use that code (' + err + ').' }); });
+	}
+	function applyReply(info) {
+		var c = hx.pend[info.tok];
+		if (!c) {
+			for (var id in hx.links) {
+				if (hx.links[id].kind === 'offer' && hx.links[id].tok === info.tok) { emit({ e: 'err', m: "You're already connected to " + hx.links[id].nick + '.' }); return; }
+			}
+			emit({ e: 'err', m: "That reply is for a join code you don't have any more - make a new code and swap again." });
+			return;
+		}
+		if (c.pc.signalingState !== 'have-local-offer') { emit({ e: 'err', m: 'That join code is already being used.' }); return; }
+		c.applied = now();
+		state(c, 'connecting');
+		c.pc.setRemoteDescription({ type: 'answer', sdp: buildSdp(info) })
+			.then(function () { emit({ e: 'applied', tok: info.tok }); })
+			.catch(function (err) { c.state = 'failed'; drop(c, 'reply'); emit({ e: 'err', m: "Couldn't use that reply code (" + err + ')' }); });
+		if (hx.myTok === info.tok) { hx.myTok = -1; emit({ e: 'used', tok: info.tok }); }
+	}
+	hx.ctl = function (json) {
+		var d;
+		try { d = JSON.parse(String(json)); } catch (e) { return; }
+		flood('ctl', d);
+	};
+	hx.reset = function () {
+		var all = [];
+		var k;
+		for (k in hx.links) { all.push(hx.links[k]); }
+		for (k in hx.ans) { all.push(hx.ans[k]); }
+		for (k in hx.mesh) { all.push(hx.mesh[k]); }
+		for (var i = 0; i < all.length; i++) { all[i].state = 'replaced'; drop(all[i], 'reset'); }
+		hx.graph = {};
+		hx.meshTried = {};
+		floodPeers();
+		groupChanged();
+	};
+	hx.linkCount = function () { return liveLinks().length; };
+
+	// ---------- clipboard (needs a real tap/click to be allowed) ----------
+	function copyFallback(t) {
+		try {
+			var ta = document.createElement('textarea');
+			ta.value = t;
+			ta.setAttribute('readonly', '');
+			ta.style.position = 'fixed';
+			ta.style.top = '-1000px';
+			document.body.appendChild(ta);
+			ta.select();
+			ta.setSelectionRange(0, t.length);
+			var ok = document.execCommand('copy');
+			document.body.removeChild(ta);
+			emit({ e: ok ? 'copied' : 'copyfail' });
+		} catch (e) { emit({ e: 'copyfail' }); }
+	}
+	function copyNow(t) {
+		try {
+			if (navigator.clipboard && navigator.clipboard.writeText) {
+				navigator.clipboard.writeText(t).then(function () { emit({ e: 'copied' }); }, function () { copyFallback(t); });
+				return;
+			}
+		} catch (e) {}
+		copyFallback(t);
+	}
+	function promptPaste() {
+		setTimeout(function () {
+			var t = window.prompt('Paste the code here:', '');
+			if (t) { emit({ e: 'paste', t: String(t) }); }
+		}, 0);
+	}
+	function pasteNow() {
+		try {
+			if (navigator.clipboard && navigator.clipboard.readText) {
+				navigator.clipboard.readText().then(function (t) {
+					if (t) { emit({ e: 'paste', t: String(t) }); } else { promptPaste(); }
+				}, function () { promptPaste(); });
+				return;
+			}
+		} catch (e) {}
+		promptPaste();
+	}
+	hx.copyText = function (t) {
+		hx.pendingCopy = String(t);
+		hx.pendingCopyMs = now();
+	};
+	hx.armPaste = function () { hx.pendingPaste = true; hx.pendingPasteMs = now(); };
+	function gesture() {
+		if (hx.pendingCopy !== null) {
+			var t = hx.pendingCopy;
+			hx.pendingCopy = null;
+			if (now() - hx.pendingCopyMs < 4000) { copyNow(t); }
+		}
+		if (hx.pendingPaste) {
+			hx.pendingPaste = false;
+			if (now() - hx.pendingPasteMs < 4000) { pasteNow(); }
+		}
+	}
+	['pointerup', 'touchend', 'mouseup', 'keyup'].forEach(function (ev) { window.addEventListener(ev, gesture, true); });
+
+	// ---------- housekeeping ----------
+	setInterval(function () {
+		var t = now();
+		var links = liveLinks();
+		for (var i = 0; i < links.length; i++) {
+			var c = links[i];
+			if (t - c.lastRx > 15000) { drop(c, 'timeout'); continue; }
+			sendRaw(c, { t: 'p' });
+		}
+		var k;
+		for (k in hx.pend) {
+			var p = hx.pend[k];
+			if (p.applied && !p.linked && t - p.applied > 60000) { drop(p, 'no answer'); }
+			else if (!p.applied && t - p.t > 1800000) { p.state = 'replaced'; drop(p, 'old'); }
+		}
+		for (k in hx.ans) {
+			var a = hx.ans[k];
+			if (!a.linked && t - a.t > 600000) { drop(a, 'old'); }
+		}
+		for (k in hx.mesh) {
+			var m = hx.mesh[k];
+			if (!m.linked && t - m.t > 30000) { m.state = 'replaced'; drop(m, 'mesh timeout'); }
+		}
+		for (k in hx.seen) { if (t - hx.seen[k] > 120000) { delete hx.seen[k]; } }
+	}, 2000);
+	setInterval(function () {
+		if (liveLinks().length > 0) { floodPeers(); }
+		meshTick();
+	}, 8000);
+	setInterval(meshTick, 2500);
+})();
+"""
+
 func _init_trystero_bridge() -> void :
 	if not OS.has_feature("web"):
 		return
@@ -720,6 +2366,7 @@ func _init_trystero_bridge() -> void :
 	js_on_peer_join_cb = JavaScriptBridge.create_callback(_on_trystero_peer_joined)
 	js_on_peer_leave_cb = JavaScriptBridge.create_callback(_on_trystero_peer_left)
 	js_on_data_receive_cb = JavaScriptBridge.create_callback(_on_trystero_data_received)
+	js_on_direct_cb = JavaScriptBridge.create_callback(_on_hx_event)
 
 	# Background tabs stop the game loop, but JS timers keep firing (about once
 	# a second), so matchmaking and the ban timer keep working while tabbed out.
@@ -727,9 +2374,10 @@ func _init_trystero_bridge() -> void :
 
 	var window = JavaScriptBridge.get_interface("window")
 	window._godot_tick = js_tick_cb
-	window._godot_on_peer_joined = js_on_peer_join_cb
-	window._godot_on_peer_left = js_on_peer_leave_cb
+	window._godot_real_join = js_on_peer_join_cb
+	window._godot_real_leave = js_on_peer_leave_cb
 	window._godot_on_data_received = js_on_data_receive_cb
+	window._godot_on_direct = js_on_direct_cb
 
 	JavaScriptBridge.eval("""
 		window.trysteroRoom = null;
@@ -766,13 +2414,33 @@ func _init_trystero_bridge() -> void :
 				if (window._godot_tick) { window._godot_tick(); }
 			}, 500);
 		}
+
+		// Trystero's joins/leaves pass through the direct-connect layer, so
+		// someone linked both ways is still just one player to the game.
+		window._godot_on_peer_joined = function (id) {
+			var fwd = true;
+			try { if (window.hx) { fwd = window.hx.tJoin(String(id)); } } catch (e) { console.error(e); }
+			if (fwd && window._godot_real_join) { window._godot_real_join.apply(null, arguments); }
+		};
+		window._godot_on_peer_left = function (id) {
+			var fwd = true;
+			try { if (window.hx) { fwd = window.hx.tLeave(String(id)); } } catch (e) { console.error(e); }
+			if (fwd && window._godot_real_leave) { window._godot_real_leave.apply(null, arguments); }
+		};
+		// Every packet goes out through Trystero and any direct links.
+		window.hxSendAll = function (j) {
+			try { if (typeof window.sendTrysteroPacket === 'function') { window.sendTrysteroPacket(j); } } catch (e) { console.error(e); }
+			try { if (window.hx) { window.hx.send(j); } } catch (e) { console.error(e); }
+		};
 	""", true)
+	JavaScriptBridge.eval("try {\n" + HX_JS + "\n} catch (e) { console.error('[Direct] could not start', e); }", true)
 
 func _leave_trystero_room() -> void :
 	if not OS.has_feature("web"):
 		return
 	var window = JavaScriptBridge.get_interface("window")
 	window.leaveTrysteroRoom()
+	_hx_set_room("")
 
 func _get_self_trystero_id() -> String:
 	if mm_self_id != "":
@@ -1434,10 +3102,11 @@ func _transport_send(json_string: String) -> void :
 	if not OS.has_feature("web"):
 		return
 	var window = JavaScriptBridge.get_interface("window")
-	window.sendTrysteroPacket(json_string)
+	window.hxSendAll(json_string)
 
 func _join_room(code: String) -> void :
 	if OS.has_feature("web"):
+		_hx_set_room(code)
 		var window = JavaScriptBridge.get_interface("window")
 		window.joinTrysteroRoomWhenReady(code)
 
@@ -1593,15 +3262,21 @@ func _mm_group_size() -> int:
 	return team_size * 2
 
 func _mm_min_players() -> int:
+	if dc_lobby != "":
+		return dc_n # (a direct group plays as soon as everyone's in)
 	return int(GAME_MODES[game_mode].get("min", team_size * 2))
 
 func _mm_max_players() -> int:
+	if dc_lobby != "":
+		return dc_n
 	return int(GAME_MODES[game_mode].get("max", team_size * 2))
 
 func _mm_wait_seconds() -> float:
 	return ROYALE_WAIT_SECONDS if game_mode == "royale" else FFA_WAIT_SECONDS
 
 func _mm_lobby_code() -> String:
+	if dc_lobby != "":
+		return dc_lobby
 	return "public_" + game_mode + "_lobby"
 
 func _mm_enter_lobby() -> void :
@@ -1627,6 +3302,11 @@ func _update_waiting_label() -> void :
 	if mm_phase == "lobby":
 		if mm_linger_room != "":
 			waiting_opponent_label.text = "Match found! Connecting..."
+		elif dc_lobby != "":
+			var here = min(_mm_searching_peers().size() + 1, dc_n)
+			waiting_opponent_label.text = mode_label + " with your direct group: " + str(here) + "/" + str(dc_n) + " here..."
+			if here < dc_n and _now_ms() - dc_queue_ms > 20000:
+				waiting_opponent_label.text += " Still waiting for the others (they need to be on the menu) - leave to go back."
 		elif party_queued and _in_party() and not _mm_units(_mm_searching_peers()).has(_mm_my_unit()):
 			waiting_opponent_label.text = "Waiting for your party to join the queue..."
 		else:
@@ -2508,7 +4188,7 @@ func _on_find_match_pressed(mode: String = "1v1", from_party: bool = false) -> v
 		return
 
 	_social_leave_menu()
-	party_queued = from_party and _in_party()
+	party_queued = from_party and _in_party() and dc_lobby == ""
 	party_lobby_missing_since = 0
 	party_lobby_seen.clear()
 	game_mode = mode if GAME_MODES.has(mode) else "1v1"
@@ -3375,6 +5055,7 @@ func _save_nickname_from_input() -> void:
 		save_player_data()
 		if changed:
 			_lb_announce()
+			_hx_set_nick(local_nickname)
 
 func _load_player_data() -> void :
 	if FileAccess.file_exists(SAVE_PATH):
@@ -3914,6 +5595,8 @@ func update_local_hud_hp(hp: int) -> void :
 
 func _build_main_menu() -> void :
 	_clear_ui()
+	dc_lobby = ""
+	dc_n = 0
 	if dummy_just_unlocked and pending_error_message == "":
 		dummy_just_unlocked = false
 		pending_error_message = "NEW! You reached " + get_rank_name(DUMMY_UNLOCK_ELO) + " and unlocked the Crash Test Dummy - pick him under Customize Character!"
@@ -3971,6 +5654,7 @@ func _build_main_menu() -> void :
 	nickname_input.custom_minimum_size = Vector2(320, 35)
 	nickname_input.alignment = HORIZONTAL_ALIGNMENT_CENTER
 	nickname_input.focus_exited.connect(_save_nickname_from_input)
+	_osk_prep(nickname_input)
 	container.add_child(nickname_input)
 
 	var elo_row = HBoxContainer.new()
@@ -4129,6 +5813,8 @@ func _build_main_menu() -> void :
 		_lb_announce()
 	else:
 		_lb_enter_room()
+	if dc_open:
+		_build_direct_panel()
 
 # --- LEADERBOARD ROOM ---
 
@@ -5219,6 +6905,27 @@ func _build_party_panel() -> void :
 	jb.custom_minimum_size = Vector2(64, 0)
 	jb.pressed.connect( func(): _join_party_code(party_code_input.text if party_code_input else ""))
 	jrow.add_child(jb)
+	_osk_prep(party_code_input)
+
+	# Direct connect, for Wi-Fi that blocks the relay servers
+	outer.add_child(HSeparator.new())
+	var dlab = Label.new()
+	dlab.text = "Relay servers blocked?"
+	dlab.add_theme_font_size_override("font_size", 12)
+	outer.add_child(dlab)
+	var dbtn = Button.new()
+	dbtn.text = "Get join code"
+	dbtn.custom_minimum_size = Vector2(0, 34)
+	dbtn.pressed.connect(_open_direct_panel)
+	outer.add_child(dbtn)
+	dc_party_label = Label.new()
+	dc_party_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	dc_party_label.custom_minimum_size = Vector2(party_panel_w - 20.0, 0)
+	dc_party_label.add_theme_font_size_override("font_size", 11)
+	dc_party_label.add_theme_color_override("font_color", Color(0.6, 1.0, 0.7))
+	dc_party_label.visible = false
+	outer.add_child(dc_party_label)
+	_dc_refresh()
 
 func _fill_party_panel() -> void :
 	if not party_panel_box:
@@ -9268,6 +10975,7 @@ func _show_color_picker_ui() -> void :
 	color_hex_input.custom_minimum_size = Vector2(150, 36)
 	color_hex_input.alignment = HORIZONTAL_ALIGNMENT_CENTER
 	color_hex_input.text_submitted.connect( func(t): _apply_hex_color(t))
+	_osk_prep(color_hex_input)
 	hex_row.add_child(color_hex_input)
 	var apply_btn = Button.new()
 	apply_btn.text = "Use This Color"
@@ -9909,6 +11617,10 @@ func _show_match_results_screen(outcome_title: String, is_winner: bool, elo_chan
 	_update_elo_animation_ui()
 
 func _update_elo_animation_ui() -> void :
+	if not is_instance_valid(anim_elo_label):
+		# The results screen is gone (left with Esc while it was counting).
+		is_animating_elo = false
+		return
 	var val_int = int(round(anim_current_elo))
 	if anim_elo_label:
 		anim_elo_label.text = " Rating: " + str(val_int) + " ELO (" + get_rank_name(val_int) + ")"
@@ -9925,6 +11637,7 @@ func _update_elo_animation_ui() -> void :
 
 func _clear_ui() -> void :
 	_free_royale_vote_ui()
+	_free_direct_panel()
 	if dummy_level_canvas:
 		dummy_level_canvas.queue_free()
 		dummy_level_canvas = null
@@ -14360,16 +16073,21 @@ class NetworkPlayer extends CharacterBody3D:
 		var to_t = best.global_position + best._up() * 0.9 - cam_pos
 		var desired_yaw = atan2(-to_t.x, -to_t.z)
 		var desired_pitch = atan2(to_t.y, Vector2(to_t.x, to_t.z).length())
-		var k = main_manager.AIM_ASSIST_STRENGTH * (0.3 if main_manager.mobile_look_active() else 1.0)
+		# A gentle nudge, not a lock-on: it fades out toward the edge of the
+		# cone and never turns you faster than AIM_ASSIST_MAX_TURN.
+		var fall = clamp(1.0 - best_angle / deg_to_rad(main_manager.AIM_ASSIST_CONE_DEG), 0.0, 1.0)
+		var k = main_manager.AIM_ASSIST_STRENGTH * fall * (0.5 if main_manager.mobile_look_active() else 1.0)
 		var t = 1.0 - exp(-k * delta)
+		var max_step = deg_to_rad(main_manager.AIM_ASSIST_MAX_TURN) * delta
 		if main_manager.is_moon():
 			# work it out in our own frame ("up" is wherever the moon puts it)
 			var lt = global_transform.basis.orthonormalized().inverse() * to_t
-			rotate_object_local(Vector3.UP, wrapf(atan2(-lt.x, -lt.z), -PI, PI) * t)
+			rotate_object_local(Vector3.UP, clamp(wrapf(atan2(-lt.x, -lt.z), -PI, PI) * t, -max_step, max_step))
 			desired_pitch = atan2(lt.y, Vector2(lt.x, lt.z).length())
 		else:
-			rotation.y += wrapf(desired_yaw - rotation.y, -PI, PI) * t
-		camera.rotation.x = clamp(lerp(camera.rotation.x, desired_pitch, t), deg_to_rad(-89), deg_to_rad(89))
+			rotation.y += clamp(wrapf(desired_yaw - rotation.y, -PI, PI) * t, -max_step, max_step)
+		var pitch = camera.rotation.x + clamp((desired_pitch - camera.rotation.x) * t, -max_step, max_step)
+		camera.rotation.x = clamp(pitch, deg_to_rad(-89), deg_to_rad(89))
 
 	# --- LADDERS ---
 	func enter_ladder(ladder: Node) -> void :
